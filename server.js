@@ -25,6 +25,15 @@ app.use('/api/bookings', require('./routes/bookingRoutes'));
 app.use('/api/admin', require('./routes/adminRoutes'));
 app.use('/api/supplier', require('./routes/supplierRoutes'));
 
+// Health Check
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'OK',
+        uptime: process.uptime(),
+        timestamp: new Date()
+    });
+});
+
 // Routes Placeholder
 app.get('/', (req, res) => {
     res.send('Kufi Backend API is running');
