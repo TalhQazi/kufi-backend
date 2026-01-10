@@ -1,0 +1,37 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+require('dotenv').config();
+
+const connectDB = require('./config/db');
+
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+
+// Connect to Database
+connectDB();
+
+// Init Middleware
+app.use(express.json({ extended: false }));
+
+// Define Routes
+app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/activities', require('./routes/activityRoutes'));
+app.use('/api/bookings', require('./routes/bookingRoutes'));
+app.use('/api/admin', require('./routes/adminRoutes'));
+app.use('/api/supplier', require('./routes/supplierRoutes'));
+
+// Routes Placeholder
+app.get('/', (req, res) => {
+    res.send('Kufi Backend API is running');
+});
+
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
