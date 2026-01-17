@@ -23,3 +23,22 @@ exports.getUserBookings = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
+
+// Get Supplier Bookings
+exports.getSupplierBookings = async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 10;
+
+        // Mock supplier bookings for now
+        const bookings = [
+            { title: "Safari Adventure", subtitle: "Tanzania · 5 Days", status: "Confirmed" },
+            { title: "Mountain Trek", subtitle: "Nepal · 7 Days", status: "Pending" },
+            { title: "Beach Resort", subtitle: "Maldives · 3 Days", status: "Confirmed" },
+        ].slice(0, limit);
+
+        res.json({ bookings });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};

@@ -6,7 +6,10 @@ const {
     getAllUsers,
     deleteUser,
     getPendingActivities,
-    approveActivity
+    approveActivity,
+    getActivity,
+    getRevenueTrend,
+    getBookingsTrend
 } = require('../controllers/adminController');
 
 // All routes require 'admin' role
@@ -31,5 +34,17 @@ router.get('/activities/pending', getPendingActivities);
 // @route   PUT api/admin/activities/:id/approve
 // @desc    Approve activity
 router.put('/activities/:id/approve', approveActivity);
+
+// @route   GET api/admin/activity
+// @desc    Get recent activity feed
+router.get('/activity', getActivity);
+
+// @route   GET api/admin/revenue-trend
+// @desc    Get revenue trend data
+router.get('/revenue-trend', getRevenueTrend);
+
+// @route   GET api/admin/bookings-trend
+// @desc    Get bookings trend data
+router.get('/bookings-trend', getBookingsTrend);
 
 module.exports = router;

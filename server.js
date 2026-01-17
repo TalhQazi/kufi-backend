@@ -24,6 +24,9 @@ app.use('/api/activities', require('./routes/activityRoutes'));
 app.use('/api/bookings', require('./routes/bookingRoutes'));
 app.use('/api/admin', require('./routes/adminRoutes'));
 app.use('/api/supplier', require('./routes/supplierRoutes'));
+app.use('/api/analytics', require('./routes/analyticsRoutes'));
+app.use('/api/itineraries', require('./routes/itineraryRoutes'));
+app.use('/api/countries', require('./routes/countryRoutes'));
 
 // Health Check
 app.get('/health', (req, res) => {
