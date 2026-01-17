@@ -67,3 +67,47 @@ exports.loginUser = async (req, res) => {
         res.status(500).send('Server error');
     }
 };
+// Get Current User Profile
+exports.getProfile = async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id).select('-password');
+        res.json(user);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};
+
+// Update User Profile
+exports.updateProfile = async (req, res) => {
+    const { fullName, phone, country, dob, gender, address, city, nationality, avatar } = req.body;
+
+    // Build profile object
+    const profileFields = {};
+    if (fullName) profileFields.fullName = fullName;
+    if (phone) profileFields.phone = phone;
+    if (country) profileFields.country = country;
+    if (dob) profileFields.dob = dob;
+    if (gender) profileFields.gender = gender;
+    if (address) profileFields.address = address;
+    if (city) profileFields.city = city;
+    if (nationality) profileFields.nationality = nationality;
+    if (avatar) profileFields.avatar = avatar;
+
+    try {
+        let user = await User.findById(req.user.id);
+
+        if (!user) return res.status(404).json({ msg: 'User not found' });
+
+        user = await User.findByIdAndUpdate(
+            req.user.id,
+            { $set: profileFields },
+            { new: true }
+        ).select('-password');
+
+        res.json(user);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};

@@ -5,6 +5,9 @@ const UserSchema = new mongoose.Schema({
         type: String,
         required: true
     },
+    fullName: {
+        type: String
+    },
     email: {
         type: String,
         required: true,
@@ -20,6 +23,27 @@ const UserSchema = new mongoose.Schema({
         default: 'user'
     },
     phone: {
+        type: String
+    },
+    country: {
+        type: String
+    },
+    dob: {
+        type: Date
+    },
+    gender: {
+        type: String
+    },
+    address: {
+        type: String
+    },
+    city: {
+        type: String
+    },
+    nationality: {
+        type: String
+    },
+    avatar: {
         type: String
     },
     createdAt: {
