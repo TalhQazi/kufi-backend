@@ -11,6 +11,42 @@ exports.getActivities = async (req, res) => {
     }
 };
 
+// Update activity (e.g. status)
+exports.updateActivity = async (req, res) => {
+    try {
+        const activity = await Activity.findByIdAndUpdate(
+            req.params.id,
+            { $set: req.body },
+            { new: true }
+        );
+
+        if (!activity) {
+            return res.status(404).json({ msg: 'Activity not found' });
+        }
+
+        res.json(activity);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+// Delete activity
+exports.deleteActivity = async (req, res) => {
+    try {
+        const activity = await Activity.findByIdAndDelete(req.params.id);
+
+        if (!activity) {
+            return res.status(404).json({ msg: 'Activity not found' });
+        }
+
+        res.json({ msg: 'Activity deleted' });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
 // Get single activity
 exports.getActivityById = async (req, res) => {
     try {
