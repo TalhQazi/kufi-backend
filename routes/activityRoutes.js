@@ -10,6 +10,7 @@ router.get('/', getActivities);
 // @route   GET api/activities/:id
 // @desc    Get activity by ID
 // @access  Public
+//comment added
 router.get('/:id', getActivityById);
 
 // @route   POST api/activities
