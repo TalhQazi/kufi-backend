@@ -1,13 +1,68 @@
 const Booking = require('../models/Booking');
 
+const normalizeBookingPayload = (body) => {
+    const travelersRaw = body?.travelers ?? body?.guests
+    const travelers = Number(travelersRaw)
+    const travelersSafe = Number.isFinite(travelers) ? travelers : undefined
+
+    const contactDetails = body?.contactDetails || {
+        firstName: body?.firstName,
+        lastName: body?.lastName,
+        email: body?.email,
+        phone: body?.phone,
+    }
+
+    const preferences = body?.preferences || {
+        includeHotel: body?.includeHotel,
+        hotelOwn: body?.hotelOwn,
+        foodAllGood: body?.foodAllGood,
+        vegetarian: body?.vegetarian,
+    }
+
+    const tripDetails = body?.tripDetails || {
+        country: body?.country || body?.location,
+        arrivalDate: body?.arrivalDate,
+        departureDate: body?.departureDate,
+        budget: body?.budget || body?.amount,
+    }
+
+    const items = Array.isArray(body?.items)
+        ? body.items
+        : (Array.isArray(body?.activities) ? body.activities : [])
+            .map((activityId) => ({
+                activity: activityId,
+                title: body?.experience,
+                travelers: travelersSafe,
+                addOns: body?.addOns || undefined,
+            }))
+
+    return {
+        user: body?.user || body?.userId,
+        items,
+        contactDetails,
+        tripDetails,
+        preferences,
+    }
+}
+
 // Create Booking
 exports.createBooking = async (req, res) => {
     try {
-        const newBooking = new Booking(req.body);
+        const normalized = normalizeBookingPayload(req.body || {});
+        const newBooking = new Booking(normalized);
         const booking = await newBooking.save();
         res.json(booking);
     } catch (err) {
-        console.error(err.message);
+        console.error(err);
+
+        if (err?.name === 'ValidationError') {
+            return res.status(400).json({
+                error: 'ValidationError',
+                message: err.message,
+                details: err.errors,
+            });
+        }
+
         res.status(500).send('Server Error');
     }
 };
