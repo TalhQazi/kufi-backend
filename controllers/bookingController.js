@@ -91,23 +91,23 @@ exports.getSupplierBookings = async (req, res) => {
         const { status, limit } = req.query;
 
         // 1. Get supplier's activities to find what countries they operate in
+        const User = require('../models/User');
+        const supplier = await User.findById(supplierId);
         const myActivities = await Activity.find({ supplier: supplierId });
         const activityIds = myActivities.map(a => a._id);
-        const myCountries = [...new Set(myActivities.map(a => a.country).filter(Boolean))];
+
+        // Countries from activities + supplier's own country
+        const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
+        const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
 
         // 2. Build query: 
         // - Bookings containing my specific activities
-        // - OR Bookings with no activities yet but in my countries
+        // - OR ANY pending booking in my countries (so I can respond to general requests)
         let query = {
             $or: [
                 { 'items.activity': { $in: activityIds } },
                 {
-                    'items': { $size: 0 },
-                    'tripDetails.country': { $in: myCountries }
-                },
-                // Also support if items exist but activity is not set (generic items)
-                {
-                    'items.activity': { $exists: false },
+                    'status': 'pending',
                     'tripDetails.country': { $in: myCountries }
                 }
             ]

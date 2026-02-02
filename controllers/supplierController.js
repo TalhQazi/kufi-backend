@@ -7,16 +7,19 @@ exports.getSupplierStats = async (req, res) => {
         const supplierId = req.user.id;
 
         // 1. Get supplier's activities to find what countries they operate in
+        const User = require('../models/User');
+        const supplier = await User.findById(supplierId);
         const myActivities = await Activity.find({ supplier: supplierId });
         const activityIds = myActivities.map(a => a._id);
-        const myCountries = [...new Set(myActivities.map(a => a.country).filter(Boolean))];
+
+        const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
+        const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
 
         // 2. Build inclusive query
         let query = {
             $or: [
                 { 'items.activity': { $in: activityIds } },
-                { 'items': { $size: 0 }, 'tripDetails.country': { $in: myCountries } },
-                { 'items.activity': { $exists: false }, 'tripDetails.country': { $in: myCountries } }
+                { 'status': 'pending', 'tripDetails.country': { $in: myCountries } }
             ]
         };
 
@@ -68,22 +71,22 @@ exports.getMyBookings = async (req, res) => {
         const { status, limit } = req.query;
 
         // 1. Get supplier's activities to find what countries they operate in
+        const User = require('../models/User');
+        const supplier = await User.findById(supplierId);
         const myActivities = await Activity.find({ supplier: supplierId });
         const activityIds = myActivities.map(a => a._id);
-        const myCountries = [...new Set(myActivities.map(a => a.country).filter(Boolean))];
+
+        const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
+        const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
 
         // 2. Build query: 
         // - Bookings containing my specific activities
-        // - OR Bookings with no activities yet but in my countries
+        // - OR ANY pending booking in my countries
         let query = {
             $or: [
                 { 'items.activity': { $in: activityIds } },
                 {
-                    'items': { $size: 0 },
-                    'tripDetails.country': { $in: myCountries }
-                },
-                {
-                    'items.activity': { $exists: false },
+                    'status': 'pending',
                     'tripDetails.country': { $in: myCountries }
                 }
             ]
