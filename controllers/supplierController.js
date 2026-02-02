@@ -16,10 +16,11 @@ exports.getSupplierStats = async (req, res) => {
         const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
 
         // 2. Build inclusive query
+        // Show assigned activities OR any pending requests (to allow discovery)
         let query = {
             $or: [
                 { 'items.activity': { $in: activityIds } },
-                { 'status': 'pending', 'tripDetails.country': { $in: myCountries } }
+                { 'status': 'pending' }
             ]
         };
 
@@ -81,14 +82,11 @@ exports.getMyBookings = async (req, res) => {
 
         // 2. Build query: 
         // - Bookings containing my specific activities
-        // - OR ANY pending booking in my countries
+        // - OR ANY pending booking in the system
         let query = {
             $or: [
                 { 'items.activity': { $in: activityIds } },
-                {
-                    'status': 'pending',
-                    'tripDetails.country': { $in: myCountries }
-                }
+                { 'status': 'pending' }
             ]
         };
 
