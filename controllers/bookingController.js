@@ -87,17 +87,46 @@ exports.getUserBookings = async (req, res) => {
 // Get Supplier Bookings
 exports.getSupplierBookings = async (req, res) => {
     try {
-        // This is similar to supplierController.getMyBookings
-        // We should ensure it fetches real data for the logged-in supplier
         const supplierId = req.user.id;
+        const { status, limit } = req.query;
 
-        const activities = await Activity.find({ supplier: supplierId }).select('_id');
-        const activityIds = activities.map(a => a._id);
+        // 1. Get supplier's activities to find what countries they operate in
+        const myActivities = await Activity.find({ supplier: supplierId });
+        const activityIds = myActivities.map(a => a._id);
+        const myCountries = [...new Set(myActivities.map(a => a.country).filter(Boolean))];
 
-        const bookings = await Booking.find({ 'items.activity': { $in: activityIds } })
+        // 2. Build query: 
+        // - Bookings containing my specific activities
+        // - OR Bookings with no activities yet but in my countries
+        let query = {
+            $or: [
+                { 'items.activity': { $in: activityIds } },
+                {
+                    'items': { $size: 0 },
+                    'tripDetails.country': { $in: myCountries }
+                },
+                // Also support if items exist but activity is not set (generic items)
+                {
+                    'items.activity': { $exists: false },
+                    'tripDetails.country': { $in: myCountries }
+                }
+            ]
+        };
+
+        if (status) {
+            query.status = status;
+        }
+
+        let bookingsQuery = Booking.find(query)
+            .sort({ createdAt: -1 })
             .populate('user', 'name email')
             .populate('items.activity');
 
+        if (limit) {
+            bookingsQuery = bookingsQuery.limit(parseInt(limit));
+        }
+
+        const bookings = await bookingsQuery;
         res.json({ bookings });
     } catch (err) {
         console.error('Error fetching supplier bookings:', err.message);
