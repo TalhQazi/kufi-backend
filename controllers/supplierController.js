@@ -59,11 +59,12 @@ exports.getMyBookings = async (req, res) => {
         const activityIds = activities.map(a => a._id);
 
         const bookings = await Booking.find({ 'items.activity': { $in: activityIds } })
-            .populate('user', 'name email');
+            .populate('user', 'name email')
+            .populate('items.activity');
 
         res.json(bookings);
     } catch (err) {
-        console.error(err.message);
+        console.error('Error fetching supplier bookings:', err.message);
         res.status(500).send('Server Error');
     }
 };

@@ -1,4 +1,5 @@
 const Booking = require('../models/Booking');
+const Activity = require('../models/Activity');
 
 const normalizeBookingPayload = (body) => {
     const travelersRaw = body?.travelers ?? body?.guests
@@ -62,7 +63,6 @@ exports.createBooking = async (req, res) => {
                 details: err.errors,
             });
         }
-
         res.status(500).send('Server Error');
     }
 };
@@ -70,8 +70,13 @@ exports.createBooking = async (req, res) => {
 // Get User Bookings
 exports.getUserBookings = async (req, res) => {
     try {
-        // In a real app, you'd verify the user ID from the token matches the param or use req.user.id
-        const bookings = await Booking.find({ $or: [{ user: req.params.userId }, { 'contactDetails.email': req.params.email }] });
+        const { userId, email } = req.params;
+        const bookings = await Booking.find({
+            $or: [
+                { user: userId },
+                { 'contactDetails.email': email }
+            ]
+        }).populate('items.activity');
         res.json(bookings);
     } catch (err) {
         console.error(err.message);
@@ -82,18 +87,42 @@ exports.getUserBookings = async (req, res) => {
 // Get Supplier Bookings
 exports.getSupplierBookings = async (req, res) => {
     try {
-        const limit = parseInt(req.query.limit) || 10;
+        // This is similar to supplierController.getMyBookings
+        // We should ensure it fetches real data for the logged-in supplier
+        const supplierId = req.user.id;
 
-        // Mock supplier bookings for now
-        const bookings = [
-            { title: "Safari Adventure", subtitle: "Tanzania · 5 Days", status: "Confirmed" },
-            { title: "Mountain Trek", subtitle: "Nepal · 7 Days", status: "Pending" },
-            { title: "Beach Resort", subtitle: "Maldives · 3 Days", status: "Confirmed" },
-        ].slice(0, limit);
+        const activities = await Activity.find({ supplier: supplierId }).select('_id');
+        const activityIds = activities.map(a => a._id);
+
+        const bookings = await Booking.find({ 'items.activity': { $in: activityIds } })
+            .populate('user', 'name email')
+            .populate('items.activity');
 
         res.json({ bookings });
     } catch (err) {
-        console.error(err.message);
+        console.error('Error fetching supplier bookings:', err.message);
         res.status(500).send('Server error');
+    }
+};
+// Update Booking Status
+exports.updateBookingStatus = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        const booking = await Booking.findByIdAndUpdate(
+            id,
+            { status },
+            { new: true }
+        );
+
+        if (!booking) {
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+
+        res.json(booking);
+    } catch (err) {
+        console.error('Error updating booking status:', err.message);
+        res.status(500).send('Server Error');
     }
 };
