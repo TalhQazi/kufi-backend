@@ -23,15 +23,33 @@ exports.getUserItineraries = async (req, res) => {
 // Create new itinerary
 exports.createItinerary = async (req, res) => {
     try {
-        const userId = req.user?.id;
+        const authUserId = req.user?.id;
+        const role = req.user?.role;
+
+        const requestedUserId = req.body?.userId;
+        const userId = role === 'supplier' ? requestedUserId : authUserId;
 
         if (!userId) {
             return res.status(401).json({ msg: 'User not authenticated' });
         }
 
+        const tripData = req.body?.tripData;
+        const title = req.body?.title || tripData?.title;
+        const destination = req.body?.destination || tripData?.destination || tripData?.location;
+
+        if (!title || !destination) {
+            return res.status(400).json({ msg: 'Missing required fields: title, destination' });
+        }
+
         const itinerary = new Itinerary({
             ...req.body,
-            userId
+            userId,
+            supplierId: role === 'supplier' ? authUserId : req.body?.supplierId,
+            bookingId: req.body?.bookingId || req.body?.requestId,
+            title,
+            destination,
+            tripData: tripData || req.body?.tripData,
+            days: Array.isArray(req.body?.days) ? req.body.days : [],
         });
 
         await itinerary.save();

@@ -6,6 +6,14 @@ const ItinerarySchema = new mongoose.Schema({
         ref: 'User',
         required: true
     },
+    bookingId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Booking'
+    },
+    supplierId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+    },
     title: {
         type: String,
         required: true
@@ -48,6 +56,13 @@ const ItinerarySchema = new mongoose.Schema({
     }],
     notes: {
         type: String
+    },
+    tripData: {
+        type: mongoose.Schema.Types.Mixed
+    },
+    days: {
+        type: [mongoose.Schema.Types.Mixed],
+        default: []
     },
     createdAt: {
         type: Date,
