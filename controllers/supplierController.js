@@ -80,11 +80,13 @@ exports.getMyBookings = async (req, res) => {
         const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
         const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
 
-        // 2. Build query: 
-        // - Bookings containing my specific activities
-        // - OR ANY pending booking in the system
+        // 2. Build query:
+        // - Bookings explicitly assigned to me (after I accept)
+        // - OR bookings containing my activities
+        // - OR ANY pending booking in the system (marketplace style)
         let query = {
             $or: [
+                { supplier: supplierId },
                 { 'items.activity': { $in: activityIds } },
                 { 'status': 'pending' }
             ]

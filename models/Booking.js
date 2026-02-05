@@ -5,6 +5,10 @@ const BookingSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User'
     },
+    supplier: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+    },
     items: [
         {
             activity: {

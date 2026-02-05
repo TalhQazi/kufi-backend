@@ -100,11 +100,13 @@ exports.getSupplierBookings = async (req, res) => {
         const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
         const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
 
-        // 2. Build query: 
-        // - Bookings containing my specific activities (always show)
+        // 2. Build query:
+        // - Bookings explicitly assigned to me (supplier accepted)
+        // - OR bookings containing my activities
         // - OR ANY pending booking in the system (marketplace style)
         let query = {
             $or: [
+                { supplier: supplierId },
                 { 'items.activity': { $in: activityIds } },
                 { 'status': 'pending' }
             ]
@@ -136,11 +138,12 @@ exports.updateBookingStatus = async (req, res) => {
         const { id } = req.params;
         const { status } = req.body;
 
-        const booking = await Booking.findByIdAndUpdate(
-            id,
-            { status },
-            { new: true }
-        );
+        const update = { status };
+        if (String(status || '').toLowerCase() === 'confirmed') {
+            update.supplier = req.user.id;
+        }
+
+        const booking = await Booking.findByIdAndUpdate(id, update, { new: true });
 
         if (!booking) {
             return res.status(404).json({ message: 'Booking not found' });
