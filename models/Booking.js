@@ -49,6 +49,14 @@ const BookingSchema = new mongoose.Schema({
     createdAt: {
         type: Date,
         default: Date.now
+    },
+    adjustmentCard: {
+        type: mongoose.Schema.Types.Mixed,
+        default: null
+    },
+    adjustmentRequestedAt: {
+        type: Date,
+        default: null
     }
 });
 

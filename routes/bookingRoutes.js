@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { createBooking, getUserBookings, getSupplierBookings, updateBookingStatus } = require('../controllers/bookingController');
+const { createBooking, getUserBookings, getSupplierBookings, updateBookingStatus, updateBookingAdjustment } = require('../controllers/bookingController');
 const auth = require('../middleware/auth');
 
 // @route   POST api/bookings
@@ -22,5 +22,10 @@ router.get('/supplier', auth(['supplier']), getSupplierBookings);
 // @desc    Update booking status
 // @access  Private
 router.patch('/:id/status', auth(['supplier', 'admin']), updateBookingStatus);
+
+// @route   PATCH api/bookings/:id/adjustment
+// @desc    Update booking adjustment card
+// @access  Private
+router.patch('/:id/adjustment', auth(), updateBookingAdjustment);
 
 module.exports = router;

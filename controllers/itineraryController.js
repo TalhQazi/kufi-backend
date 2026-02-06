@@ -4,10 +4,15 @@ const Itinerary = require('../models/Itinerary');
 exports.getUserItineraries = async (req, res) => {
     try {
         const userId = req.user?.id;
+        const role = req.user?.role;
 
         let itineraries;
         if (userId) {
-            itineraries = await Itinerary.find({ userId }).sort({ createdAt: -1 });
+            if (role === 'supplier') {
+                itineraries = await Itinerary.find({ supplierId: userId }).sort({ createdAt: -1 });
+            } else {
+                itineraries = await Itinerary.find({ userId }).sort({ createdAt: -1 });
+            }
         } else {
             // Return empty array if no user is authenticated
             itineraries = [];

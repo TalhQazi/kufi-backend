@@ -155,3 +155,46 @@ exports.updateBookingStatus = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
+
+// Update Booking Adjustment Card
+exports.updateBookingAdjustment = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const card = req.body?.card;
+
+        if (!id) {
+            return res.status(400).json({ message: 'Missing booking id' });
+        }
+
+        if (!card || typeof card !== 'object') {
+            return res.status(400).json({ message: 'Missing adjustment card' });
+        }
+
+        const fields = [card?.title, card?.description, card?.location, card?.cost, card?.imageDataUrl];
+        const hasAny = fields.some((v) => String(v || '').trim());
+        if (!hasAny) {
+            return res.status(400).json({ message: 'Adjustment card is empty' });
+        }
+
+        const update = {
+            adjustmentCard: {
+                title: String(card?.title || '').trim(),
+                description: String(card?.description || '').trim(),
+                location: String(card?.location || '').trim(),
+                cost: String(card?.cost || '').trim(),
+                imageDataUrl: String(card?.imageDataUrl || '').trim(),
+            },
+            adjustmentRequestedAt: new Date(),
+        };
+
+        const booking = await Booking.findByIdAndUpdate(id, update, { new: true }).populate('items.activity');
+        if (!booking) {
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+
+        res.json(booking);
+    } catch (err) {
+        console.error('Error updating booking adjustment:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
