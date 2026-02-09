@@ -4,7 +4,7 @@ const bcrypt = require('bcryptjs');
 
 // Register User
 exports.registerUser = async (req, res) => {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role, phone, country, city, status } = req.body;
 
     try {
         let user = await User.findOne({ email });
@@ -12,11 +12,24 @@ exports.registerUser = async (req, res) => {
             return res.status(400).json({ msg: 'User already exists' });
         }
 
+        if (role === 'supplier') {
+            if (!String(country || '').trim()) {
+                return res.status(400).json({ msg: 'Country is required for supplier registration' });
+            }
+            if (!String(city || '').trim()) {
+                return res.status(400).json({ msg: 'City is required for supplier registration' });
+            }
+        }
+
         user = new User({
             name,
             email,
             password,
             role,
+            phone,
+            country,
+            city,
+            status,
         });
 
         const salt = await bcrypt.genSalt(10);
@@ -24,7 +37,10 @@ exports.registerUser = async (req, res) => {
 
         await user.save();
 
-        res.status(201).json({ msg: 'User registered successfully', user });
+        const safeUser = user.toObject();
+        delete safeUser.password;
+
+        res.status(201).json({ msg: 'User registered successfully', user: safeUser });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server error');

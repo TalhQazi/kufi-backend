@@ -1,5 +1,108 @@
 const Booking = require('../models/Booking');
 const Activity = require('../models/Activity');
+const User = require('../models/User');
+
+const normalizeCountryKey = (value) => {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .trim();
+};
+
+const normalizeCountryLabel = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    // Support values like "Turkey, Istanbul" or "Istanbul, Turkey"
+    const parts = raw.split(',').map((p) => String(p || '').trim()).filter(Boolean);
+    if (parts.length === 0) return '';
+    return parts[0];
+};
+
+const getSupplierAvgRatings = async (supplierIds) => {
+    const ids = (supplierIds || []).map((id) => String(id)).filter(Boolean);
+    if (ids.length === 0) return new Map();
+
+    const rows = await Activity.aggregate([
+        {
+            $match: {
+                supplier: { $in: (supplierIds || []) },
+                rating: { $gt: 0 },
+            },
+        },
+        {
+            $group: {
+                _id: '$supplier',
+                avgRating: { $avg: '$rating' },
+                activityCount: { $sum: 1 },
+            },
+        },
+    ]);
+
+    const map = new Map();
+    (rows || []).forEach((row) => {
+        map.set(String(row._id), {
+            avgRating: Number(row?.avgRating) || 0,
+            activityCount: Number(row?.activityCount) || 0,
+        });
+    });
+    return map;
+};
+
+const pickBestSupplierIdForCountry = async (countryLabel) => {
+    const normalizedLabel = normalizeCountryLabel(countryLabel);
+    const countryKey = normalizeCountryKey(normalizedLabel);
+
+    // 1) Same-country suppliers (match against supplier profile country)
+    if (countryKey) {
+        const suppliers = await User.find({ role: 'supplier' }).select('_id country createdAt');
+        const sameCountrySuppliers = (suppliers || []).filter((s) => normalizeCountryKey(s?.country) === countryKey);
+        if (sameCountrySuppliers.length > 0) {
+            const ids = sameCountrySuppliers.map((s) => s._id);
+            const ratingMap = await getSupplierAvgRatings(ids);
+
+            const ranked = sameCountrySuppliers
+                .map((s) => {
+                    const meta = ratingMap.get(String(s._id)) || { avgRating: 0, activityCount: 0 };
+                    return {
+                        supplierId: s._id,
+                        avgRating: meta.avgRating,
+                        activityCount: meta.activityCount,
+                        createdAt: s.createdAt ? new Date(s.createdAt).getTime() : 0,
+                    };
+                })
+                .sort((a, b) => {
+                    if (b.avgRating !== a.avgRating) return b.avgRating - a.avgRating;
+                    if (b.activityCount !== a.activityCount) return b.activityCount - a.activityCount;
+                    return a.createdAt - b.createdAt;
+                });
+
+            if (ranked[0]?.supplierId) return ranked[0].supplierId;
+        }
+    }
+
+    // 2) Fallback: highest rated overall supplier
+    const allSuppliers = await User.find({ role: 'supplier' }).select('_id createdAt');
+    const allIds = (allSuppliers || []).map((s) => s._id);
+    const ratingMap = await getSupplierAvgRatings(allIds);
+
+    const rankedOverall = (allSuppliers || [])
+        .map((s) => {
+            const meta = ratingMap.get(String(s._id)) || { avgRating: 0, activityCount: 0 };
+            return {
+                supplierId: s._id,
+                avgRating: meta.avgRating,
+                activityCount: meta.activityCount,
+                createdAt: s.createdAt ? new Date(s.createdAt).getTime() : 0,
+            };
+        })
+        .sort((a, b) => {
+            if (b.avgRating !== a.avgRating) return b.avgRating - a.avgRating;
+            if (b.activityCount !== a.activityCount) return b.activityCount - a.activityCount;
+            return a.createdAt - b.createdAt;
+        });
+
+    return rankedOverall?.[0]?.supplierId || null;
+};
 
 const normalizeBookingPayload = (body) => {
     const travelersRaw = body?.travelers ?? body?.guests
@@ -50,6 +153,14 @@ const normalizeBookingPayload = (body) => {
 exports.createBooking = async (req, res) => {
     try {
         const normalized = normalizeBookingPayload(req.body || {});
+
+        // Assign booking to exactly one supplier based on country + supplier avg activity rating
+        const tripCountry = normalizeCountryLabel(normalized?.tripDetails?.country);
+        const bestSupplierId = await pickBestSupplierIdForCountry(tripCountry);
+        if (bestSupplierId) {
+            normalized.supplier = bestSupplierId;
+        }
+
         const newBooking = new Booking(normalized);
         const booking = await newBooking.save();
         res.json(booking);
@@ -90,27 +201,8 @@ exports.getSupplierBookings = async (req, res) => {
         const supplierId = req.user.id;
         const { status, limit } = req.query;
 
-        // 1. Get supplier's activities to find what countries they operate in
-        const User = require('../models/User');
-        const supplier = await User.findById(supplierId);
-        const myActivities = await Activity.find({ supplier: supplierId });
-        const activityIds = myActivities.map(a => a._id);
-
-        // Countries from activities + supplier's own country
-        const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
-        const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
-
-        // 2. Build query:
-        // - Bookings explicitly assigned to me (supplier accepted)
-        // - OR bookings containing my activities
-        // - OR ANY pending booking in the system (marketplace style)
-        let query = {
-            $or: [
-                { supplier: supplierId },
-                { 'items.activity': { $in: activityIds } },
-                { 'status': 'pending' }
-            ]
-        };
+        // Only return bookings assigned to this supplier
+        let query = { supplier: supplierId };
 
         if (status) {
             query.status = status;
@@ -139,8 +231,12 @@ exports.updateBookingStatus = async (req, res) => {
         const { status } = req.body;
 
         const update = { status };
+        // Do not override existing supplier assignment; only set if missing
         if (String(status || '').toLowerCase() === 'confirmed') {
-            update.supplier = req.user.id;
+            const existing = await Booking.findById(id).select('supplier');
+            if (!existing?.supplier) {
+                update.supplier = req.user.id;
+            }
         }
 
         const booking = await Booking.findByIdAndUpdate(id, update, { new: true });

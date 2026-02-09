@@ -6,31 +6,25 @@ exports.getSupplierStats = async (req, res) => {
     try {
         const supplierId = req.user.id;
 
-        // 1. Get supplier's activities to find what countries they operate in
-        const User = require('../models/User');
-        const supplier = await User.findById(supplierId);
         const myActivities = await Activity.find({ supplier: supplierId });
-        const activityIds = myActivities.map(a => a._id);
 
-        const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
-        const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
+        const ratings = (myActivities || [])
+            .map((activity) => Number(activity?.rating))
+            .filter((rating) => Number.isFinite(rating) && rating > 0);
+        const avgRating = ratings.length > 0
+            ? (ratings.reduce((sum, rating) => sum + rating, 0) / ratings.length)
+            : 0;
 
-        // 2. Build inclusive query
-        // Show assigned activities OR any pending requests (to allow discovery)
-        let query = {
-            $or: [
-                { 'items.activity': { $in: activityIds } },
-                { 'status': 'pending' }
-            ]
-        };
-
+        // Single-supplier assignment: only bookings assigned to this supplier
+        const query = { supplier: supplierId };
         const totalBookings = await Booking.countDocuments(query);
         const confirmedBookings = await Booking.countDocuments({ ...query, status: 'confirmed' });
 
         res.json({
             activities: myActivities.length,
             bookings: totalBookings,
-            revenue: confirmedBookings * 120 // Placeholder estimation
+            revenue: confirmedBookings * 120, // Placeholder estimation
+            avgRating
         });
     } catch (err) {
         console.error(err.message);
@@ -71,26 +65,8 @@ exports.getMyBookings = async (req, res) => {
         const supplierId = req.user.id;
         const { status, limit } = req.query;
 
-        // 1. Get supplier's activities to find what countries they operate in
-        const User = require('../models/User');
-        const supplier = await User.findById(supplierId);
-        const myActivities = await Activity.find({ supplier: supplierId });
-        const activityIds = myActivities.map(a => a._id);
-
-        const countriesFromActivities = myActivities.map(a => a.country).filter(Boolean);
-        const myCountries = [...new Set([...countriesFromActivities, supplier?.country].filter(Boolean))];
-
-        // 2. Build query:
-        // - Bookings explicitly assigned to me (after I accept)
-        // - OR bookings containing my activities
-        // - OR ANY pending booking in the system (marketplace style)
-        let query = {
-            $or: [
-                { supplier: supplierId },
-                { 'items.activity': { $in: activityIds } },
-                { 'status': 'pending' }
-            ]
-        };
+        // Only return bookings assigned to this supplier
+        let query = { supplier: supplierId };
 
         // Handle status filter
         if (status) {
