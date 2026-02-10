@@ -34,6 +34,20 @@ const ActivitySchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
+    addOns: {
+        quadBiking: {
+            type: Boolean,
+            default: false
+        },
+        campingGear: {
+            type: Boolean,
+            default: false
+        },
+        photographyPackage: {
+            type: Boolean,
+            default: false
+        }
+    },
     supplier: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User'
