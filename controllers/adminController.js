@@ -188,3 +188,16 @@ exports.getBookingsTrend = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
+exports.getAdminBookings = async (req, res) => {
+  try {
+    // Sab bookings, latest pehle
+    const bookings = await Booking.find().sort({ createdAt: -1 });
+ 
+    // Abhi ke liye full documents bhej do – frontend hum ne already
+    // itna robust bana diya hai ke different fields handle kar lega
+    res.json(bookings);
+  } catch (err) {
+    console.error('Error fetching admin bookings:', err.message);
+    res.status(500).send('Server Error');
+  }
+};

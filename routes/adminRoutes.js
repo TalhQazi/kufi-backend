@@ -9,7 +9,8 @@ const {
     approveActivity,
     getActivity,
     getRevenueTrend,
-    getBookingsTrend
+    getBookingsTrend,
+    getAdminBookings,     
 } = require('../controllers/adminController');
 
 // All routes require 'admin' role
@@ -46,5 +47,7 @@ router.get('/revenue-trend', getRevenueTrend);
 // @route   GET api/admin/bookings-trend
 // @desc    Get bookings trend data
 router.get('/bookings-trend', getBookingsTrend);
+
+router.get('/bookings', getAdminBookings);
 
 module.exports = router;
