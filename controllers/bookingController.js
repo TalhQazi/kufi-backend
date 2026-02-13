@@ -15,7 +15,8 @@ const normalizeCountryLabel = (value) => {
     // Support values like "Turkey, Istanbul" or "Istanbul, Turkey"
     const parts = raw.split(',').map((p) => String(p || '').trim()).filter(Boolean);
     if (parts.length === 0) return '';
-    return parts[0];
+    if (parts.length === 1) return parts[0];
+    return parts[parts.length - 1];
 };
 
 const getSupplierAvgRatings = async (supplierIds) => {
@@ -80,28 +81,8 @@ const pickBestSupplierIdForCountry = async (countryLabel) => {
         }
     }
 
-    // 2) Fallback: highest rated overall supplier
-    const allSuppliers = await User.find({ role: 'supplier' }).select('_id createdAt');
-    const allIds = (allSuppliers || []).map((s) => s._id);
-    const ratingMap = await getSupplierAvgRatings(allIds);
-
-    const rankedOverall = (allSuppliers || [])
-        .map((s) => {
-            const meta = ratingMap.get(String(s._id)) || { avgRating: 0, activityCount: 0 };
-            return {
-                supplierId: s._id,
-                avgRating: meta.avgRating,
-                activityCount: meta.activityCount,
-                createdAt: s.createdAt ? new Date(s.createdAt).getTime() : 0,
-            };
-        })
-        .sort((a, b) => {
-            if (b.avgRating !== a.avgRating) return b.avgRating - a.avgRating;
-            if (b.activityCount !== a.activityCount) return b.activityCount - a.activityCount;
-            return a.createdAt - b.createdAt;
-        });
-
-    return rankedOverall?.[0]?.supplierId || null;
+    // No same-country supplier found — do not assign to a random supplier.
+    return null;
 };
 
 const normalizeBookingPayload = (body) => {
