@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getActivities, getActivityById, createActivity, seedActivities, updateActivity, deleteActivity } = require('../controllers/activityController');
+const auth = require('../middleware/auth');
 
 // @route   GET api/activities
 // @desc    Get all activities
@@ -16,17 +17,22 @@ router.get('/:id', getActivityById);
 // @route   POST api/activities
 // @desc    Create an activity
 // @access  Private (Admin)
-router.post('/', createActivity);
+router.post('/', auth(['admin']), createActivity);
 
 // @route   PATCH api/activities/:id
 // @desc    Update an activity (e.g. status)
 // @access  Private (Admin)
-router.patch('/:id', updateActivity);
+router.patch('/:id', auth(['admin']), updateActivity);
+
+// @route   PUT api/activities/:id
+// @desc    Full update of an activity (edit fields)
+// @access  Private (Admin)
+router.put('/:id', auth(['admin']), updateActivity);
 
 // @route   DELETE api/activities/:id
 // @desc    Delete an activity
 // @access  Private (Admin)
-router.delete('/:id', deleteActivity);
+router.delete('/:id', auth(['admin']), deleteActivity);
 
 // @route   POST api/activities/seed
 // @desc    Seed activities

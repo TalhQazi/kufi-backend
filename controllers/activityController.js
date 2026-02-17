@@ -3,7 +3,7 @@ const Activity = require('../models/Activity');
 // Get all activities
 exports.getActivities = async (req, res) => {
     try {
-        const activities = await Activity.find();
+        const activities = await Activity.find().sort({ _id: -1 });
         res.json(activities);
     } catch (err) {
         console.error(err.message);
