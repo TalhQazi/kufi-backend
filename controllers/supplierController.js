@@ -1,6 +1,25 @@
 const Activity = require('../models/Activity');
 const Booking = require('../models/Booking');
 
+const normalizeStringArray = (value) => {
+    if (!Array.isArray(value)) return [];
+    return value.map((v) => String(v || '').trim()).filter(Boolean);
+};
+
+const sanitizeActivityPayload = (body) => {
+    const next = { ...(body || {}) };
+
+    if (Object.prototype.hasOwnProperty.call(next, 'highlights')) {
+        next.highlights = normalizeStringArray(next.highlights);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(next, 'addOns') && Array.isArray(next.addOns)) {
+        next.addOns = normalizeStringArray(next.addOns);
+    }
+
+    return next;
+};
+
 // Get Supplier Stats
 exports.getSupplierStats = async (req, res) => {
     try {
@@ -46,8 +65,9 @@ exports.getMyActivities = async (req, res) => {
 // Create Activity (Supplier)
 exports.createSupplierActivity = async (req, res) => {
     try {
+        const safeBody = sanitizeActivityPayload(req.body);
         const newActivity = new Activity({
-            ...req.body,
+            ...safeBody,
             supplier: req.user.id,
             status: 'pending' // Force pending for review
         });

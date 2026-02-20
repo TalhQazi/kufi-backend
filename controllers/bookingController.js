@@ -85,6 +85,42 @@ const pickBestSupplierIdForCountry = async (countryLabel) => {
     return null;
 };
 
+const pickNextSupplierIdForCountry = async (countryLabel, excludedSupplierIds = []) => {
+    const normalizedLabel = normalizeCountryLabel(countryLabel);
+    const countryKey = normalizeCountryKey(normalizedLabel);
+    const excluded = new Set((excludedSupplierIds || []).map((id) => String(id)).filter(Boolean));
+
+    if (!countryKey) return null;
+
+    const suppliers = await User.find({ role: 'supplier' }).select('_id country createdAt');
+    const sameCountrySuppliers = (suppliers || [])
+        .filter((supplier) => normalizeCountryKey(supplier?.country) === countryKey)
+        .filter((supplier) => !excluded.has(String(supplier?._id)));
+
+    if (sameCountrySuppliers.length === 0) return null;
+
+    const ids = sameCountrySuppliers.map((supplier) => supplier._id);
+    const ratingMap = await getSupplierAvgRatings(ids);
+
+    const ranked = sameCountrySuppliers
+        .map((supplier) => {
+            const meta = ratingMap.get(String(supplier._id)) || { avgRating: 0, activityCount: 0 };
+            return {
+                supplierId: supplier._id,
+                avgRating: meta.avgRating,
+                activityCount: meta.activityCount,
+                createdAt: supplier.createdAt ? new Date(supplier.createdAt).getTime() : 0,
+            };
+        })
+        .sort((left, right) => {
+            if (right.avgRating !== left.avgRating) return right.avgRating - left.avgRating;
+            if (right.activityCount !== left.activityCount) return right.activityCount - left.activityCount;
+            return left.createdAt - right.createdAt;
+        });
+
+    return ranked?.[0]?.supplierId || null;
+};
+
 const normalizeBookingPayload = (body) => {
     const travelersRaw = body?.travelers ?? body?.guests
     const travelers = Number(travelersRaw)
@@ -211,22 +247,64 @@ exports.updateBookingStatus = async (req, res) => {
         const { id } = req.params;
         const { status } = req.body;
 
-        const update = { status };
-        // Do not override existing supplier assignment; only set if missing
-        if (String(status || '').toLowerCase() === 'confirmed') {
-            const existing = await Booking.findById(id).select('supplier');
-            if (!existing?.supplier) {
-                update.supplier = req.user.id;
-            }
-        }
-
-        const booking = await Booking.findByIdAndUpdate(id, update, { new: true });
-
+        const normalizedStatus = String(status || '').trim().toLowerCase();
+        const booking = await Booking.findById(id);
         if (!booking) {
             return res.status(404).json({ message: 'Booking not found' });
         }
 
-        res.json(booking);
+        const assignedSupplierId = booking?.supplier ? String(booking.supplier) : '';
+        const actorSupplierId = req?.user?.id ? String(req.user.id) : '';
+
+        const isStatusChangeAction = normalizedStatus === 'confirmed' || normalizedStatus === 'cancelled';
+        if (isStatusChangeAction && assignedSupplierId && actorSupplierId && assignedSupplierId !== actorSupplierId) {
+            return res.status(403).json({ message: 'Access denied: booking is assigned to another supplier' });
+        }
+
+        if (normalizedStatus === 'confirmed') {
+            booking.status = 'confirmed';
+            if (!booking.supplier && actorSupplierId) {
+                booking.supplier = actorSupplierId;
+            }
+
+            if (actorSupplierId && Array.isArray(booking.rejectedSuppliers)) {
+                booking.rejectedSuppliers = booking.rejectedSuppliers.filter((s) => String(s) !== actorSupplierId);
+            }
+            const saved = await booking.save();
+            return res.json(saved);
+        }
+
+        if (normalizedStatus === 'cancelled') {
+            // Supplier rejected: reroute to next same-country supplier.
+            const tripCountry = normalizeCountryLabel(booking?.tripDetails?.country);
+            const rejected = Array.isArray(booking.rejectedSuppliers) ? booking.rejectedSuppliers.map((s) => String(s)) : [];
+            const excluded = new Set(rejected);
+            if (actorSupplierId) excluded.add(actorSupplierId);
+
+            // Persist rejection.
+            if (actorSupplierId) {
+                booking.rejectedSuppliers = Array.isArray(booking.rejectedSuppliers) ? booking.rejectedSuppliers : [];
+                if (!booking.rejectedSuppliers.some((s) => String(s) === actorSupplierId)) {
+                    booking.rejectedSuppliers.push(actorSupplierId);
+                }
+            }
+
+            const nextSupplierId = await pickNextSupplierIdForCountry(tripCountry, Array.from(excluded));
+            if (nextSupplierId) {
+                booking.supplier = nextSupplierId;
+                booking.status = 'pending';
+            } else {
+                booking.supplier = undefined;
+                booking.status = 'cancelled';
+            }
+
+            const saved = await booking.save();
+            return res.json(saved);
+        }
+
+        booking.status = normalizedStatus || booking.status;
+        const saved = await booking.save();
+        return res.json(saved);
     } catch (err) {
         console.error('Error updating booking status:', err.message);
         res.status(500).send('Server Error');

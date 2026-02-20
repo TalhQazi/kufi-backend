@@ -1,5 +1,24 @@
 const Activity = require('../models/Activity');
 
+const normalizeStringArray = (value) => {
+    if (!Array.isArray(value)) return [];
+    return value.map((v) => String(v || '').trim()).filter(Boolean);
+};
+
+const sanitizeActivityPayload = (body) => {
+    const next = { ...(body || {}) };
+
+    if (Object.prototype.hasOwnProperty.call(next, 'highlights')) {
+        next.highlights = normalizeStringArray(next.highlights);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(next, 'addOns') && Array.isArray(next.addOns)) {
+        next.addOns = normalizeStringArray(next.addOns);
+    }
+
+    return next;
+};
+
 // Get all activities
 exports.getActivities = async (req, res) => {
     try {
@@ -14,9 +33,10 @@ exports.getActivities = async (req, res) => {
 // Update activity (e.g. status)
 exports.updateActivity = async (req, res) => {
     try {
+        const safeBody = sanitizeActivityPayload(req.body);
         const activity = await Activity.findByIdAndUpdate(
             req.params.id,
-            { $set: req.body },
+            { $set: safeBody },
             { new: true }
         );
 
@@ -67,7 +87,8 @@ exports.getActivityById = async (req, res) => {
 // Create activity (Admin)
 exports.createActivity = async (req, res) => {
     try {
-        const newActivity = new Activity(req.body);
+        const safeBody = sanitizeActivityPayload(req.body);
+        const newActivity = new Activity(safeBody);
         const activity = await newActivity.save();
         res.json(activity);
     } catch (err) {

@@ -8,6 +8,10 @@ const ActivitySchema = new mongoose.Schema({
     description: {
         type: String
     },
+    highlights: {
+        type: [String],
+        default: []
+    },
     location: {
         type: String
     },

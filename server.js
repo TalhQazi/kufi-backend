@@ -28,6 +28,7 @@ app.use('/api/analytics', require('./routes/analyticsRoutes'));
 app.use('/api/itineraries', require('./routes/itineraryRoutes'));
 app.use('/api/countries', require('./routes/countryRoutes'));
 app.use('/api/cities', require('./routes/cityRoutes'));
+app.use('/api/categories', require('./routes/categoryRoutes'));
 
 // Health Check
 app.get('/health', (req, res) => {
