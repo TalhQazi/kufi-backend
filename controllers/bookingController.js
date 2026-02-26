@@ -198,14 +198,22 @@ exports.createBooking = async (req, res) => {
 // Get User Bookings
 exports.getUserBookings = async (req, res) => {
     try {
-        const { userId, email } = req.params;
-        const bookings = await Booking.find({
-            $or: [
-                { user: userId },
-                { 'contactDetails.email': email }
-            ]
-        }).populate('items.activity');
-        res.json(bookings);
+        const { userId } = req.params;
+        const emailFromQuery = req.query?.email;
+        const authEmail = req.user?.email;
+
+        const email = String(emailFromQuery || authEmail || '').trim();
+
+        const orConditions = [{ user: userId }];
+        if (email) {
+            orConditions.push({ 'contactDetails.email': email });
+        }
+
+        const bookings = await Booking.find({ $or: orConditions })
+            .sort({ createdAt: -1 })
+            .populate('items.activity');
+
+        res.json({ bookings });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');

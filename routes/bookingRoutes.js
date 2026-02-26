@@ -11,7 +11,7 @@ router.post('/', createBooking);
 // @route   GET api/bookings/user/:userId
 // @desc    Get bookings by user ID
 // @access  Private
-router.get('/user/:userId', getUserBookings);
+router.get('/user/:userId', auth(), getUserBookings);
 
 // @route   GET api/bookings/supplier
 // @desc    Get supplier bookings
