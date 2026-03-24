@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const path = require('path');
 require('dotenv').config();
 
 const connectDB = require('./config/db');
@@ -17,6 +18,9 @@ connectDB();
 
 // Init Middleware
 app.use(express.json({ limit: '20mb', extended: false }));
+
+// Serve uploads (e.g. category icons)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Define Routes
 app.use('/api/auth', require('./routes/authRoutes'));

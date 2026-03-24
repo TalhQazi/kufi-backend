@@ -12,6 +12,10 @@ const sanitizeCategoryPayload = (body) => {
     if (Object.prototype.hasOwnProperty.call(next, 'image')) {
         next.image = String(next.image || '').trim();
     }
+    if (Object.prototype.hasOwnProperty.call(next, 'status')) {
+        const s = String(next.status || '').toLowerCase().trim();
+        next.status = ['active', 'draft'].includes(s) ? s : 'active';
+    }
 
     return next;
 };
