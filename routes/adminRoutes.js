@@ -10,7 +10,10 @@ const {
     getActivity,
     getRevenueTrend,
     getBookingsTrend,
-    getAdminBookings,     
+    getAdminBookings,
+    getSuppliersWithScores,
+    updateSupplierScore,
+    getBestSupplierForOrder,
 } = require('../controllers/adminController');
 
 // All routes require 'admin' role
@@ -49,5 +52,17 @@ router.get('/revenue-trend', getRevenueTrend);
 router.get('/bookings-trend', getBookingsTrend);
 
 router.get('/bookings', getAdminBookings);
+
+// @route   GET api/admin/suppliers/scores
+// @desc    Get all suppliers with score points
+router.get('/suppliers/scores', getSuppliersWithScores);
+
+// @route   PUT api/admin/suppliers/:supplierId/score
+// @desc    Update supplier score points
+router.put('/suppliers/:supplierId/score', updateSupplierScore);
+
+// @route   GET api/admin/suppliers/best-for-order
+// @desc    Get best supplier for order assignment (highest score)
+router.get('/suppliers/best-for-order', getBestSupplierForOrder);
 
 module.exports = router;

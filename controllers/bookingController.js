@@ -53,35 +53,49 @@ const pickBestSupplierIdForCountry = async (countryLabel) => {
     const normalizedLabel = normalizeCountryLabel(countryLabel);
     const countryKey = normalizeCountryKey(normalizedLabel);
 
-    // 1) Same-country suppliers (match against supplier profile country)
+    // Find suppliers sorted by admin-assigned scorePoints (highest first)
+    let query = { role: 'supplier', status: 'active' };
     if (countryKey) {
-        const suppliers = await User.find({ role: 'supplier' }).select('_id country createdAt');
+        // First try: find same-country suppliers
+        const suppliers = await User.find({ role: 'supplier' }).select('_id country scorePoints createdAt');
         const sameCountrySuppliers = (suppliers || []).filter((s) => normalizeCountryKey(s?.country) === countryKey);
+        
         if (sameCountrySuppliers.length > 0) {
-            const ids = sameCountrySuppliers.map((s) => s._id);
-            const ratingMap = await getSupplierAvgRatings(ids);
-
+            // Sort by scorePoints (highest first), then by createdAt
             const ranked = sameCountrySuppliers
-                .map((s) => {
-                    const meta = ratingMap.get(String(s._id)) || { avgRating: 0, activityCount: 0 };
-                    return {
-                        supplierId: s._id,
-                        avgRating: meta.avgRating,
-                        activityCount: meta.activityCount,
-                        createdAt: s.createdAt ? new Date(s.createdAt).getTime() : 0,
-                    };
-                })
+                .map((s) => ({
+                    supplierId: s._id,
+                    scorePoints: s.scorePoints || 0,
+                    createdAt: s.createdAt ? new Date(s.createdAt).getTime() : 0,
+                }))
                 .sort((a, b) => {
-                    if (b.avgRating !== a.avgRating) return b.avgRating - a.avgRating;
-                    if (b.activityCount !== a.activityCount) return b.activityCount - a.activityCount;
+                    if (b.scorePoints !== a.scorePoints) return b.scorePoints - a.scorePoints;
                     return a.createdAt - b.createdAt;
                 });
 
             if (ranked[0]?.supplierId) return ranked[0].supplierId;
         }
+        
+        // If no same-country supplier, find highest scored supplier from any country
+        const allSuppliers = await User.find(query)
+            .select('_id country scorePoints createdAt')
+            .sort({ scorePoints: -1, createdAt: 1 });
+        
+        if (allSuppliers.length > 0) {
+            return allSuppliers[0]._id;
+        }
+    } else {
+        // No country specified, return highest scored supplier
+        const suppliers = await User.find(query)
+            .select('_id scorePoints createdAt')
+            .sort({ scorePoints: -1, createdAt: 1 })
+            .limit(1);
+        
+        if (suppliers.length > 0) {
+            return suppliers[0]._id;
+        }
     }
 
-    // No same-country supplier found — do not assign to a random supplier.
     return null;
 };
 
@@ -92,33 +106,22 @@ const pickNextSupplierIdForCountry = async (countryLabel, excludedSupplierIds = 
 
     if (!countryKey) return null;
 
-    const suppliers = await User.find({ role: 'supplier' }).select('_id country createdAt');
+    // Find same-country suppliers sorted by scorePoints (highest first)
+    const suppliers = await User.find({ 
+        role: 'supplier', 
+        status: 'active',
+        _id: { $nin: Array.from(excluded) }
+    })
+        .select('_id country scorePoints createdAt')
+        .sort({ scorePoints: -1, createdAt: 1 });
+    
     const sameCountrySuppliers = (suppliers || [])
-        .filter((supplier) => normalizeCountryKey(supplier?.country) === countryKey)
-        .filter((supplier) => !excluded.has(String(supplier?._id)));
+        .filter((supplier) => normalizeCountryKey(supplier?.country) === countryKey);
 
     if (sameCountrySuppliers.length === 0) return null;
 
-    const ids = sameCountrySuppliers.map((supplier) => supplier._id);
-    const ratingMap = await getSupplierAvgRatings(ids);
-
-    const ranked = sameCountrySuppliers
-        .map((supplier) => {
-            const meta = ratingMap.get(String(supplier._id)) || { avgRating: 0, activityCount: 0 };
-            return {
-                supplierId: supplier._id,
-                avgRating: meta.avgRating,
-                activityCount: meta.activityCount,
-                createdAt: supplier.createdAt ? new Date(supplier.createdAt).getTime() : 0,
-            };
-        })
-        .sort((left, right) => {
-            if (right.avgRating !== left.avgRating) return right.avgRating - left.avgRating;
-            if (right.activityCount !== left.activityCount) return right.activityCount - left.activityCount;
-            return left.createdAt - right.createdAt;
-        });
-
-    return ranked?.[0]?.supplierId || null;
+    // Return the highest scored supplier from same country
+    return sameCountrySuppliers[0]?._id || null;
 };
 
 const normalizeBookingPayload = (body) => {

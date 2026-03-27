@@ -34,6 +34,11 @@ app.use('/api/countries', require('./routes/countryRoutes'));
 app.use('/api/cities', require('./routes/cityRoutes'));
 app.use('/api/categories', require('./routes/categoryRoutes'));
 app.use('/api/blogs', require('./routes/blogRoutes'));
+app.use('/api/reviews', require('./routes/reviewRoutes'));
+app.use('/api/booking-terms', require('./routes/bookingTermRoutes'));
+app.use('/api/footer', require('./routes/footerSettingsRoutes'));
+app.use('/api/header', require('./routes/headerSettingsRoutes'));
+app.use('/api/sections', require('./routes/sectionVisibilityRoutes'));
 
 // Health Check
 app.get('/health', (req, res) => {

@@ -201,3 +201,83 @@ exports.getAdminBookings = async (req, res) => {
     res.status(500).send('Server Error');
   }
 };
+
+// Get all suppliers with score points
+exports.getSuppliersWithScores = async (req, res) => {
+  try {
+    const suppliers = await User.find({ role: 'supplier' })
+      .select('-password')
+      .sort({ scorePoints: -1, createdAt: -1 });
+    res.json(suppliers);
+  } catch (err) {
+    console.error('Error fetching suppliers with scores:', err.message);
+    res.status(500).send('Server Error');
+  }
+};
+
+// Update supplier score points
+exports.updateSupplierScore = async (req, res) => {
+  try {
+    const { supplierId } = req.params;
+    const { scorePoints } = req.body;
+
+    // Validate score
+    const score = Number(scorePoints);
+    if (!Number.isFinite(score) || score < 0 || score > 100) {
+      return res.status(400).json({ msg: 'Score must be between 0 and 100' });
+    }
+
+    const supplier = await User.findOne({ _id: supplierId, role: 'supplier' });
+    if (!supplier) {
+      return res.status(404).json({ msg: 'Supplier not found' });
+    }
+
+    supplier.scorePoints = score;
+    await supplier.save();
+
+    res.json({ 
+      msg: 'Supplier score updated successfully', 
+      supplier: {
+        _id: supplier._id,
+        name: supplier.name,
+        email: supplier.email,
+        scorePoints: supplier.scorePoints
+      }
+    });
+  } catch (err) {
+    console.error('Error updating supplier score:', err.message);
+    res.status(500).send('Server Error');
+  }
+};
+
+// Get best supplier for order assignment (by score and availability)
+exports.getBestSupplierForOrder = async (req, res) => {
+  try {
+    const { country, city } = req.query;
+    
+    // Build query - find active suppliers
+    let query = { role: 'supplier', status: 'active' };
+    
+    // Find suppliers sorted by score (highest first)
+    let suppliers = await User.find(query)
+      .select('-password')
+      .sort({ scorePoints: -1, createdAt: -1 });
+
+    // If country/city specified, try to find suppliers who have activities in that region
+    // For now, return highest scored supplier
+    const bestSupplier = suppliers[0] || null;
+    
+    if (!bestSupplier) {
+      return res.status(404).json({ msg: 'No active suppliers found' });
+    }
+
+    res.json({
+      supplier: bestSupplier,
+      totalSuppliers: suppliers.length,
+      availableSuppliers: suppliers.slice(0, 5) // Return top 5 for reference
+    });
+  } catch (err) {
+    console.error('Error finding best supplier:', err.message);
+    res.status(500).send('Server Error');
+  }
+};
