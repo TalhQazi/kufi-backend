@@ -39,6 +39,7 @@ app.use('/api/booking-terms', require('./routes/bookingTermRoutes'));
 app.use('/api/footer', require('./routes/footerSettingsRoutes'));
 app.use('/api/header', require('./routes/headerSettingsRoutes'));
 app.use('/api/sections', require('./routes/sectionVisibilityRoutes'));
+app.use('/api/legal-content', require('./routes/legalContentRoutes'));
 
 // Health Check
 app.get('/health', (req, res) => {
