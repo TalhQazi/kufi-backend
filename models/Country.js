@@ -30,6 +30,11 @@ const CountrySchema = new mongoose.Schema({
         type: Boolean,
         default: false
     },
+    status: {
+        type: String,
+        enum: ['active', 'draft'],
+        default: 'active'
+    },
     createdAt: {
         type: Date,
         default: Date.now

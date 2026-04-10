@@ -81,6 +81,41 @@ exports.deleteUser = async (req, res) => {
     }
 };
 
+// Get Supplier History (bookings assigned to this supplier)
+exports.getSupplierHistory = async (req, res) => {
+    try {
+        const supplierId = req.params.id;
+        
+        // Find bookings where this supplier was assigned
+        const bookings = await Booking.find({ supplier: supplierId })
+            .populate('user', 'name email')
+            .populate('items.activity', 'title image')
+            .sort({ createdAt: -1 });
+        
+        // Transform into history format
+        const history = bookings.map(booking => ({
+            _id: booking._id,
+            date: booking.createdAt,
+            travelerName: booking.contactDetails?.firstName 
+                ? `${booking.contactDetails.firstName} ${booking.contactDetails.lastName || ''}`
+                : booking.user?.name || 'Unknown',
+            travelerEmail: booking.contactDetails?.email || booking.user?.email || 'N/A',
+            status: booking.status,
+            items: booking.items?.map(item => ({
+                title: item.title || item.activity?.title || 'Activity',
+                travelers: item.travelers || 0
+            })) || [],
+            tripDetails: booking.tripDetails,
+            createdAt: booking.createdAt
+        }));
+        
+        res.json(history);
+    } catch (err) {
+        console.error('Error fetching supplier history:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
 // Get Pending Activities
 exports.getPendingActivities = async (req, res) => {
     try {

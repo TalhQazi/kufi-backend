@@ -5,6 +5,7 @@ const {
     getSystemStats,
     getAllUsers,
     deleteUser,
+    getSupplierHistory,
     getPendingActivities,
     approveActivity,
     getActivity,
@@ -30,6 +31,10 @@ router.get('/users', getAllUsers);
 // @route   DELETE api/admin/users/:id
 // @desc    Delete user
 router.delete('/users/:id', deleteUser);
+
+// @route   GET api/admin/suppliers/:id/history
+// @desc    Get supplier booking history
+router.get('/suppliers/:id/history', getSupplierHistory);
 
 // @route   GET api/admin/activities/pending
 // @desc    Get pending activities

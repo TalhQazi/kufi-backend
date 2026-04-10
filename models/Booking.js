@@ -63,6 +63,20 @@ const BookingSchema = new mongoose.Schema({
     adjustmentRequestedAt: {
         type: Date,
         default: null
+    },
+    transferStatus: {
+        type: String,
+        enum: ['transferred', 'pending', 'completed'],
+        default: null
+    },
+    transferredAt: {
+        type: Date,
+        default: null
+    },
+    transferredBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null
     }
 });
 

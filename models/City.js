@@ -17,6 +17,11 @@ const CitySchema = new mongoose.Schema({
   image: {
     type: String,
   },
+  status: {
+    type: String,
+    enum: ['active', 'draft'],
+    default: 'active'
+  },
   createdAt: {
     type: Date,
     default: Date.now,

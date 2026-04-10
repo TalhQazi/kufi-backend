@@ -322,6 +322,54 @@ exports.updateBookingStatus = async (req, res) => {
     }
 };
 
+// Get Single Booking by ID
+exports.getBookingById = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const booking = await Booking.findById(id)
+            .populate('user', 'name email phone avatar')
+            .populate('supplier', 'name email companyName')
+            .populate('items.activity');
+
+        if (!booking) {
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+
+        res.json(booking);
+    } catch (err) {
+        console.error('Error fetching booking:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+// Transfer Booking to Another Supplier (Admin only)
+exports.transferBooking = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { supplierId } = req.body;
+
+        const booking = await Booking.findById(id);
+        if (!booking) {
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+
+        // Update supplier and mark as transferred
+        booking.supplier = supplierId || null;
+        booking.transferStatus = 'transferred';
+        booking.transferredAt = new Date();
+        booking.transferredBy = req.user?.id;
+
+        // Keep status as pending so it shows as "transferred" in the UI
+        // Don't change the status - transferStatus is what the UI checks
+
+        const saved = await booking.save();
+        res.json(saved);
+    } catch (err) {
+        console.error('Error transferring booking:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
 // Update Booking Adjustment Card
 exports.updateBookingAdjustment = async (req, res) => {
     try {
