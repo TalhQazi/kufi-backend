@@ -5,7 +5,7 @@ const Activity = require('../models/Activity');
 const User = require('../models/User');
 
 
-
+//normailze country key
 const normalizeCountryKey = (value) => {
 
     return String(value || '')
