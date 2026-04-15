@@ -41,6 +41,11 @@ const BookingSchema = new mongoose.Schema({
         foodAllGood: Boolean,
         vegetarian: Boolean
     },
+    bookingTermSelections: {
+        type: Map,
+        of: [String],
+        default: {}
+    },
     status: {
         type: String,
         enum: ['pending', 'confirmed', 'cancelled'],
