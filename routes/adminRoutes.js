@@ -15,6 +15,8 @@ const {
     getSuppliersWithScores,
     updateSupplierScore,
     getBestSupplierForOrder,
+    getGlobalSettings,
+    updateGlobalSettings,
 } = require('../controllers/adminController');
 
 // All routes require 'admin' role
@@ -69,5 +71,13 @@ router.put('/suppliers/:supplierId/score', updateSupplierScore);
 // @route   GET api/admin/suppliers/best-for-order
 // @desc    Get best supplier for order assignment (highest score)
 router.get('/suppliers/best-for-order', getBestSupplierForOrder);
+
+// @route   GET api/admin/settings
+// @desc    Get global settings
+router.get('/settings', getGlobalSettings);
+
+// @route   PUT api/admin/settings
+// @desc    Update global settings
+router.put('/settings', updateGlobalSettings);
 
 module.exports = router;

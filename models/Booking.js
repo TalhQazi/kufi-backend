@@ -82,7 +82,25 @@ const BookingSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
         default: null
-    }
+    },
+    totalAmount: {
+        type: Number,
+        default: 0
+    },
+    commissionAmount: {
+        type: Number,
+        default: 0
+    },
+    netAmount: {
+        type: Number,
+        default: 0
+    },
+    paymentStatus: {
+        type: String,
+        enum: ['unpaid', 'paid', 'refunded'],
+        default: 'unpaid'
+    },
+    stripeSessionId: String
 });
 
 module.exports = mongoose.model('Booking', BookingSchema);

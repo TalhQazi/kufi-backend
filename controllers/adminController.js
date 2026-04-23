@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const Activity = require('../models/Activity');
 const Booking = require('../models/Booking');
+const GlobalSettings = require('../models/GlobalSettings');
 
 const parseBudgetNumber = (value) => {
     if (!value) return 0;
@@ -315,4 +316,39 @@ exports.getBestSupplierForOrder = async (req, res) => {
     console.error('Error finding best supplier:', err.message);
     res.status(500).send('Server Error');
   }
+};
+
+// Global Settings Management
+exports.getGlobalSettings = async (req, res) => {
+    try {
+        let settings = await GlobalSettings.findOne();
+        if (!settings) {
+            settings = new GlobalSettings();
+            await settings.save();
+        }
+        res.json(settings);
+    } catch (err) {
+        console.error('Error fetching global settings:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+exports.updateGlobalSettings = async (req, res) => {
+    try {
+        const { commissionPercentage, stripePublicKey } = req.body;
+        let settings = await GlobalSettings.findOne();
+        if (!settings) {
+            settings = new GlobalSettings();
+        }
+        
+        if (commissionPercentage !== undefined) settings.commissionPercentage = commissionPercentage;
+        if (stripePublicKey !== undefined) settings.stripePublicKey = stripePublicKey;
+        
+        settings.updatedAt = Date.now();
+        await settings.save();
+        res.json(settings);
+    } catch (err) {
+        console.error('Error updating global settings:', err.message);
+        res.status(500).send('Server Error');
+    }
 };

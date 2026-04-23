@@ -79,6 +79,7 @@ app.use('/api/footer', require('./routes/footerSettingsRoutes'));
 app.use('/api/header', require('./routes/headerSettingsRoutes'));
 
 app.use('/api/sections', require('./routes/sectionVisibilityRoutes'));
+app.use('/api/payment', require('./routes/paymentRoutes'));
 
 
 
