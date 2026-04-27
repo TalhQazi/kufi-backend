@@ -81,6 +81,7 @@ app.use('/api/header', require('./routes/headerSettingsRoutes'));
 app.use('/api/sections', require('./routes/sectionVisibilityRoutes'));
 app.use('/api/payment', require('./routes/paymentRoutes'));
 
+app.use('/api/legal-content', require('./routes/legalContentRoutes'));
 
 
 // Health Check

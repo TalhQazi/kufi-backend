@@ -16,6 +16,17 @@ const sanitizeActivityPayload = (body) => {
         next.addOns = normalizeStringArray(next.addOns);
     }
 
+    // Handle coordinates - ensure lat/lng are numbers or null
+    if (Object.prototype.hasOwnProperty.call(next, 'coordinates')) {
+        const coords = next.coordinates;
+        if (coords && typeof coords === 'object') {
+            next.coordinates = {
+                lat: coords.lat !== undefined && coords.lat !== '' ? Number(coords.lat) : null,
+                lng: coords.lng !== undefined && coords.lng !== '' ? Number(coords.lng) : null
+            };
+        }
+    }
+
     return next;
 };
 
