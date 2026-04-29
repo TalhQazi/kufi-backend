@@ -735,3 +735,37 @@ exports.updateBookingAdjustment = async (req, res) => {
 
 };
 
+// Update Booking
+exports.updateBooking = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { contactDetails, tripDetails, totalAmount } = req.body;
+
+        const booking = await Booking.findById(id);
+        if (!booking) {
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+
+        if (contactDetails) {
+            booking.contactDetails = { 
+                ...booking.contactDetails.toObject(), 
+                ...contactDetails 
+            };
+        }
+        if (tripDetails) {
+            booking.tripDetails = { 
+                ...booking.tripDetails.toObject(), 
+                ...tripDetails 
+            };
+        }
+        if (totalAmount !== undefined) {
+            booking.totalAmount = totalAmount;
+        }
+
+        await booking.save();
+        res.json(booking);
+    } catch (err) {
+        console.error('Error updating booking:', err.message);
+        res.status(500).send('Server Error');
+    }
+};

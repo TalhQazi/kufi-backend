@@ -98,3 +98,15 @@ exports.handleWebhook = async (req, res) => {
 
     res.json({ received: true });
 };
+exports.getPublicSettings = async (req, res) => {
+    try {
+        let settings = await GlobalSettings.findOne();
+        if (!settings) {
+            settings = { commissionPercentage: 10, stripePublicKey: '' };
+        }
+        res.json(settings);
+    } catch (err) {
+        console.error('Error fetching public settings:', err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};

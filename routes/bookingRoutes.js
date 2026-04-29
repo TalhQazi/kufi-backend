@@ -2,7 +2,8 @@ const express = require('express');
 
 const router = express.Router();
 
-const { createBooking, getUserBookings, getSupplierBookings, updateBookingStatus, updateBookingAdjustment } = require('../controllers/bookingController');
+const { createBooking, getUserBookings, getSupplierBookings, updateBookingStatus, updateBookingAdjustment, updateBooking } = require('../controllers/bookingController');
+
 
 const auth = require('../middleware/auth');
 
@@ -58,5 +59,11 @@ router.patch('/:id/adjustment', auth(), updateBookingAdjustment);
 
 
 
+// @route   PATCH api/bookings/:id
+// @desc    Update a booking
+// @access  Private
+router.patch('/:id', auth(), updateBooking);
+
 module.exports = router;
+
 
