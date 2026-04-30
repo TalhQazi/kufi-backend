@@ -1,8 +1,7 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { OAuth2Client } = require('google-auth-library');
-const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const axios = require('axios');
 
 // Register User
 exports.registerUser = async (req, res) => {
@@ -129,8 +128,6 @@ exports.updateProfile = async (req, res) => {
         res.status(500).send('Server error');
     }
 };
-
-const axios = require('axios');
 
 // Google Login
 exports.googleLogin = async (req, res) => {
