@@ -9,6 +9,10 @@ const GlobalSettingsSchema = new mongoose.Schema({
         type: String,
         default: ''
     },
+    googleAnalyticsId: {
+        type: String,
+        default: ''
+    },
     updatedAt: {
         type: Date,
         default: Date.now

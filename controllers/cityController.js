@@ -29,6 +29,10 @@ exports.getCities = async (req, res) => {
       }
     }
 
+    if (req.query.isTopLocation === 'true') {
+      match.isTopLocation = true;
+    }
+
     const cities = await City.aggregate([
       { $match: match },
       { $sort: { name: 1 } },

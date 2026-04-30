@@ -27,6 +27,10 @@ const ActivitySchema = new mongoose.Schema({
     image: {
         type: String
     },
+    images: {
+        type: [String],
+        default: []
+    },
     category: {
         type: String
     },

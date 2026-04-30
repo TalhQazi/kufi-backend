@@ -64,6 +64,11 @@ router.patch('/:id/adjustment', auth(), updateBookingAdjustment);
 // @access  Private
 router.patch('/:id', auth(), updateBooking);
 
+// @route   PATCH api/bookings/:id/transfer
+// @desc    Transfer booking to another supplier
+// @access  Private (Admin only)
+router.patch('/:id/transfer', auth(['admin']), require('../controllers/bookingController').transferBooking);
+
 module.exports = router;
 
 

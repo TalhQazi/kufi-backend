@@ -55,6 +55,7 @@ app.use('/api/activities', require('./routes/activityRoutes'));
 app.use('/api/bookings', require('./routes/bookingRoutes'));
 
 app.use('/api/admin', require('./routes/adminRoutes'));
+app.use('/api/config', require('./routes/publicConfigRoutes'));
 
 app.use('/api/supplier', require('./routes/supplierRoutes'));
 
@@ -82,6 +83,7 @@ app.use('/api/sections', require('./routes/sectionVisibilityRoutes'));
 app.use('/api/payment', require('./routes/paymentRoutes'));
 
 app.use('/api/legal-content', require('./routes/legalContentRoutes'));
+app.use('/api/newsletter', require('./routes/newsletterRoutes'));
 
 
 // Health Check

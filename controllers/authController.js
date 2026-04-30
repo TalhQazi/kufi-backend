@@ -1,6 +1,8 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const { OAuth2Client } = require('google-auth-library');
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Register User
 exports.registerUser = async (req, res) => {
@@ -125,5 +127,50 @@ exports.updateProfile = async (req, res) => {
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server error');
+    }
+const axios = require('axios');
+
+// Google Login
+exports.googleLogin = async (req, res) => {
+    const { token } = req.body; // This is the access_token from frontend
+
+    try {
+        // Fetch user info from Google using the access token
+        const googleRes = await axios.get(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${token}`);
+        const { name, email, picture } = googleRes.data;
+
+        let user = await User.findOne({ email });
+
+        if (!user) {
+            user = new User({
+                name,
+                email,
+                password: Math.random().toString(36).slice(-8),
+                role: 'user',
+                avatar: picture,
+                status: 'active'
+            });
+            await user.save();
+        }
+
+        const payload = {
+            user: {
+                id: user.id,
+                role: user.role
+            }
+        };
+
+        jwt.sign(
+            payload,
+            process.env.JWT_SECRET,
+            { expiresIn: 360000 },
+            (err, token) => {
+                if (err) throw err;
+                res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+            }
+        );
+    } catch (err) {
+        console.error('Google Login Error:', err.response?.data || err.message);
+        res.status(500).send('Google Login failed');
     }
 };

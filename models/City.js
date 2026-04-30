@@ -22,6 +22,10 @@ const CitySchema = new mongoose.Schema({
     enum: ['active', 'draft'],
     default: 'active'
   },
+  isTopLocation: {
+    type: Boolean,
+    default: false
+  },
   createdAt: {
     type: Date,
     default: Date.now,

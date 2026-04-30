@@ -769,3 +769,36 @@ exports.updateBooking = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
+// Transfer Booking to another supplier
+exports.transferBooking = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { supplierId } = req.body;
+
+        if (!supplierId) {
+            return res.status(400).json({ message: 'Target supplier ID is required' });
+        }
+
+        const booking = await Booking.findById(id);
+        if (!booking) {
+            return res.status(404).json({ message: 'Booking not found' });
+        }
+
+        const newSupplier = await User.findOne({ _id: supplierId, role: 'supplier' });
+        if (!newSupplier) {
+            return res.status(404).json({ message: 'Target supplier not found' });
+        }
+
+        booking.supplier = supplierId;
+        booking.status = 'pending'; // Reset to pending for the new supplier to review
+        
+        // Optionally clear rejections if we are force-transferring
+        booking.rejectedSuppliers = (booking.rejectedSuppliers || []).filter(s => String(s) !== String(supplierId));
+
+        await booking.save();
+        res.json({ message: 'Booking transferred successfully', booking });
+    } catch (err) {
+        console.error('Error transferring booking:', err.message);
+        res.status(500).send('Server Error');
+    }
+};

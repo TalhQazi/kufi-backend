@@ -343,6 +343,7 @@ exports.updateGlobalSettings = async (req, res) => {
         
         if (commissionPercentage !== undefined) settings.commissionPercentage = commissionPercentage;
         if (stripePublicKey !== undefined) settings.stripePublicKey = stripePublicKey;
+        if (req.body.googleAnalyticsId !== undefined) settings.googleAnalyticsId = req.body.googleAnalyticsId;
         
         settings.updatedAt = Date.now();
         await settings.save();

@@ -16,6 +16,10 @@ const sanitizeActivityPayload = (body) => {
         next.addOns = normalizeStringArray(next.addOns);
     }
 
+    if (Object.prototype.hasOwnProperty.call(next, 'images')) {
+        next.images = normalizeStringArray(next.images);
+    }
+
     // Handle coordinates - ensure lat/lng are numbers or null
     if (Object.prototype.hasOwnProperty.call(next, 'coordinates')) {
         const coords = next.coordinates;

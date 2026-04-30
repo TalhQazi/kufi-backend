@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const legalContentSchema = new mongoose.Schema({
     type: {
         type: String,
-        enum: ['terms', 'privacy', 'faqs', 'support'],
+        enum: ['terms', 'privacy', 'faqs', 'support', 'about'],
         required: true,
         unique: true
     },
@@ -15,7 +15,8 @@ const legalContentSchema = new mongoose.Schema({
                 'terms': 'Terms & Conditions',
                 'privacy': 'Privacy Policy',
                 'faqs': 'Frequently Asked Questions',
-                'support': 'Support'
+                'support': 'Support',
+                'about': 'About Us'
             };
             return titles[this.type] || 'Content';
         }
@@ -62,6 +63,11 @@ legalContentSchema.statics.initializeDefaults = async function() {
             type: 'support',
             title: 'Support',
             content: '<p>Support content goes here...</p>'
+        },
+        {
+            type: 'about',
+            title: 'About Us',
+            content: '<p>Learn more about Kufi Travel and our mission to provide seamless booking experiences.</p>'
         }
     ];
 
