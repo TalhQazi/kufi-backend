@@ -97,7 +97,7 @@ exports.getProfile = async (req, res) => {
 
 // Update User Profile
 exports.updateProfile = async (req, res) => {
-    const { fullName, phone, country, dob, gender, address, city, nationality, avatar } = req.body;
+    const { fullName, phone, country, dob, gender, streetNumber, address, city, state, zipCode, nationality, avatar, businessName, businessAddress, businessLicense } = req.body;
 
     // Build profile object
     const profileFields = {};
@@ -106,10 +106,21 @@ exports.updateProfile = async (req, res) => {
     if (country) profileFields.country = country;
     if (dob) profileFields.dob = dob;
     if (gender) profileFields.gender = gender;
+    if (streetNumber) profileFields.streetNumber = streetNumber;
     if (address) profileFields.address = address;
     if (city) profileFields.city = city;
+    if (state) profileFields.state = state;
+    if (zipCode) profileFields.zipCode = zipCode;
     if (nationality) profileFields.nationality = nationality;
     if (avatar) profileFields.avatar = avatar;
+    // Supplier fields
+    if (businessName) profileFields.businessName = businessName;
+    if (businessAddress) profileFields.businessAddress = businessAddress;
+    if (businessLicense) profileFields.businessLicense = businessLicense;
+    // Set businessProfileStatus to pending if business info is provided
+    if (businessName || businessAddress) {
+        profileFields.businessProfileStatus = 'pending';
+    }
 
     try {
         let user = await User.findById(req.user.id);
@@ -123,6 +134,40 @@ exports.updateProfile = async (req, res) => {
         ).select('-password');
 
         res.json(user);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};
+
+// Change Password
+exports.changePassword = async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+        return res.status(400).json({ msg: 'Current password and new password are required' });
+    }
+
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) {
+            return res.status(404).json({ msg: 'User not found' });
+        }
+
+        // Check if user has a password (Google users may not)
+        const isMatch = await bcrypt.compare(currentPassword, user.password);
+        if (!isMatch) {
+            return res.status(400).json({ msg: 'Current password is incorrect' });
+        }
+
+        // Hash new password
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+        user.password = hashedPassword;
+        await user.save();
+
+        res.json({ msg: 'Password updated successfully' });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server error');

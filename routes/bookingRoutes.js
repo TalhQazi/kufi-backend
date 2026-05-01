@@ -27,7 +27,21 @@ router.post('/', createBooking);
 
 router.get('/user/:userId', auth(), getUserBookings);
 
-
+// @route   GET api/bookings
+// @desc    Get current user's bookings
+// @access  Private
+router.get('/', auth(), async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const bookings = await require('../models/Booking').find({ user: userId })
+            .populate('items.activity', 'title')
+            .sort({ createdAt: -1 });
+        res.json(bookings);
+    } catch (error) {
+        console.error('Error fetching user bookings:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
 
 // @route   GET api/bookings/supplier
 

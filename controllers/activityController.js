@@ -37,11 +37,16 @@ const sanitizeActivityPayload = (body) => {
 // Get all activities
 exports.getActivities = async (req, res) => {
     try {
-        const activities = await Activity.find().sort({ _id: -1 });
+        const activities = await Activity.find()
+            .select('title description location country price duration image images category rating reviews status')
+            .lean()
+            .maxTimeMS(10000)
+            .sort({ _id: -1 })
+            .limit(100);
         res.json(activities);
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+        console.error('Error fetching activities:', err.message);
+        res.status(500).json({ message: 'Error fetching activities', error: err.message });
     }
 };
 

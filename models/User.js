@@ -38,10 +38,19 @@ const UserSchema = new mongoose.Schema({
     gender: {
         type: String
     },
+    streetNumber: {
+        type: String
+    },
     address: {
         type: String
     },
     city: {
+        type: String
+    },
+    state: {
+        type: String
+    },
+    zipCode: {
         type: String
     },
     nationality: {
@@ -55,6 +64,30 @@ const UserSchema = new mongoose.Schema({
         default: 0,
         min: 0,
         max: 100
+    },
+    // Supplier verification fields
+    businessName: {
+        type: String
+    },
+    businessAddress: {
+        type: String
+    },
+    businessLicense: {
+        type: String // URL to uploaded document
+    },
+    businessLicenseStatus: {
+        type: String,
+        enum: ['pending', 'verified', 'rejected'],
+        default: 'pending'
+    },
+    businessProfileStatus: {
+        type: String,
+        enum: ['pending', 'verified', 'rejected'],
+        default: 'pending'
+    },
+    isVerified: {
+        type: Boolean,
+        default: false
     },
     createdAt: {
         type: Date,

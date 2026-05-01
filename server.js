@@ -84,6 +84,7 @@ app.use('/api/payment', require('./routes/paymentRoutes'));
 
 app.use('/api/legal-content', require('./routes/legalContentRoutes'));
 app.use('/api/newsletter', require('./routes/newsletterRoutes'));
+app.use('/api/upload', require('./routes/uploadRoutes'));
 
 
 // Health Check
