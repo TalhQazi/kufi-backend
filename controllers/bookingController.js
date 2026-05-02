@@ -775,25 +775,37 @@ exports.transferBooking = async (req, res) => {
         const { id } = req.params;
         const { supplierId } = req.body;
 
-        if (!supplierId) {
-            return res.status(400).json({ message: 'Target supplier ID is required' });
-        }
-
         const booking = await Booking.findById(id);
         if (!booking) {
             return res.status(404).json({ message: 'Booking not found' });
         }
 
-        const newSupplier = await User.findOne({ _id: supplierId, role: 'supplier' });
+        let targetSupplierId = supplierId;
+
+        if (!targetSupplierId) {
+            // Auto-pick the next available supplier
+            const tripCountry = normalizeCountryLabel(booking?.tripDetails?.country);
+            const rejected = Array.isArray(booking.rejectedSuppliers) ? booking.rejectedSuppliers.map((s) => String(s)) : [];
+            const excluded = new Set(rejected);
+            if (booking.supplier) excluded.add(String(booking.supplier));
+            
+            const nextSupplierId = await pickNextSupplierIdForCountry(tripCountry, Array.from(excluded));
+            if (!nextSupplierId) {
+                return res.status(400).json({ message: 'No other suppliers available for this country' });
+            }
+            targetSupplierId = nextSupplierId;
+        }
+
+        const newSupplier = await User.findOne({ _id: targetSupplierId, role: 'supplier' });
         if (!newSupplier) {
             return res.status(404).json({ message: 'Target supplier not found' });
         }
 
-        booking.supplier = supplierId;
+        booking.supplier = targetSupplierId;
         booking.status = 'pending'; // Reset to pending for the new supplier to review
         
         // Optionally clear rejections if we are force-transferring
-        booking.rejectedSuppliers = (booking.rejectedSuppliers || []).filter(s => String(s) !== String(supplierId));
+        booking.rejectedSuppliers = (booking.rejectedSuppliers || []).filter(s => String(s) !== String(targetSupplierId));
 
         await booking.save();
         res.json({ message: 'Booking transferred successfully', booking });
@@ -802,3 +814,5 @@ exports.transferBooking = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
+
+
