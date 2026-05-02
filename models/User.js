@@ -89,6 +89,15 @@ const UserSchema = new mongoose.Schema({
         type: Boolean,
         default: false
     },
+    wishlist: {
+        type: [{
+            countryId: { type: mongoose.Schema.Types.ObjectId, ref: 'Country' },
+            countryName: { type: String },
+            countryImage: { type: String },
+            addedAt: { type: Date, default: Date.now }
+        }],
+        default: []
+    },
     createdAt: {
         type: Date,
         default: Date.now
