@@ -69,6 +69,9 @@ const updateSectionVisibility = async (req, res) => {
             id: sanitize(section.id) || '',
             name: sanitize(section.name) || '',
             description: sanitize(section.description) || '',
+            title: sanitize(section.title) || '',
+            heading: sanitize(section.heading) || '',
+            subheading: sanitize(section.subheading) || '',
             page: sanitize(section.page) || 'home',
             isVisible: section.isVisible !== false,
             sortOrder: Number(section.sortOrder) || 0
