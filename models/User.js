@@ -101,7 +101,14 @@ const UserSchema = new mongoose.Schema({
     createdAt: {
         type: Date,
         default: Date.now
+    },
+    lastReadNotifications: {
+        type: Date,
+        default: Date.now
     }
 });
+
+UserSchema.index({ role: 1 });
+UserSchema.index({ status: 1 });
 
 module.exports = mongoose.model('User', UserSchema);

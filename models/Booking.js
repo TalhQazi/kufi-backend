@@ -103,4 +103,9 @@ const BookingSchema = new mongoose.Schema({
     stripeSessionId: String
 });
 
+BookingSchema.index({ user: 1 });
+BookingSchema.index({ supplier: 1 });
+BookingSchema.index({ status: 1 });
+BookingSchema.index({ createdAt: -1 });
+
 module.exports = mongoose.model('Booking', BookingSchema);

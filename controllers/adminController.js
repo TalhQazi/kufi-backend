@@ -2,6 +2,8 @@ const User = require('../models/User');
 const Activity = require('../models/Activity');
 const Booking = require('../models/Booking');
 const GlobalSettings = require('../models/GlobalSettings');
+const EmailSettings = require('../models/EmailSettings');
+const { sendEmail } = require('../utils/emailService');
 
 const parseBudgetNumber = (value) => {
     if (!value) return 0;
@@ -30,13 +32,19 @@ const timeAgo = (date) => {
 // Get System Stats
 exports.getSystemStats = async (req, res) => {
     try {
+        const adminId = req.user.id;
+        const adminUser = await User.findById(adminId);
+        const lastRead = adminUser?.lastReadNotifications || new Date(0);
+
         const totalUsers = await User.countDocuments({ role: 'user' });
         const totalSuppliers = await User.countDocuments({ role: 'supplier' });
 
-        const [totalActivities, totalBookings, pendingRequests] = await Promise.all([
+        const [totalActivities, totalBookings, pendingRequests, unreadBookings, unreadSuppliers] = await Promise.all([
             Activity.countDocuments(),
             Booking.countDocuments(),
-            Booking.countDocuments({ status: 'pending' })
+            Booking.countDocuments({ status: 'pending' }),
+            Booking.countDocuments({ createdAt: { $gt: lastRead } }),
+            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } })
         ]);
 
         const confirmedBookings = await Booking.find({ status: 'confirmed' }).select('tripDetails');
@@ -51,6 +59,7 @@ exports.getSystemStats = async (req, res) => {
             activities: totalActivities,
             bookings: totalBookings,
             pendingRequests,
+            unreadNotifications: unreadBookings + unreadSuppliers,
             revenue,
             reportedIssues
         });
@@ -385,9 +394,98 @@ exports.approveSupplier = async (req, res) => {
         user.businessProfileStatus = 'verified';
         
         await user.save();
+
+        // Send Approval Email
+        try {
+            await sendEmail({
+                to: user.email,
+                subject: 'Your Supplier Account Approved',
+                templateKey: 'supplierApproval',
+                html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                        <h2 style="color: #a26e35;">Congratulations ${user.name}!</h2>
+                        <p>Your supplier account on <strong>Kufi</strong> has been approved by the administrator.</p>
+                        <p>You can now log in to your dashboard and start managing your activities and bookings.</p>
+                        <div style="margin-top: 30px; text-align: center;">
+                            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Login to Dashboard</a>
+                        </div>
+                        <p style="margin-top: 30px; font-size: 12px; color: #777;">If you have any questions, feel free to contact our support team.</p>
+                    </div>
+                `
+            });
+        } catch (emailErr) {
+            console.error('Error sending approval email:', emailErr);
+        }
+
         res.json(user);
     } catch (err) {
         console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+// Mark notifications as read
+exports.markNotificationsAsRead = async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ msg: 'User not found' });
+
+        user.lastReadNotifications = Date.now();
+        await user.save();
+        res.json({ msg: 'Notifications marked as read' });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+// Email Settings Management
+exports.getEmailSettings = async (req, res) => {
+    try {
+        let settings = await EmailSettings.findOne();
+        if (!settings) {
+            settings = new EmailSettings();
+            await settings.save();
+        }
+        res.json(settings);
+    } catch (err) {
+        console.error('Error fetching email settings:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+exports.updateEmailSettings = async (req, res) => {
+    try {
+        const {
+            smtpHost,
+            smtpPort,
+            smtpUser,
+            smtpPass,
+            fromEmail,
+            fromName,
+            encryption,
+            templates
+        } = req.body;
+
+        let settings = await EmailSettings.findOne();
+        if (!settings) {
+            settings = new EmailSettings();
+        }
+
+        if (smtpHost !== undefined) settings.smtpHost = smtpHost;
+        if (smtpPort !== undefined) settings.smtpPort = smtpPort;
+        if (smtpUser !== undefined) settings.smtpUser = smtpUser;
+        if (smtpPass !== undefined) settings.smtpPass = smtpPass;
+        if (fromEmail !== undefined) settings.fromEmail = fromEmail;
+        if (fromName !== undefined) settings.fromName = fromName;
+        if (encryption !== undefined) settings.encryption = encryption;
+        if (templates !== undefined) settings.templates = { ...settings.templates, ...templates };
+
+        settings.updatedAt = Date.now();
+        await settings.save();
+        res.json(settings);
+    } catch (err) {
+        console.error('Error updating email settings:', err.message);
         res.status(500).send('Server Error');
     }
 };

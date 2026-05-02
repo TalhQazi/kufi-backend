@@ -2,6 +2,7 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
+const { sendEmail } = require('../utils/emailService');
 
 // Register User
 exports.registerUser = async (req, res) => {
@@ -37,6 +38,33 @@ exports.registerUser = async (req, res) => {
         user.password = await bcrypt.hash(password, salt);
 
         await user.save();
+
+        // Send Registration Email
+        try {
+            const templateKey = role === 'supplier' ? 'supplierRegistration' : 'userRegistration';
+            const subject = role === 'supplier' ? 'Supplier Registration Pending Approval' : 'Welcome to Kufi!';
+            const message = role === 'supplier' 
+                ? 'Thank you for registering as a supplier on Kufi. Your account is currently pending administrator approval. We will notify you once your account is activated.'
+                : 'Welcome to Kufi! Your account has been successfully created. You can now explore destinations and book activities.';
+
+            await sendEmail({
+                to: user.email,
+                subject,
+                templateKey,
+                html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                        <h2 style="color: #a26e35;">Hello ${user.name}!</h2>
+                        <p>${message}</p>
+                        <div style="margin-top: 30px; text-align: center;">
+                            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Login to Kufi</a>
+                        </div>
+                        <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for joining us.</p>
+                    </div>
+                `
+            });
+        } catch (emailErr) {
+            console.error('Error sending registration email:', emailErr);
+        }
 
         const safeUser = user.toObject();
         delete safeUser.password;

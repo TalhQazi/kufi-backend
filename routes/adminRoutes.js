@@ -19,10 +19,25 @@ const {
     updateGlobalSettings,
     toggleUserStatus,
     approveSupplier,
+    markNotificationsAsRead,
+    getEmailSettings,
+    updateEmailSettings
 } = require('../controllers/adminController');
 
 // All routes require 'admin' role
 router.use(auth(['admin']));
+
+// @route   POST api/admin/notifications/read
+// @desc    Mark all notifications as read
+router.post('/notifications/read', markNotificationsAsRead);
+
+// @route   GET api/admin/email-settings
+// @desc    Get email configuration
+router.get('/email-settings', getEmailSettings);
+
+// @route   PUT api/admin/email-settings
+// @desc    Update email configuration
+router.put('/email-settings', updateEmailSettings);
 
 // @route   GET api/admin/stats
 // @desc    Get system wide stats

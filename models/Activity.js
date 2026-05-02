@@ -67,4 +67,9 @@ const ActivitySchema = new mongoose.Schema({
     }
 });
 
+ActivitySchema.index({ supplier: 1 });
+ActivitySchema.index({ status: 1 });
+ActivitySchema.index({ category: 1 });
+ActivitySchema.index({ country: 1 });
+
 module.exports = mongoose.model('Activity', ActivitySchema);

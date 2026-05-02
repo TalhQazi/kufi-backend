@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 
 const mongoose = require('mongoose');
 
@@ -23,6 +24,7 @@ const app = express();
 // Middleware
 
 app.use(cors());
+app.use(compression());
 
 app.use(bodyParser.json({ limit: '20mb' }));
 
