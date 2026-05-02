@@ -17,6 +17,8 @@ const {
     getBestSupplierForOrder,
     getGlobalSettings,
     updateGlobalSettings,
+    toggleUserStatus,
+    approveSupplier,
 } = require('../controllers/adminController');
 
 // All routes require 'admin' role
@@ -136,5 +138,13 @@ router.put('/suppliers/:supplierId/verify-all', async (req, res) => {
         res.status(500).json({ msg: 'Server error' });
     }
 });
+
+// @route   PATCH api/admin/users/:id/toggle
+// @desc    Toggle user status
+router.patch('/users/:id/toggle', toggleUserStatus);
+
+// @route   PATCH api/admin/users/:id/approve
+// @desc    Approve supplier
+router.patch('/users/:id/approve', approveSupplier);
 
 module.exports = router;

@@ -353,3 +353,41 @@ exports.updateGlobalSettings = async (req, res) => {
         res.status(500).send('Server Error');
     }
 };
+
+// Toggle user status (active/suspended)
+exports.toggleUserStatus = async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ msg: 'User not found' });
+
+        user.status = user.status === 'suspended' ? 'active' : 'suspended';
+        await user.save();
+        res.json(user);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+// Approve supplier registration
+exports.approveSupplier = async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ msg: 'User not found' });
+
+        if (user.role !== 'supplier') {
+            return res.status(400).json({ msg: 'User is not a supplier' });
+        }
+
+        user.status = 'active';
+        user.isVerified = true;
+        user.businessLicenseStatus = 'verified';
+        user.businessProfileStatus = 'verified';
+        
+        await user.save();
+        res.json(user);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+};
