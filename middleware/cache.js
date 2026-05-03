@@ -10,17 +10,22 @@ const cacheMiddleware = (ttlSeconds = 3600) => {
         const key = `cache:${req.originalUrl || req.url}`;
         
         try {
-            const cachedData = await getCache(key);
+            // Add a timeout to cache lookup to prevent hanging the whole request
+            const cachePromise = getCache(key);
+            const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 200)); // 200ms timeout
+            
+            const cachedData = await Promise.race([cachePromise, timeoutPromise]);
+            
             if (cachedData) {
-                // Set a header to indicate cache hit
                 res.setHeader('X-Cache', 'HIT');
                 return res.json(cachedData);
             }
 
-            // If not cached, override res.json to cache the response before sending
+            // If not cached, override res.json to cache the response
             const originalJson = res.json;
             res.json = function (data) {
-                setCache(key, data, ttlSeconds);
+                // Set cache in background without awaiting
+                setCache(key, data, ttlSeconds).catch(err => console.error('Background cache set error:', err));
                 res.setHeader('X-Cache', 'MISS');
                 return originalJson.call(this, data);
             };
