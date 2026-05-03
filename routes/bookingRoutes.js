@@ -34,7 +34,7 @@ router.get('/', auth(), async (req, res) => {
     try {
         const userId = req.user.id;
         const bookings = await require('../models/Booking').find({ user: userId })
-            .populate('items.activity', 'title')
+            .populate('items.activity', 'title imageUrl images image location')
             .sort({ createdAt: -1 });
         res.json(bookings);
     } catch (error) {
