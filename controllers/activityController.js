@@ -1,4 +1,5 @@
 const Activity = require('../models/Activity');
+const { clearCache } = require('../utils/cache');
 
 const normalizeStringArray = (value) => {
     if (!Array.isArray(value)) return [];
@@ -64,6 +65,9 @@ exports.updateActivity = async (req, res) => {
             return res.status(404).json({ msg: 'Activity not found' });
         }
 
+        // Clear cache
+        await clearCache('cache:/api/activities*');
+
         res.json(activity);
     } catch (err) {
         console.error(err.message);
@@ -79,6 +83,9 @@ exports.deleteActivity = async (req, res) => {
         if (!activity) {
             return res.status(404).json({ msg: 'Activity not found' });
         }
+
+        // Clear cache
+        await clearCache('cache:/api/activities*');
 
         res.json({ msg: 'Activity deleted' });
     } catch (err) {
@@ -110,6 +117,10 @@ exports.createActivity = async (req, res) => {
         const safeBody = sanitizeActivityPayload(req.body);
         const newActivity = new Activity(safeBody);
         const activity = await newActivity.save();
+        
+        // Clear cache
+        await clearCache('cache:/api/activities*');
+
         res.json(activity);
     } catch (err) {
         console.error(err.message);

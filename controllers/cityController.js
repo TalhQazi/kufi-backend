@@ -1,5 +1,5 @@
-const mongoose = require('mongoose');
 const City = require('../models/City');
+const { clearCache } = require('../utils/cache');
 
 // Get all cities
 exports.getCities = async (req, res) => {
@@ -66,6 +66,10 @@ exports.createCity = async (req, res) => {
   try {
     const city = new City(req.body);
     await city.save();
+
+    // Clear cache
+    await clearCache('cache:/api/cities*');
+
     res.status(201).json(city);
   } catch (err) {
     console.error(err.message);
@@ -86,6 +90,9 @@ exports.updateCity = async (req, res) => {
       return res.status(404).json({ msg: 'City not found' });
     }
 
+    // Clear cache
+    await clearCache('cache:/api/cities*');
+
     res.json(city);
   } catch (err) {
     console.error(err.message);
@@ -101,6 +108,9 @@ exports.deleteCity = async (req, res) => {
     if (!city) {
       return res.status(404).json({ msg: 'City not found' });
     }
+
+    // Clear cache
+    await clearCache('cache:/api/cities*');
 
     res.json({ msg: 'City deleted' });
   } catch (err) {

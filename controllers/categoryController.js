@@ -1,4 +1,5 @@
 const Category = require('../models/Category');
+const { clearCache } = require('../utils/cache');
 
 const sanitizeCategoryPayload = (body) => {
     const next = { ...(body || {}) };
@@ -52,6 +53,10 @@ exports.createCategory = async (req, res) => {
 
         const category = new Category(safeBody);
         await category.save();
+
+        // Clear cache
+        await clearCache('cache:/api/categories*');
+
         res.status(201).json(category);
     } catch (err) {
         console.error(err.message);
@@ -75,6 +80,9 @@ exports.updateCategory = async (req, res) => {
             return res.status(404).json({ msg: 'Category not found' });
         }
 
+        // Clear cache
+        await clearCache('cache:/api/categories*');
+
         res.json(category);
     } catch (err) {
         console.error(err.message);
@@ -92,6 +100,9 @@ exports.deleteCategory = async (req, res) => {
         if (!category) {
             return res.status(404).json({ msg: 'Category not found' });
         }
+
+        // Clear cache
+        await clearCache('cache:/api/categories*');
 
         res.json({ msg: 'Category deleted' });
     } catch (err) {

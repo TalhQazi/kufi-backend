@@ -9,9 +9,10 @@ const {
     deleteCategory
 } = require('../controllers/categoryController');
 const auth = require('../middleware/auth');
+const cache = require('../middleware/cache');
 
-router.get('/', getCategories);
-router.get('/:id', getCategoryById);
+router.get('/', cache(1800), getCategories); // Cache for 30 minutes
+router.get('/:id', cache(1800), getCategoryById); // Cache for 30 minutes
 
 // Upload category icon (admin only)
 router.post('/upload-icon', auth(['admin']), async (req, res) => {

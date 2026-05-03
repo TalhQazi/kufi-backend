@@ -1,4 +1,5 @@
 const Country = require('../models/Country');
+const { clearCache } = require('../utils/cache');
 
 // Get all countries
 exports.getCountries = async (req, res) => {
@@ -32,6 +33,10 @@ exports.createCountry = async (req, res) => {
     try {
         const country = new Country(req.body);
         await country.save();
+
+        // Clear cache
+        await clearCache('cache:/api/countries*');
+
         res.status(201).json(country);
     } catch (err) {
         console.error(err.message);
@@ -52,6 +57,9 @@ exports.updateCountry = async (req, res) => {
             return res.status(404).json({ msg: 'Country not found' });
         }
 
+        // Clear cache
+        await clearCache('cache:/api/countries*');
+
         res.json(country);
     } catch (err) {
         console.error(err.message);
@@ -67,6 +75,9 @@ exports.deleteCountry = async (req, res) => {
         if (!country) {
             return res.status(404).json({ msg: 'Country not found' });
         }
+
+        // Clear cache
+        await clearCache('cache:/api/countries*');
 
         res.json({ msg: 'Country deleted' });
     } catch (err) {

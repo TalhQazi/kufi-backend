@@ -2,16 +2,17 @@ const express = require('express');
 const router = express.Router();
 const { getCountries, getCountryById, createCountry, updateCountry, deleteCountry } = require('../controllers/countryController');
 const auth = require('../middleware/auth');
+const cache = require('../middleware/cache');
 
 // @route   GET api/countries
 // @desc    Get all countries
 // @access  Public
-router.get('/', getCountries);
+router.get('/', cache(600), getCountries); // Cache for 10 minutes
 
 // @route   GET api/countries/:id
 // @desc    Get country by ID
 // @access  Public
-router.get('/:id', getCountryById);
+router.get('/:id', cache(1200), getCountryById); // Cache for 20 minutes
 
 // @route   POST api/countries
 // @desc    Create new country

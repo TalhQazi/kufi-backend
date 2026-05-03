@@ -2,17 +2,18 @@ const express = require('express');
 const router = express.Router();
 const { getActivities, getActivityById, createActivity, seedActivities, updateActivity, deleteActivity } = require('../controllers/activityController');
 const auth = require('../middleware/auth');
+const cache = require('../middleware/cache');
 
 // @route   GET api/activities
 // @desc    Get all activities
 // @access  Public
-router.get('/', getActivities);
+router.get('/', cache(300), getActivities); // Cache for 5 minutes
 
 // @route   GET api/activities/:id
 // @desc    Get activity by ID
 // @access  Public
 //comment added now 
-router.get('/:id', getActivityById);
+router.get('/:id', cache(600), getActivityById); // Cache for 10 minutes
 
 // @route   POST api/activities
 // @desc    Create an activity

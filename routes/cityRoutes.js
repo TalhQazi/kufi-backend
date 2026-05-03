@@ -8,16 +8,17 @@ const {
   deleteCity,
 } = require('../controllers/cityController');
 const auth = require('../middleware/auth');
+const cache = require('../middleware/cache');
 
 // @route   GET api/cities
 // @desc    Get all cities
 // @access  Public
-router.get('/', getCities);
+router.get('/', cache(600), getCities); // Cache for 10 minutes
 
 // @route   GET api/cities/:id
 // @desc    Get city by ID
 // @access  Public
-router.get('/:id', getCityById);
+router.get('/:id', cache(1200), getCityById); // Cache for 20 minutes
 
 // @route   POST api/cities
 // @desc    Create new city
