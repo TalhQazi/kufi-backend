@@ -3,7 +3,6 @@ const cors = require('cors');
 const compression = require('compression');
 const bodyParser = require('body-parser');
 const path = require('path');
-const timeout = require('connect-timeout');
 
 require('dotenv').config();
 
@@ -12,17 +11,10 @@ const connectDB = require('./config/db');
 const app = express();
 
 // Middleware
-app.use(timeout('30s'));
 app.use(cors());
 app.use(compression());
 app.use(bodyParser.json({ limit: '20mb' }));
 app.use(bodyParser.urlencoded({ limit: '20mb', extended: true }));
-
-// Halt on timeout
-const haltOnTimeout = (req, res, next) => {
-    if (!req.timedout) next();
-};
-app.use(haltOnTimeout);
 
 // Connect to Database
 connectDB();
