@@ -47,7 +47,10 @@ exports.getSystemStats = async (req, res) => {
             User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } })
         ]);
 
-        const confirmedBookings = await Booking.find({ status: 'confirmed' }).select('tripDetails');
+        const confirmedBookings = await Booking.find({ status: 'confirmed' })
+            .select('tripDetails')
+            .sort({ createdAt: -1 })
+            .limit(1000);
         const revenue = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
 
         // These are not tracked in DB yet; keep safe defaults so UI doesn't break.
