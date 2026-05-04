@@ -25,7 +25,7 @@ exports.getSupplierStats = async (req, res) => {
     try {
         const supplierId = req.user.id;
 
-        const myActivities = await Activity.find({ supplier: supplierId });
+        const myActivities = await Activity.find({ supplier: supplierId }).lean();
 
         const ratings = (myActivities || [])
             .map((activity) => Number(activity?.rating))
@@ -54,7 +54,7 @@ exports.getSupplierStats = async (req, res) => {
 // Get My Activities
 exports.getMyActivities = async (req, res) => {
     try {
-        const activities = await Activity.find({ supplier: req.user.id });
+        const activities = await Activity.find({ supplier: req.user.id }).lean();
         res.json(activities);
     } catch (err) {
         console.error(err.message);
@@ -96,11 +96,12 @@ exports.getMyBookings = async (req, res) => {
         let bookingsQuery = Booking.find(query)
             .sort({ createdAt: -1 })
             .populate('user', 'name email')
-            .populate('items.activity');
+            .populate('items.activity')
+            .lean();
 
-        if (limit) {
-            bookingsQuery = bookingsQuery.limit(parseInt(limit));
-        }
+        // Default limit to prevent timeouts
+        const fetchLimit = limit ? parseInt(limit) : 100;
+        bookingsQuery = bookingsQuery.limit(fetchLimit);
 
         const bookings = await bookingsQuery;
 
