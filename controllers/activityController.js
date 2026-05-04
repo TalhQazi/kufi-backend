@@ -64,11 +64,11 @@ exports.getActivities = async (req, res) => {
         }
 
         const activities = await Activity.find(filter)
-            .select('title description summary location country price duration image images category rating reviews availability isInternational status')
+            .select('title description location country price duration image category rating reviews status createdAt')
             .lean()
-            .maxTimeMS(5000)
-            .sort({ _id: -1 })
-            .limit(100); // Increased limit as we now have filtering
+            .maxTimeMS(20000)
+            .sort({ createdAt: -1 })
+            .limit(100); 
         res.json(activities);
     } catch (err) {
         console.error('Error fetching activities:', err.message);

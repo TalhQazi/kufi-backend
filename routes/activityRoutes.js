@@ -7,7 +7,7 @@ const cache = require('../middleware/cache');
 // @route   GET api/activities
 // @desc    Get all activities
 // @access  Public
-router.get('/', cache(300), getActivities); // Cache for 5 minutes
+router.get('/', getActivities);
 
 // @route   GET api/activities/:id
 // @desc    Get activity by ID
