@@ -122,7 +122,7 @@ exports.deleteActivity = async (req, res) => {
 // Get single activity
 exports.getActivityById = async (req, res) => {
     try {
-        const activity = await Activity.findById(req.params.id);
+        const activity = await Activity.findById(req.params.id).lean();
         if (!activity) {
             return res.status(404).json({ msg: 'Activity not found' });
         }

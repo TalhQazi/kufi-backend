@@ -54,66 +54,60 @@ const pickBestSupplierIdForCountry = async (countryLabel) => {
     const normalizedLabel = normalizeCountryLabel(countryLabel);
     const countryKey = normalizeCountryKey(normalizedLabel);
 
-    let query = { role: 'supplier', status: 'active' };
     if (countryKey) {
-        const suppliers = await User.find({ role: 'supplier' }).select('_id country scorePoints createdAt');
-        const sameCountrySuppliers = (suppliers || []).filter((s) => normalizeCountryKey(s?.country) === countryKey);
+        // Find active suppliers in the same country
+        const sameCountrySuppliers = await User.find({ 
+            role: 'supplier', 
+            status: 'active',
+            country: { $regex: new RegExp(`^${countryKey}$`, 'i') } // Basic regex or exact match
+        })
+        .select('_id scorePoints createdAt')
+        .sort({ scorePoints: -1, createdAt: 1 })
+        .limit(1)
+        .lean();
         
         if (sameCountrySuppliers.length > 0) {
-            const ranked = sameCountrySuppliers
-                .map((s) => ({
-                    supplierId: s._id,
-                    scorePoints: s.scorePoints || 0,
-                    createdAt: s.createdAt ? new Date(s.createdAt).getTime() : 0,
-                }))
-                .sort((a, b) => {
-                    if (b.scorePoints !== a.scorePoints) return b.scorePoints - a.scorePoints;
-                    return a.createdAt - b.createdAt;
-                });
-
-            if (ranked[0]?.supplierId) return ranked[0].supplierId;
+            return sameCountrySuppliers[0]._id;
         }
         
-        const allSuppliers = await User.find(query)
-            .select('_id country scorePoints createdAt')
-            .sort({ scorePoints: -1, createdAt: 1 });
-        
-        if (allSuppliers.length > 0) {
-            return allSuppliers[0]._id;
-        }
-    } else {
-        const suppliers = await User.find(query)
+        // Fallback to top-ranked active supplier globally
+        const topSupplier = await User.find({ role: 'supplier', status: 'active' })
             .select('_id scorePoints createdAt')
             .sort({ scorePoints: -1, createdAt: 1 })
-            .limit(1);
+            .limit(1)
+            .lean();
         
-        if (suppliers.length > 0) {
-            return suppliers[0]._id;
-        }
+        return topSupplier[0]?._id || null;
+    } else {
+        const topSupplier = await User.find({ role: 'supplier', status: 'active' })
+            .select('_id scorePoints createdAt')
+            .sort({ scorePoints: -1, createdAt: 1 })
+            .limit(1)
+            .lean();
+        
+        return topSupplier[0]?._id || null;
     }
-    return null;
 };
 
 const pickNextSupplierIdForCountry = async (countryLabel, excludedSupplierIds = []) => {
     const normalizedLabel = normalizeCountryLabel(countryLabel);
     const countryKey = normalizeCountryKey(normalizedLabel);
-    const excluded = new Set((excludedSupplierIds || []).map((id) => String(id)).filter(Boolean));
+    const excluded = (excludedSupplierIds || []).map((id) => String(id)).filter(Boolean);
 
     if (!countryKey) return null;
 
     const suppliers = await User.find({ 
         role: 'supplier', 
         status: 'active',
-        _id: { $nin: Array.from(excluded) }
+        country: { $regex: new RegExp(`^${countryKey}$`, 'i') },
+        _id: { $nin: excluded }
     })
-        .select('_id country scorePoints createdAt')
-        .sort({ scorePoints: -1, createdAt: 1 });
+        .select('_id scorePoints createdAt')
+        .sort({ scorePoints: -1, createdAt: 1 })
+        .limit(1)
+        .lean();
     
-    const sameCountrySuppliers = (suppliers || [])
-        .filter((supplier) => normalizeCountryKey(supplier?.country) === countryKey);
-
-    if (sameCountrySuppliers.length === 0) return null;
-    return sameCountrySuppliers[0]?._id || null;
+    return suppliers[0]?._id || null;
 };
 
 const normalizeBookingPayload = (body) => {
@@ -205,7 +199,9 @@ exports.getUserBookings = async (req, res) => {
 
         const bookings = await Booking.find({ $or: orConditions })
             .sort({ createdAt: -1 })
-            .populate('items.activity');
+            .limit(100)
+            .populate('items.activity')
+            .lean();
 
         res.json({ bookings });
     } catch (err) {

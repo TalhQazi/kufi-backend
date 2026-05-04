@@ -132,7 +132,11 @@ exports.getSupplierHistory = async (req, res) => {
 // Get Pending Activities
 exports.getPendingActivities = async (req, res) => {
     try {
-        const activities = await Activity.find({ status: 'pending' }).populate('supplier', 'name email');
+        const activities = await Activity.find({ status: 'pending' })
+            .populate('supplier', 'name email')
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
         res.json(activities);
     } catch (err) {
         console.error(err.message);

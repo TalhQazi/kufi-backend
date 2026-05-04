@@ -67,7 +67,8 @@ exports.getReviews = async (req, res) => {
 
     const reviews = await Review.find(filter)
       .sort({ sortOrder: 1, createdAt: -1 })
-      .limit(20);
+      .limit(20)
+      .lean();
     res.json(reviews);
   } catch (err) {
     console.error(err.message);
@@ -77,7 +78,7 @@ exports.getReviews = async (req, res) => {
 
 exports.getReviewById = async (req, res) => {
   try {
-    const review = await Review.findById(req.params.id);
+    const review = await Review.findById(req.params.id).lean();
     if (!review) return res.status(404).json({ msg: 'Review not found' });
     res.json(review);
   } catch (err) {
