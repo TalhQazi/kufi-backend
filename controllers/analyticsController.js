@@ -3,6 +3,7 @@ const Activity = require('../models/Activity');
 const User = require('../models/User');
 const AnalyticsSession = require('../models/AnalyticsSession');
 const AnalyticsDaily = require('../models/AnalyticsDaily');
+const mongoose = require('mongoose');
 
 const getDayKey = (date = new Date()) => {
     const d = new Date(date);
@@ -42,11 +43,11 @@ exports.getSupplierAnalytics = async (req, res) => {
         const supplierId = req.user.id;
 
         // 1. Get supplier's activities
-        const myActivities = await Activity.find({ supplier: supplierId }).select('_id');
+        const myActivities = await Activity.find({ supplier: supplierId }).select('_id').lean();
         const activityIds = myActivities.map(a => a._id);
 
         // 2. Get bookings containing these activities (limit to 500 for safety)
-        const bookings = await Booking.find({ 'items.activity': { $in: activityIds } }).limit(500);
+        const bookings = await Booking.find({ 'items.activity': { $in: activityIds } }).limit(500).lean();
 
         // 3. Calculate statistics
         const pendingRequests = bookings.filter(b => b.status === 'pending').length;
@@ -56,15 +57,13 @@ exports.getSupplierAnalytics = async (req, res) => {
         const totalRevenue = bookings
             .filter(b => b.status === 'confirmed')
             .reduce((sum, b) => {
-                // Simplified revenue calculation: sum of item prices if available, or trip budget
-                // For now, let's use a placeholder if prices aren't fully structured
                 return sum + (parseInt(b.tripDetails?.budget?.replace(/[^0-9]/g, '')) || 0);
             }, 0);
 
         const overview = [
             { label: "Total Revenue", value: `$${totalRevenue.toLocaleString()}`, delta: "Real-time", icon: "DollarSign" },
             { label: "Active Bookings", value: String(bookings.filter(b => b.status === 'confirmed').length), delta: "Total", icon: "CalendarDays" },
-            { label: "Average Rating", value: "4.8", delta: "+0.3", icon: "Star" }, // Keep rating mockup for now
+            { label: "Average Rating", value: "4.8", delta: "+0.3", icon: "Star" },
             { label: "Experiences", value: String(myActivities.length), delta: "Active", icon: "Briefcase" },
         ];
 
@@ -183,7 +182,7 @@ exports.trackHeartbeat = async (req, res) => {
 exports.getAdminAnalytics = async (req, res) => {
     try {
         const now = new Date();
-        const activeCutoff = new Date(now.getTime() - 5 * 60 * 1000); // last 5 minutes
+        const activeCutoff = new Date(now.getTime() - 5 * 60 * 1000);
 
         const [
             totalTraffic,
@@ -191,16 +190,19 @@ exports.getAdminAnalytics = async (req, res) => {
             totalUsers,
             totalBookings
         ] = await Promise.all([
-            AnalyticsSession.countDocuments(),
-            AnalyticsSession.countDocuments({ lastSeenAt: { $gte: activeCutoff } }),
-            User.countDocuments({ role: 'user' }),
-            Booking.countDocuments()
+            AnalyticsSession.countDocuments().maxTimeMS(5000),
+            AnalyticsSession.countDocuments({ lastSeenAt: { $gte: activeCutoff } }).maxTimeMS(5000),
+            User.countDocuments({ role: 'user' }).maxTimeMS(5000),
+            Booking.countDocuments().maxTimeMS(5000)
         ]);
 
         const confirmedBookings = await Booking.find({ status: 'confirmed' })
             .select('tripDetails createdAt items')
             .sort({ createdAt: -1 })
-            .limit(1000);
+            .limit(1000)
+            .lean()
+            .maxTimeMS(5000);
+            
         const revenueNumber = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
         const conversionRate = safePercent(totalBookings, totalTraffic);
 
@@ -213,7 +215,7 @@ exports.getAdminAnalytics = async (req, res) => {
 
         const days = getLastNDays(7);
         const dayKeys = days.map((d) => getDayKey(d));
-        const dailyRows = await AnalyticsDaily.find({ day: { $in: dayKeys } }).select('day visitors pageViews');
+        const dailyRows = await AnalyticsDaily.find({ day: { $in: dayKeys } }).select('day visitors pageViews').lean().maxTimeMS(5000);
         const dailyMap = new Map((dailyRows || []).map((r) => [r.day, r]));
 
         const trafficLabels = days.map((d) => d.toLocaleDateString('en-US', { weekday: 'short' }));
@@ -263,7 +265,7 @@ exports.getAdminAnalytics = async (req, res) => {
             },
             { $sort: { count: -1 } },
             { $limit: 6 }
-        ]);
+        ]).option({ maxTimeMS: 10000 });
 
         const categoryLabels = (bookingsByCategoryAgg || []).map((r) => r._id || 'Other');
         const categoryCounts = (bookingsByCategoryAgg || []).map((r) => Number(r.count || 0));
@@ -278,7 +280,7 @@ exports.getAdminAnalytics = async (req, res) => {
             ]
         };
 
-        const sessionCount = await AnalyticsSession.countDocuments();
+        const sessionCount = await AnalyticsSession.countDocuments().maxTimeMS(5000);
         const totals = await AnalyticsSession.aggregate([
             {
                 $group: {
@@ -287,7 +289,8 @@ exports.getAdminAnalytics = async (req, res) => {
                     totalPageViews: { $sum: '$pageViews' }
                 }
             }
-        ]);
+        ]).option({ maxTimeMS: 5000 });
+        
         const totalSeconds = Number(totals?.[0]?.totalSeconds || 0);
         const totalPageViews = Number(totals?.[0]?.totalPageViews || 0);
         const avgSeconds = sessionCount ? Math.round(totalSeconds / sessionCount) : 0;
@@ -303,11 +306,8 @@ exports.getAdminAnalytics = async (req, res) => {
             { label: 'Bounce Rate', value: '—', change: 'Not tracked', color: 'bg-purple-500', changeColor: 'text-gray-500' },
         ];
 
-        // Top performing listings: bookings + revenue from confirmed bookings (budget-based)
-        // Reuse confirmedBookings from earlier to avoid duplicate query
-        const confirmedBookingDocs = confirmedBookings;
         const perActivity = new Map();
-        (confirmedBookingDocs || []).forEach((b) => {
+        (confirmedBookings || []).forEach((b) => {
             const budget = parseBudgetNumber(b.tripDetails?.budget);
             const items = Array.isArray(b.items) ? b.items : [];
             const uniqueActivityIds = [...new Set(items.map((it) => String(it?.activity || '')).filter(Boolean))];
@@ -329,7 +329,7 @@ exports.getAdminAnalytics = async (req, res) => {
             .map(([id]) => id);
 
         const activities = topIds.length
-            ? await Activity.find({ _id: { $in: topIds } }).select('title')
+            ? await Activity.find({ _id: { $in: topIds } }).select('title').lean()
             : [];
         const activityTitleMap = new Map((activities || []).map((a) => [String(a._id), a.title]));
 
@@ -348,20 +348,16 @@ exports.getAdminAnalytics = async (req, res) => {
             };
         });
 
-        // Simple traffic deltas based on last 2 days visitors
         const todayVisitors = visitorsSeries[visitorsSeries.length - 1] || 0;
         const yesterdayVisitors = visitorsSeries[visitorsSeries.length - 2] || 0;
         const trafficDelta = yesterdayVisitors ? `${Math.round(((todayVisitors - yesterdayVisitors) / yesterdayVisitors) * 100)}%` : 'Real-time';
         statCards[0].change = trafficDelta;
 
-        // Active users delta based on total users (informational)
         statCards[1].change = totalUsers ? `${safePercent(activeUsers, totalUsers)}% of users` : 'Real-time';
 
-        // Revenue delta: based on avg revenue per confirmed booking
         const avgRevenue = confirmedBookings.length ? Math.round(revenueNumber / confirmedBookings.length) : 0;
         statCards[2].change = avgRevenue ? `Avg $${avgRevenue}` : 'Confirmed';
 
-        // Conversion delta based on last 7 days visitors
         statCards[3].change = totalVisitors7d ? `7d: ${totalVisitors7d}` : 'Bookings/Visitors';
 
         res.json({ statCards, trafficData, bookingsData, engagementMetrics, topListings });

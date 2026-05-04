@@ -1,12 +1,14 @@
 const mongoose = require('mongoose');
 const City = require('../models/City');
-const { clearCache } = require('../utils/cache');
+const { getCache, setCache, clearCache } = require('../utils/cache');
 
 // Get all cities
 exports.getCities = async (req, res) => {
   try {
-    // NOTE: City.country is typed as ObjectId in Mongoose, but legacy data may store it as a string.
-    // Using aggregate avoids Mongoose casting errors when filtering by a string countryName.
+    const cacheKey = `cache:/api/cities?${new URLSearchParams(req.query).toString()}`;
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) return res.json(cachedData);
+
     const match = {};
 
     if (req.query.country || req.query.countryName) {
@@ -20,7 +22,6 @@ exports.getCities = async (req, res) => {
         or.push({ country: req.query.countryName });
       }
 
-      // If country was provided but not a valid ObjectId, treat it as a string fallback.
       if (req.query.country && !mongoose.Types.ObjectId.isValid(req.query.country)) {
         or.push({ country: req.query.country });
       }
@@ -37,8 +38,9 @@ exports.getCities = async (req, res) => {
     const cities = await City.aggregate([
       { $match: match },
       { $sort: { name: 1 } },
-    ]);
+    ]).option({ maxTimeMS: 5000 });
 
+    await setCache(cacheKey, cities, 3600); // 1h cache
     res.json(cities);
   } catch (err) {
     console.error(err.message);
