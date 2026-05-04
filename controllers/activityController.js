@@ -72,6 +72,7 @@ exports.getActivities = async (req, res) => {
         res.json(activities);
     } catch (err) {
         console.error('Error fetching activities:', err.message);
+        if (res.headersSent) return;
         res.status(500).json({ message: 'Error fetching activities', error: err.message });
     }
 };

@@ -102,7 +102,9 @@ exports.getSupplierHistory = async (req, res) => {
         const bookings = await Booking.find({ supplier: supplierId })
             .populate('user', 'name email')
             .populate('items.activity', 'title image')
-            .sort({ createdAt: -1 });
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
         
         // Transform into history format
         const history = bookings.map(booking => ({

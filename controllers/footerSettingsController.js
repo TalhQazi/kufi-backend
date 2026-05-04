@@ -1,5 +1,6 @@
 const FooterSettings = require('../models/FooterSettings');
 const path = require('path');
+const { getCache, setCache, clearCache } = require('../utils/cache');
 
 // Sanitize payload
 const sanitize = (str) => typeof str === 'string' ? str.trim() : str;
@@ -7,8 +8,15 @@ const sanitize = (str) => typeof str === 'string' ? str.trim() : str;
 // Get footer settings (public)
 const getFooterSettings = async (req, res) => {
     try {
-        const settings = await FooterSettings.getSettings();
-        res.json(settings);
+        const cacheKey = 'cache:/api/footer';
+        const cachedData = await getCache(cacheKey);
+        if (cachedData) return res.json(cachedData);
+
+        const settings = await FooterSettings.findOne().lean().maxTimeMS(3000);
+        const data = settings || {};
+        
+        await setCache(cacheKey, data, 86400); // 24h cache
+        res.json(data);
     } catch (error) {
         console.error('Error fetching footer settings:', error);
         res.status(500).json({ message: 'Error fetching footer settings', error: error.message });
@@ -118,6 +126,9 @@ const updateFooterSettings = async (req, res) => {
             { $set: updateData },
             { new: true, upsert: true }
         );
+
+        // Clear cache
+        await clearCache('cache:/api/footer*');
 
         res.json(settings);
     } catch (error) {

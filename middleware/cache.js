@@ -24,6 +24,8 @@ const cacheMiddleware = (ttlSeconds = 3600) => {
             // If not cached, override res.json to cache the response
             const originalJson = res.json;
             res.json = function (data) {
+                if (res.headersSent) return this;
+                
                 // Set cache in background without awaiting
                 setCache(key, data, ttlSeconds).catch(err => console.error('Background cache set error:', err));
                 res.setHeader('X-Cache', 'MISS');
