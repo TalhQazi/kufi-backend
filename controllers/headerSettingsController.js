@@ -1,4 +1,5 @@
 const HeaderSettings = require('../models/HeaderSettings');
+const { getCache, setCache, clearCache } = require('../utils/cache');
 
 // Sanitize payload
 const sanitize = (str) => typeof str === 'string' ? str.trim() : str;
@@ -6,8 +7,15 @@ const sanitize = (str) => typeof str === 'string' ? str.trim() : str;
 // Get header settings (public)
 const getHeaderSettings = async (req, res) => {
     try {
-        const settings = await HeaderSettings.getSettings();
-        res.json(settings);
+        const cacheKey = 'cache:/api/header';
+        const cachedData = await getCache(cacheKey);
+        if (cachedData) return res.json(cachedData);
+
+        const settings = await HeaderSettings.findOne().lean().maxTimeMS(3000);
+        const data = settings || {};
+        
+        await setCache(cacheKey, data, 86400); // 24h cache
+        res.json(data);
     } catch (error) {
         console.error('Error fetching header settings:', error);
         res.status(500).json({ message: 'Error fetching header settings', error: error.message });
@@ -58,6 +66,9 @@ const updateHeaderSettings = async (req, res) => {
             { $set: updateData },
             { new: true, upsert: true }
         );
+
+        // Clear cache
+        await clearCache('cache:/api/header*');
 
         res.json(settings);
     } catch (error) {

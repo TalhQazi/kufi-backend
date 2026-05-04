@@ -67,9 +67,10 @@ const ActivitySchema = new mongoose.Schema({
     }
 });
 
-ActivitySchema.index({ supplier: 1 });
-ActivitySchema.index({ status: 1 });
-ActivitySchema.index({ category: 1 });
-ActivitySchema.index({ country: 1 });
+ActivitySchema.index({ supplier: 1, status: 1 });
+ActivitySchema.index({ status: 1, country: 1, category: 1 });
+ActivitySchema.index({ location: 1, status: 1 });
+ActivitySchema.index({ title: 'text', location: 'text' });
+ActivitySchema.index({ country: 1, status: 1 });
 
 module.exports = mongoose.model('Activity', ActivitySchema);

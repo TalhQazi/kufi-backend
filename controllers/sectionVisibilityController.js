@@ -1,4 +1,5 @@
 const SectionVisibility = require('../models/SectionVisibility');
+const { getCache, setCache, clearCache } = require('../utils/cache');
 
 // Sanitize payload
 const sanitize = (str) => typeof str === 'string' ? str.trim() : str;
@@ -6,8 +7,15 @@ const sanitize = (str) => typeof str === 'string' ? str.trim() : str;
 // Get section visibility settings (public)
 const getSectionVisibility = async (req, res) => {
     try {
-        const settings = await SectionVisibility.getSettings();
-        res.json(settings);
+        const cacheKey = 'cache:/api/sections';
+        const cachedData = await getCache(cacheKey);
+        if (cachedData) return res.json(cachedData);
+
+        const settings = await SectionVisibility.findOne().lean().maxTimeMS(3000);
+        const data = settings || { sections: [] };
+        
+        await setCache(cacheKey, data, 86400); // 24h cache
+        res.json(data);
     } catch (error) {
         console.error('Error fetching section visibility:', error);
         res.status(500).json({ message: 'Error fetching section visibility', error: error.message });
@@ -18,10 +26,18 @@ const getSectionVisibility = async (req, res) => {
 const getSectionsByPage = async (req, res) => {
     try {
         const { page } = req.params;
-        const settings = await SectionVisibility.getSettings();
+        const cacheKey = 'cache:/api/sections';
+        let settings = await getCache(cacheKey);
+        
+        if (!settings) {
+            settings = await SectionVisibility.findOne().lean().maxTimeMS(3000);
+            if (settings) await setCache(cacheKey, settings, 86400);
+        }
+        
+        const data = settings || { sections: [] };
         
         // Filter sections for the specific page, also include 'all' page sections
-        const sections = settings.sections.filter(s => 
+        const sections = (data.sections || []).filter(s => 
             s.page === page || s.page === 'all'
         );
         
@@ -36,9 +52,16 @@ const getSectionsByPage = async (req, res) => {
 const isSectionVisible = async (req, res) => {
     try {
         const { sectionId } = req.params;
-        const settings = await SectionVisibility.getSettings();
+        const cacheKey = 'cache:/api/sections';
+        let settings = await getCache(cacheKey);
         
-        const section = settings.sections.find(s => s.id === sectionId);
+        if (!settings) {
+            settings = await SectionVisibility.findOne().lean().maxTimeMS(3000);
+            if (settings) await setCache(cacheKey, settings, 86400);
+        }
+        
+        const data = settings || { sections: [] };
+        const section = (data.sections || []).find(s => s.id === sectionId);
         
         if (!section) {
             return res.status(404).json({ message: 'Section not found' });
@@ -88,6 +111,9 @@ const updateSectionVisibility = async (req, res) => {
             { new: true, upsert: true }
         );
         
+        // Clear cache
+        await clearCache('cache:/api/sections*');
+        
         res.json(settings);
     } catch (error) {
         console.error('Error updating section visibility:', error);
@@ -113,6 +139,9 @@ const toggleSection = async (req, res) => {
         settings.updatedAt = new Date();
         await settings.save();
         
+        // Clear cache
+        await clearCache('cache:/api/sections*');
+        
         res.json({
             message: 'Section visibility updated',
             section: settings.sections[sectionIndex]
@@ -127,6 +156,10 @@ const toggleSection = async (req, res) => {
 const resetToDefaults = async (req, res) => {
     try {
         await SectionVisibility.deleteOne({});
+        
+        // Clear cache
+        await clearCache('cache:/api/sections*');
+        
         const settings = await SectionVisibility.getSettings();
         
         res.json({

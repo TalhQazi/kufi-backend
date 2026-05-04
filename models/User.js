@@ -114,7 +114,8 @@ const UserSchema = new mongoose.Schema({
     }
 });
 
-UserSchema.index({ role: 1 });
-UserSchema.index({ status: 1 });
+UserSchema.index({ role: 1, status: 1 });
+UserSchema.index({ email: 1 }, { unique: true });
+UserSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('User', UserSchema);
