@@ -65,7 +65,7 @@ const ActivitySchema = new mongoose.Schema({
             default: null
         }
     }
-});
+}, { timestamps: true });
 
 ActivitySchema.index({ supplier: 1, status: 1 });
 ActivitySchema.index({ status: 1, country: 1, category: 1 });
