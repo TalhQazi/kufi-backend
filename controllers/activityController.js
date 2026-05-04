@@ -38,12 +38,37 @@ const sanitizeActivityPayload = (body) => {
 // Get all activities
 exports.getActivities = async (req, res) => {
     try {
-        const activities = await Activity.find()
+        const { country, city, category, status } = req.query;
+        const filter = {};
+
+        if (country) {
+            // Support both string and ObjectId if needed, but here we assume string or handled by frontend
+            filter.$or = [
+                { country: country },
+                { 'country.name': country },
+                { location: new RegExp(country, 'i') }
+            ];
+        }
+
+        if (city) {
+            filter.$or = filter.$or || [];
+            filter.$or.push({ location: new RegExp(city, 'i') });
+        }
+
+        if (category) {
+            filter.category = category;
+        }
+
+        if (status) {
+            filter.status = status;
+        }
+
+        const activities = await Activity.find(filter)
             .select('title description summary location country price duration image images category rating reviews availability isInternational status')
             .lean()
             .maxTimeMS(5000)
             .sort({ _id: -1 })
-            .limit(50);
+            .limit(100); // Increased limit as we now have filtering
         res.json(activities);
     } catch (err) {
         console.error('Error fetching activities:', err.message);

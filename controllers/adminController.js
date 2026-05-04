@@ -72,7 +72,7 @@ exports.getSystemStats = async (req, res) => {
 // Get All Users
 exports.getAllUsers = async (req, res) => {
     try {
-        const users = await User.find().select('-password');
+        const users = await User.find().select('-password').limit(100);
         res.json(users);
     } catch (err) {
         console.error(err.message);
@@ -236,7 +236,7 @@ exports.getBookingsTrend = async (req, res) => {
 exports.getAdminBookings = async (req, res) => {
   try {
     // Sab bookings, latest pehle
-    const bookings = await Booking.find().sort({ createdAt: -1 });
+    const bookings = await Booking.find().sort({ createdAt: -1 }).limit(100);
  
     // Abhi ke liye full documents bhej do – frontend hum ne already
     // itna robust bana diya hai ke different fields handle kar lega
@@ -252,7 +252,8 @@ exports.getSuppliersWithScores = async (req, res) => {
   try {
     const suppliers = await User.find({ role: 'supplier' })
       .select('-password')
-      .sort({ scorePoints: -1, createdAt: -1 });
+      .sort({ scorePoints: -1, createdAt: -1 })
+      .limit(100);
     res.json(suppliers);
   } catch (err) {
     console.error('Error fetching suppliers with scores:', err.message);

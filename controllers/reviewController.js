@@ -65,7 +65,9 @@ exports.getReviews = async (req, res) => {
       filter.isActive = true;
     }
 
-    const reviews = await Review.find(filter).sort({ sortOrder: 1, createdAt: -1 });
+    const reviews = await Review.find(filter)
+      .sort({ sortOrder: 1, createdAt: -1 })
+      .limit(20);
     res.json(reviews);
   } catch (err) {
     console.error(err.message);

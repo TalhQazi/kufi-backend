@@ -9,9 +9,9 @@ exports.getUserItineraries = async (req, res) => {
         let itineraries;
         if (userId) {
             if (role === 'supplier') {
-                itineraries = await Itinerary.find({ supplierId: userId }).sort({ createdAt: -1 });
+                itineraries = await Itinerary.find({ supplierId: userId }).sort({ createdAt: -1 }).limit(50);
             } else {
-                itineraries = await Itinerary.find({ userId }).sort({ createdAt: -1 });
+                itineraries = await Itinerary.find({ userId }).sort({ createdAt: -1 }).limit(50);
             }
         } else {
             // Return empty array if no user is authenticated

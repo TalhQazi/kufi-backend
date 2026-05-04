@@ -5,8 +5,6 @@ const mongoose = require('mongoose');
 
 const cors = require('cors');
 
-const bodyParser = require('body-parser');
-
 const path = require('path');
 
 require('dotenv').config();
@@ -22,23 +20,13 @@ const app = express();
 
 
 // Middleware
-
 app.use(cors());
 app.use(compression());
-
-app.use(bodyParser.json({ limit: '20mb' }));
-
-
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
 // Connect to Database
-
 connectDB();
-
-
-
-// Init Middleware
-
-app.use(express.json({ limit: '20mb', extended: false }));
 
 
 

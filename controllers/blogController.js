@@ -20,7 +20,7 @@ const sanitizeBlogPayload = (body) => {
 // GET /api/blogs
 exports.getBlogs = async (req, res) => {
   try {
-    const blogs = await Blog.find().sort({ createdAt: -1 });
+    const blogs = await Blog.find().sort({ createdAt: -1 }).limit(50);
     res.json(blogs);
   } catch (err) {
     console.error(err.message);

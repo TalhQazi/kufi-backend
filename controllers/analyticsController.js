@@ -45,8 +45,8 @@ exports.getSupplierAnalytics = async (req, res) => {
         const myActivities = await Activity.find({ supplier: supplierId }).select('_id');
         const activityIds = myActivities.map(a => a._id);
 
-        // 2. Get bookings containing these activities
-        const bookings = await Booking.find({ 'items.activity': { $in: activityIds } });
+        // 2. Get bookings containing these activities (limit to 500 for safety)
+        const bookings = await Booking.find({ 'items.activity': { $in: activityIds } }).limit(500);
 
         // 3. Calculate statistics
         const pendingRequests = bookings.filter(b => b.status === 'pending').length;
@@ -197,7 +197,10 @@ exports.getAdminAnalytics = async (req, res) => {
             Booking.countDocuments()
         ]);
 
-        const confirmedBookings = await Booking.find({ status: 'confirmed' }).select('tripDetails createdAt items');
+        const confirmedBookings = await Booking.find({ status: 'confirmed' })
+            .select('tripDetails createdAt items')
+            .sort({ createdAt: -1 })
+            .limit(1000);
         const revenueNumber = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
         const conversionRate = safePercent(totalBookings, totalTraffic);
 
@@ -301,7 +304,8 @@ exports.getAdminAnalytics = async (req, res) => {
         ];
 
         // Top performing listings: bookings + revenue from confirmed bookings (budget-based)
-        const confirmedBookingDocs = await Booking.find({ status: 'confirmed' }).select('items tripDetails');
+        // Reuse confirmedBookings from earlier to avoid duplicate query
+        const confirmedBookingDocs = confirmedBookings;
         const perActivity = new Map();
         (confirmedBookingDocs || []).forEach((b) => {
             const budget = parseBudgetNumber(b.tripDetails?.budget);
