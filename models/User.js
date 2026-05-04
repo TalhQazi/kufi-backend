@@ -105,6 +105,12 @@ const UserSchema = new mongoose.Schema({
     lastReadNotifications: {
         type: Date,
         default: Date.now
+    },
+    resetPasswordToken: {
+        type: String
+    },
+    resetPasswordExpires: {
+        type: Date
     }
 });
 

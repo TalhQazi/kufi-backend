@@ -2,6 +2,7 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
+const crypto = require('crypto');
 const { sendEmail } = require('../utils/emailService');
 
 // Register User
@@ -244,5 +245,84 @@ exports.googleLogin = async (req, res) => {
     } catch (err) {
         console.error('Google Login Error:', err.response?.data || err.message);
         res.status(500).send('Google Login failed');
+    }
+};
+// Forgot Password
+exports.forgotPassword = async (req, res) => {
+    const { email } = req.body;
+
+    try {
+        const user = await User.findOne({ email });
+        if (!user) {
+            return res.status(404).json({ msg: 'No user found with that email' });
+        }
+
+        // Generate reset token
+        const resetToken = crypto.randomBytes(20).toString('hex');
+        user.resetPasswordToken = resetToken;
+        user.resetPasswordExpires = Date.now() + 3600000; // 1 hour
+
+        await user.save();
+
+        // Send Email
+        const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/#reset-password/${resetToken}`;
+        
+        try {
+            await sendEmail({
+                to: user.email,
+                subject: 'Password Reset Request',
+                templateKey: 'passwordReset',
+                html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                        <h2 style="color: #a26e35;">Password Reset</h2>
+                        <p>You are receiving this because you (or someone else) have requested the reset of the password for your account.</p>
+                        <p>Please click on the following button to complete the process:</p>
+                        <div style="margin-top: 30px; text-align: center;">
+                            <a href="${resetUrl}" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Reset Password</a>
+                        </div>
+                        <p style="margin-top: 30px;">If you did not request this, please ignore this email and your password will remain unchanged.</p>
+                    </div>
+                `
+            });
+            res.json({ msg: 'Email sent' });
+        } catch (emailErr) {
+            user.resetPasswordToken = undefined;
+            user.resetPasswordExpires = undefined;
+            await user.save();
+            console.error('Email error:', emailErr);
+            res.status(500).json({ msg: 'Email could not be sent' });
+        }
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};
+
+// Reset Password
+exports.resetPassword = async (req, res) => {
+    const { token, password } = req.body;
+
+    try {
+        const user = await User.findOne({
+            resetPasswordToken: token,
+            resetPasswordExpires: { $gt: Date.now() }
+        });
+
+        if (!user) {
+            return res.status(400).json({ msg: 'Password reset token is invalid or has expired' });
+        }
+
+        // Set new password
+        const salt = await bcrypt.genSalt(10);
+        user.password = await bcrypt.hash(password, salt);
+        user.resetPasswordToken = undefined;
+        user.resetPasswordExpires = undefined;
+
+        await user.save();
+
+        res.json({ msg: 'Password has been reset' });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
     }
 };

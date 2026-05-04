@@ -39,11 +39,11 @@ const sanitizeActivityPayload = (body) => {
 exports.getActivities = async (req, res) => {
     try {
         const activities = await Activity.find()
-            .select('title location country price duration image category rating reviews status')
+            .select('title description summary location country price duration image images category rating reviews availability isInternational status')
             .lean()
-            .maxTimeMS(5000) // Reduce DB timeout to 5s
+            .maxTimeMS(5000)
             .sort({ _id: -1 })
-            .limit(50); // Reduce limit to 50 for better performance
+            .limit(50);
         res.json(activities);
     } catch (err) {
         console.error('Error fetching activities:', err.message);
