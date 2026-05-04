@@ -25,28 +25,37 @@ exports.getSupplierStats = async (req, res) => {
     try {
         const supplierId = req.user.id;
 
-        const myActivities = await Activity.find({ supplier: supplierId }).lean();
+        const activities = await Activity.find({ supplier: supplierId })
+            .select('rating')
+            .lean()
+            .maxTimeMS(5000);
 
-        const ratings = (myActivities || [])
-            .map((activity) => Number(activity?.rating))
-            .filter((rating) => Number.isFinite(rating) && rating > 0);
-        const avgRating = ratings.length > 0
-            ? (ratings.reduce((sum, rating) => sum + rating, 0) / ratings.length)
-            : 0;
-
-        // Single-supplier assignment: only bookings assigned to this supplier
         const query = { supplier: supplierId };
-        const totalBookings = await Booking.countDocuments(query);
-        const confirmedBookings = await Booking.countDocuments({ ...query, status: 'confirmed' });
+        const totalBookings = await Booking.countDocuments(query).maxTimeMS(5000);
+        const confirmedBookings = await Booking.countDocuments({ ...query, status: 'confirmed' }).maxTimeMS(5000);
+
+        const bookingsForRevenue = await Booking.find({ ...query, status: 'confirmed' })
+            .select('totalAmount netAmount adjustmentCard tripDetails budget amount price')
+            .lean()
+            .maxTimeMS(5000);
+
+        let totalRevenue = 0;
+        bookingsForRevenue.forEach(b => {
+            const revenue = b.netAmount || b.totalAmount || b.amount || b.price || (b.tripDetails?.budget ? parseFloat(b.tripDetails.budget) : 0) || 0;
+            totalRevenue += parseFloat(revenue) || 0;
+        });
+
+        const ratings = activities.map(a => a.rating).filter(r => typeof r === 'number' && r > 0);
+        const avgRating = ratings.length > 0 ? (ratings.reduce((a, b) => a + b, 0) / ratings.length) : 0;
 
         res.json({
-            activities: myActivities.length,
+            activities: activities.length,
             bookings: totalBookings,
-            revenue: confirmedBookings * 120, // Placeholder estimation
+            revenue: totalRevenue,
             avgRating
         });
     } catch (err) {
-        console.error(err.message);
+        console.error('Supplier Stats Error:', err.message);
         res.status(500).send('Server Error');
     }
 };
@@ -85,30 +94,22 @@ exports.getMyBookings = async (req, res) => {
         const supplierId = req.user.id;
         const { status, limit } = req.query;
 
-        // Only return bookings assigned to this supplier
         let query = { supplier: supplierId };
+        if (status) query.status = status;
 
-        // Handle status filter
-        if (status) {
-            query.status = status;
-        }
+        const fetchLimit = limit ? parseInt(limit) : 50; 
 
-        let bookingsQuery = Booking.find(query)
+        const bookings = await Booking.find(query)
             .sort({ createdAt: -1 })
             .populate('user', 'name email')
-            .populate('items.activity')
-            .lean();
+            .populate('items.activity', 'title image')
+            .limit(fetchLimit)
+            .lean()
+            .maxTimeMS(10000); 
 
-        // Default limit to prevent timeouts
-        const fetchLimit = limit ? parseInt(limit) : 100;
-        bookingsQuery = bookingsQuery.limit(fetchLimit);
-
-        const bookings = await bookingsQuery;
-
-        // Return array directly for compatibility
         res.json(bookings);
     } catch (err) {
-        console.error('Error fetching supplier bookings:', err.message);
+        console.error('Get My Bookings Error:', err.message);
         res.status(500).send('Server Error');
     }
 };
