@@ -63,12 +63,23 @@ exports.getActivities = async (req, res) => {
             filter.status = status;
         }
 
+        // Exclude every heavy field from the list payload.
+        // `image` and `images` are stored as base64 strings (some docs >5MB),
+        // so streaming them from Atlas → backend → client made this endpoint
+        // take 30+ seconds. The frontend list views render a placeholder
+        // when image is null and load the full image only on the detail
+        // endpoint (`GET /api/activities/:id`) when the user opens an item.
         const activities = await Activity.find(filter)
-            .select('title location country price duration image category rating reviews status createdAt')
+            .select('-image -images -description -addOns -coordinates')
             .lean()
-            .maxTimeMS(60000)
             .sort({ createdAt: -1 })
-            .limit(100); 
+            .limit(100)
+            .maxTimeMS(10000);
+
+        for (const a of activities) {
+            a.image = null;
+        }
+
         res.json(activities);
     } catch (err) {
         console.error('Error fetching activities:', err.message);

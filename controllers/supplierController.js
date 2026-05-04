@@ -28,13 +28,13 @@ exports.getSupplierStats = async (req, res) => {
 
         const query = { supplier: supplierId };
         const [totalBookings, confirmedBookings, activities, revenueResult] = await Promise.all([
-            Booking.countDocuments(query).maxTimeMS(60000),
-            Booking.countDocuments({ ...query, status: 'confirmed' }).maxTimeMS(60000),
-            Activity.find({ supplier: supplierId }).select('rating').lean().maxTimeMS(60000),
+            Booking.countDocuments(query).maxTimeMS(8000),
+            Booking.countDocuments({ ...query, status: 'confirmed' }).maxTimeMS(8000),
+            Activity.find({ supplier: supplierId }).select('rating').lean().maxTimeMS(8000),
             Booking.aggregate([
                 { $match: { supplier: new mongoose.Types.ObjectId(supplierId), status: 'confirmed' } },
                 { $group: { _id: null, total: { $sum: { $ifNull: ["$netAmount", { $ifNull: ["$totalAmount", 0] }] } } } }
-            ]).option({ maxTimeMS: 60000 })
+            ]).option({ maxTimeMS: 8000 })
         ]);
 
         const totalRevenue = revenueResult[0]?.total || 0;
@@ -56,7 +56,21 @@ exports.getSupplierStats = async (req, res) => {
 // Get My Activities
 exports.getMyActivities = async (req, res) => {
     try {
-        const activities = await Activity.find({ supplier: req.user.id }).lean();
+        // Exclude heavy/base64 fields from the list payload (see
+        // activityController.getActivities for full rationale). The frontend
+        // shows a placeholder when image is null and loads the full image
+        // from the detail endpoint when the user opens an item.
+        const activities = await Activity.find({ supplier: req.user.id })
+            .select('-image -images -description -addOns -coordinates')
+            .lean()
+            .sort({ createdAt: -1 })
+            .limit(200)
+            .maxTimeMS(10000);
+
+        for (const a of activities) {
+            a.image = null;
+        }
+
         res.json(activities);
     } catch (err) {
         console.error(err.message);
@@ -90,15 +104,18 @@ exports.getMyBookings = async (req, res) => {
         let query = { supplier: supplierId };
         if (status) query.status = status;
 
-        const fetchLimit = limit ? parseInt(limit) : 50; 
+        const fetchLimit = limit ? parseInt(limit) : 50;
 
+        // Don't pull `image` via populate — some activities store 5MB base64
+        // strings in that field which makes this endpoint take 30+ seconds.
+        // The supplier UI doesn't display activity thumbnails on bookings.
         const bookings = await Booking.find(query)
             .sort({ createdAt: -1 })
             .populate('user', 'name email')
-            .populate('items.activity', 'title image')
+            .populate('items.activity', 'title')
             .limit(fetchLimit)
             .lean()
-            .maxTimeMS(10000); 
+            .maxTimeMS(10000);
 
         res.json(bookings);
     } catch (err) {
