@@ -51,7 +51,7 @@ exports.getSystemStats = async (req, res) => {
             .sort({ createdAt: -1 })
             .limit(500)
             .lean()
-            .maxTimeMS(5000);
+            .maxTimeMS(60000);
 
         const revenue = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
 

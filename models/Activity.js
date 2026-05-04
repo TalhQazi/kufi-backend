@@ -72,5 +72,6 @@ ActivitySchema.index({ status: 1, country: 1, category: 1 });
 ActivitySchema.index({ location: 1, status: 1 });
 ActivitySchema.index({ title: 'text', location: 'text' });
 ActivitySchema.index({ country: 1, status: 1 });
+ActivitySchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('Activity', ActivitySchema);

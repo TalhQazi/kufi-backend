@@ -34,7 +34,7 @@ exports.getSupplierStats = async (req, res) => {
             Booking.aggregate([
                 { $match: { supplier: new mongoose.Types.ObjectId(supplierId), status: 'confirmed' } },
                 { $group: { _id: null, total: { $sum: { $ifNull: ["$netAmount", { $ifNull: ["$totalAmount", 0] }] } } } }
-            ]).option({ maxTimeMS: 3000 })
+            ]).option({ maxTimeMS: 60000 })
         ]);
 
         const totalRevenue = revenueResult[0]?.total || 0;

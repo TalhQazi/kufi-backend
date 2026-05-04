@@ -64,9 +64,9 @@ exports.getActivities = async (req, res) => {
         }
 
         const activities = await Activity.find(filter)
-            .select('title description location country price duration image category rating reviews status createdAt')
+            .select('title location country price duration image category rating reviews status createdAt')
             .lean()
-            .maxTimeMS(20000)
+            .maxTimeMS(60000)
             .sort({ createdAt: -1 })
             .limit(100); 
         res.json(activities);
