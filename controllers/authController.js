@@ -7,7 +7,8 @@ const { sendEmail } = require('../utils/emailService');
 
 // Register User
 exports.registerUser = async (req, res) => {
-    const { name, email, password, role, phone, country, city, status } = req.body;
+    let { name, email, password, role, phone, country, city, status } = req.body;
+    email = String(email || '').trim().toLowerCase();
 
     try {
         let user = await User.findOne({ email });
@@ -79,10 +80,16 @@ exports.registerUser = async (req, res) => {
 
 // Login User
 exports.loginUser = async (req, res) => {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
 
     try {
-        const user = await User.findOne({ email });
+        if (!email || !password) {
+            return res.status(400).json({ msg: 'Please provide email and password' });
+        }
+
+        email = String(email).trim().toLowerCase();
+
+        const user = await User.findOne({ email }).lean();
         if (!user) {
             return res.status(400).json({ msg: 'Invalid Credentials' });
         }
@@ -94,7 +101,7 @@ exports.loginUser = async (req, res) => {
 
         const payload = {
             user: {
-                id: user.id,
+                id: user._id || user.id,
                 role: user.role
             }
         };
@@ -105,11 +112,20 @@ exports.loginUser = async (req, res) => {
             { expiresIn: 360000 },
             (err, token) => {
                 if (err) throw err;
-                res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+                res.json({ 
+                    token, 
+                    user: { 
+                        id: user._id || user.id, 
+                        name: user.name, 
+                        email: user.email, 
+                        role: user.role,
+                        status: user.status
+                    } 
+                });
             }
         );
     } catch (err) {
-        console.error(err.message);
+        console.error('Login Error:', err.message);
         res.status(500).send('Server error');
     }
 };
