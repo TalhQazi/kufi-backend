@@ -33,28 +33,27 @@ const timeAgo = (date) => {
 exports.getSystemStats = async (req, res) => {
     try {
         const adminId = req.user.id;
-        const adminUser = await User.findById(adminId);
+        const adminUser = await User.findById(adminId).select('lastReadNotifications').lean().maxTimeMS(3000);
         const lastRead = adminUser?.lastReadNotifications || new Date(0);
 
-        const totalUsers = await User.countDocuments({ role: 'user' });
-        const totalSuppliers = await User.countDocuments({ role: 'supplier' });
-
-        const [totalActivities, totalBookings, pendingRequests, unreadBookings, unreadSuppliers] = await Promise.all([
-            Activity.countDocuments(),
-            Booking.countDocuments(),
-            Booking.countDocuments({ status: 'pending' }),
-            Booking.countDocuments({ createdAt: { $gt: lastRead } }),
-            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } })
+        const [totalUsers, totalSuppliers, totalActivities, totalBookings, pendingRequests, unreadBookings, unreadSuppliers] = await Promise.all([
+            User.countDocuments({ role: 'user' }).maxTimeMS(3000),
+            User.countDocuments({ role: 'supplier' }).maxTimeMS(3000),
+            Activity.countDocuments().maxTimeMS(3000),
+            Booking.countDocuments().maxTimeMS(3000),
+            Booking.countDocuments({ status: 'pending' }).maxTimeMS(3000),
+            Booking.countDocuments({ createdAt: { $gt: lastRead } }).maxTimeMS(3000),
+            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } }).maxTimeMS(3000)
         ]);
 
         const confirmedBookings = await Booking.find({ status: 'confirmed' })
-            .select('tripDetails')
+            .select('tripDetails.budget')
             .sort({ createdAt: -1 })
-            .limit(1000);
-        const revenue = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
+            .limit(500)
+            .lean()
+            .maxTimeMS(5000);
 
-        // These are not tracked in DB yet; keep safe defaults so UI doesn't break.
-        const reportedIssues = 0;
+        const revenue = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
 
         res.json({
             users: totalUsers,
@@ -64,10 +63,10 @@ exports.getSystemStats = async (req, res) => {
             pendingRequests,
             unreadNotifications: unreadBookings + unreadSuppliers,
             revenue,
-            reportedIssues
+            reportedIssues: 0
         });
     } catch (err) {
-        console.error(err.message);
+        console.error('System Stats Error:', err.message);
         res.status(500).send('Server Error');
     }
 };
