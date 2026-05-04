@@ -28,9 +28,9 @@ exports.getSupplierStats = async (req, res) => {
 
         const query = { supplier: supplierId };
         const [totalBookings, confirmedBookings, activities, revenueResult] = await Promise.all([
-            Booking.countDocuments(query).maxTimeMS(3000),
-            Booking.countDocuments({ ...query, status: 'confirmed' }).maxTimeMS(3000),
-            Activity.find({ supplier: supplierId }).select('rating').lean().maxTimeMS(3000),
+            Booking.countDocuments(query).maxTimeMS(60000),
+            Booking.countDocuments({ ...query, status: 'confirmed' }).maxTimeMS(60000),
+            Activity.find({ supplier: supplierId }).select('rating').lean().maxTimeMS(60000),
             Booking.aggregate([
                 { $match: { supplier: new mongoose.Types.ObjectId(supplierId), status: 'confirmed' } },
                 { $group: { _id: null, total: { $sum: { $ifNull: ["$netAmount", { $ifNull: ["$totalAmount", 0] }] } } } }

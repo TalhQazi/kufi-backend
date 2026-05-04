@@ -33,17 +33,17 @@ const timeAgo = (date) => {
 exports.getSystemStats = async (req, res) => {
     try {
         const adminId = req.user.id;
-        const adminUser = await User.findById(adminId).select('lastReadNotifications').lean().maxTimeMS(3000);
+        const adminUser = await User.findById(adminId).select('lastReadNotifications').lean().maxTimeMS(60000);
         const lastRead = adminUser?.lastReadNotifications || new Date(0);
 
         const [totalUsers, totalSuppliers, totalActivities, totalBookings, pendingRequests, unreadBookings, unreadSuppliers] = await Promise.all([
-            User.countDocuments({ role: 'user' }).maxTimeMS(3000),
-            User.countDocuments({ role: 'supplier' }).maxTimeMS(3000),
-            Activity.countDocuments().maxTimeMS(3000),
-            Booking.countDocuments().maxTimeMS(3000),
-            Booking.countDocuments({ status: 'pending' }).maxTimeMS(3000),
-            Booking.countDocuments({ createdAt: { $gt: lastRead } }).maxTimeMS(3000),
-            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } }).maxTimeMS(3000)
+            User.countDocuments({ role: 'user' }).maxTimeMS(60000),
+            User.countDocuments({ role: 'supplier' }).maxTimeMS(60000),
+            Activity.countDocuments().maxTimeMS(60000),
+            Booking.countDocuments().maxTimeMS(60000),
+            Booking.countDocuments({ status: 'pending' }).maxTimeMS(60000),
+            Booking.countDocuments({ createdAt: { $gt: lastRead } }).maxTimeMS(60000),
+            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } }).maxTimeMS(60000)
         ]);
 
         const confirmedBookings = await Booking.find({ status: 'confirmed' })
