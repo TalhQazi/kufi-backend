@@ -74,4 +74,8 @@ const ItinerarySchema = new mongoose.Schema({
     }
 });
 
+ItinerarySchema.index({ userId: 1, createdAt: -1 });
+ItinerarySchema.index({ supplierId: 1, createdAt: -1 });
+ItinerarySchema.index({ bookingId: 1 });
+
 module.exports = mongoose.model('Itinerary', ItinerarySchema);
