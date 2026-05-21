@@ -64,6 +64,39 @@ const ItinerarySchema = new mongoose.Schema({
         type: [mongoose.Schema.Types.Mixed],
         default: []
     },
+    country: {
+        type: String,
+        trim: true
+    },
+    city: {
+        type: String,
+        trim: true
+    },
+    aiGenerated: {
+        type: Boolean,
+        default: false
+    },
+    aiGeneratedAt: {
+        type: Date
+    },
+    controlPanel: {
+        activityStartTime: { type: String, default: '09:00' },
+        activityEndTime: { type: String, default: '19:00' },
+        lunchStart: { type: String, default: '13:00' },
+        lunchEnd: { type: String, default: '14:00' },
+        startOnArrival: { type: Boolean, default: false },
+        endOnDeparture: { type: Boolean, default: false },
+        perDayOverrides: [{
+            date: String,
+            startTime: String,
+            endTime: String,
+            lunchStart: String,
+            lunchEnd: String
+        }],
+        hotelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Hotel' },
+        numberOfRooms: { type: Number, default: 1 },
+        budgetUplift: { type: Number, default: 0.15 }
+    },
     createdAt: {
         type: Date,
         default: Date.now
@@ -77,5 +110,6 @@ const ItinerarySchema = new mongoose.Schema({
 ItinerarySchema.index({ userId: 1, createdAt: -1 });
 ItinerarySchema.index({ supplierId: 1, createdAt: -1 });
 ItinerarySchema.index({ bookingId: 1 });
+ItinerarySchema.index({ country: 1, city: 1, aiGenerated: 1 });
 
 module.exports = mongoose.model('Itinerary', ItinerarySchema);
