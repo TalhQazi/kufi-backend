@@ -111,6 +111,12 @@ const UserSchema = new mongoose.Schema({
     },
     resetPasswordExpires: {
         type: Date
+    },
+    preferences: {
+        darkMode: {
+            type: Boolean,
+            default: false
+        }
     }
 });
 

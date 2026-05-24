@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { registerUser, loginUser, getProfile, updateProfile, changePassword, googleLogin, forgotPassword, resetPassword } = require('../controllers/authController');
+const { registerUser, loginUser, getProfile, updateProfile, changePassword, googleLogin, forgotPassword, resetPassword, getPreferences, updatePreferences } = require('../controllers/authController');
 const auth = require('../middleware/auth');
 
 // @route   POST api/auth/register
@@ -37,6 +37,16 @@ router.get('/profile', auth(), getProfile);
 // @desc    Update user profile
 // @access  Private
 router.patch('/profile', auth(), updateProfile);
+
+// @route   GET api/auth/preferences
+// @desc    Get current user UI preferences
+// @access  Private
+router.get('/preferences', auth(), getPreferences);
+
+// @route   PATCH api/auth/preferences
+// @desc    Update current user UI preferences
+// @access  Private
+router.patch('/preferences', auth(), updatePreferences);
 
 // @route   POST api/auth/change-password
 // @desc    Change user password

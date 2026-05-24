@@ -5,6 +5,19 @@ const axios = require('axios');
 const crypto = require('crypto');
 const { sendEmail } = require('../utils/emailService');
 
+const formatAuthUser = (user) => {
+    const u = user?.toObject ? user.toObject() : user;
+    return {
+        id: u._id || u.id,
+        _id: u._id || u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        status: u.status,
+        darkMode: Boolean(u.preferences?.darkMode),
+    };
+};
+
 // Register User
 exports.registerUser = async (req, res) => {
     let { name, email, password, role, phone, country, city, status } = req.body;
@@ -114,13 +127,7 @@ exports.loginUser = async (req, res) => {
                 if (err) throw err;
                 res.json({ 
                     token, 
-                    user: { 
-                        id: user._id || user.id, 
-                        name: user.name, 
-                        email: user.email, 
-                        role: user.role,
-                        status: user.status
-                    } 
+                    user: formatAuthUser(user)
                 });
             }
         );
@@ -179,6 +186,43 @@ exports.updateProfile = async (req, res) => {
         ).select('-password');
 
         res.json(user);
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};
+
+// Get user UI preferences (dark mode, etc.)
+exports.getPreferences = async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id).select('preferences');
+        if (!user) return res.status(404).json({ msg: 'User not found' });
+
+        res.json({ darkMode: Boolean(user.preferences?.darkMode) });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};
+
+// Update user UI preferences
+exports.updatePreferences = async (req, res) => {
+    const { darkMode } = req.body;
+
+    if (typeof darkMode !== 'boolean') {
+        return res.status(400).json({ msg: 'darkMode must be a boolean' });
+    }
+
+    try {
+        const user = await User.findByIdAndUpdate(
+            req.user.id,
+            { $set: { 'preferences.darkMode': darkMode } },
+            { new: true }
+        ).select('preferences');
+
+        if (!user) return res.status(404).json({ msg: 'User not found' });
+
+        res.json({ darkMode: Boolean(user.preferences?.darkMode) });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server error');
@@ -255,7 +299,7 @@ exports.googleLogin = async (req, res) => {
             { expiresIn: 360000 },
             (err, token) => {
                 if (err) throw err;
-                res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+                res.json({ token, user: formatAuthUser(user) });
             }
         );
     } catch (err) {
