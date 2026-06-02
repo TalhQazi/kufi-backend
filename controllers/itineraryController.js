@@ -216,6 +216,7 @@ exports.createItinerary = async (req, res) => {
             if (existingForBooking) {
                 applyBudgetToDocument(existingForBooking);
                 await existingForBooking.save();
+                await existingForBooking.populate('controlPanel.hotelId');
                 return res.json(existingForBooking);
             }
         }
