@@ -4,6 +4,7 @@ const {
     getUserItineraries,
     createItinerary,
     getItineraryById,
+    getItineraryByBookingId,
     generateItinerary,
     saveControlPanel,
     saveDays,
@@ -12,6 +13,7 @@ const auth = require('../middleware/auth');
 
 router.get('/', auth(), getUserItineraries);
 router.post('/', auth(), createItinerary);
+router.get('/booking/:bookingId', auth(), getItineraryByBookingId);
 router.get('/:id', auth(), getItineraryById);
 router.post('/:id/generate', auth(), generateItinerary);
 router.put('/:id/control-panel', auth(), saveControlPanel);

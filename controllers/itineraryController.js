@@ -110,21 +110,36 @@ exports.createItinerary = async (req, res) => {
         const title = req.body?.title || tripData?.title;
         const destination = req.body?.destination || tripData?.destination || tripData?.location;
 
-        if (!title || !destination) return res.status(400).json({ msg: 'Missing required fields: title, destination' });
-
         const bookingIdVal = req.body?.bookingId || req.body?.requestId;
         const supplierIdVal = role === 'supplier' ? authUserId : req.body?.supplierId;
 
         if (bookingIdVal && !mongoose.Types.ObjectId.isValid(bookingIdVal)) return res.status(400).json({ msg: 'Invalid bookingId format' });
         if (supplierIdVal && !mongoose.Types.ObjectId.isValid(supplierIdVal)) return res.status(400).json({ msg: 'Invalid supplierId format' });
 
+        if (bookingIdVal) {
+            const existingForBooking = await Itinerary.findOne({ bookingId: bookingIdVal });
+            if (existingForBooking) {
+                return res.json(existingForBooking);
+            }
+        }
+
+        const country = req.body?.country || tripData?.country || '';
+        const city = req.body?.city || tripData?.city || '';
+        const resolvedDestination = destination || city || country;
+
+        if (!resolvedDestination) {
+            return res.status(400).json({ msg: 'Missing required fields: destination (or country/city)' });
+        }
+
         const itinerary = new Itinerary({
             ...req.body,
             userId,
             supplierId: supplierIdVal,
             bookingId: bookingIdVal,
-            title,
-            destination,
+            title: title || resolvedDestination,
+            destination: resolvedDestination,
+            country: country || req.body?.country,
+            city: city || req.body?.city,
             tripData: tripData || req.body?.tripData,
             days: Array.isArray(req.body?.days) ? req.body.days : [],
         });
@@ -147,6 +162,24 @@ exports.getItineraryById = async (req, res) => {
         res.json(itinerary);
     } catch (err) {
         console.error(err.message);
+        res.status(500).send('Server error');
+    }
+};
+
+exports.getItineraryByBookingId = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(bookingId)) {
+            return res.status(400).json({ msg: 'Invalid bookingId format' });
+        }
+
+        const itinerary = await Itinerary.findOne({ bookingId })
+            .populate('controlPanel.hotelId', 'name city country pricePerNight rooms');
+
+        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found for this booking' });
+        res.json(itinerary);
+    } catch (err) {
+        console.error('getItineraryByBookingId error:', err?.message);
         res.status(500).send('Server error');
     }
 };
