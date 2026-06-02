@@ -3,12 +3,78 @@ const OpenAI = require('openai');
 const Itinerary = require('../models/Itinerary');
 const Activity = require('../models/Activity');
 const Hotel = require('../models/Hotel');
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const Booking = require('../models/Booking');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function escapeRegExp(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseBudget(value) {
+    if (value === null || value === undefined) return undefined;
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const raw = String(value).trim();
+    if (!raw || raw === '—' || raw.toLowerCase() === 'n/a') return undefined;
+    const cleaned = raw.replace(/[^0-9.]/g, '');
+    const num = Number(cleaned);
+    return Number.isFinite(num) ? num : undefined;
+}
+
+function getOpenAIClient() {
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) return null;
+    return new OpenAI({ apiKey: key });
+}
+
+function buildDefaultDays(itinerary, activities = []) {
+    const startDate = itinerary.startDate
+        ? new Date(itinerary.startDate).toISOString().split('T')[0]
+        : null;
+    const endDate = itinerary.endDate
+        ? new Date(itinerary.endDate).toISOString().split('T')[0]
+        : null;
+    const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
+    const usableActs = Array.isArray(activities) ? activities : [];
+
+    const days = [];
+    for (let idx = 0; idx < tripDays; idx++) {
+        const newDate = startDate ? addDays(startDate, idx) : '';
+        const isArrival = idx === 0;
+        const isDeparture = idx === tripDays - 1;
+        const dayActivities = [];
+
+        if (!isArrival && !isDeparture && usableActs.length > 0) {
+            const act = usableActs[idx % usableActs.length];
+            dayActivities.push({
+                activityId: String(act._id),
+                title: act.title,
+                description: act.description || '',
+                startTime: '09:00',
+                endTime: '11:00',
+                price: Number(act.price) || 0,
+                category: act.category || 'general',
+                image: act.image || '',
+                isSupplierOnly: true,
+            });
+        }
+
+        days.push({
+            day: idx + 1,
+            date: newDate,
+            dayName: getDayName(newDate),
+            isArrivalDay: isArrival,
+            isDepartureDay: isDeparture,
+            arrivalNote: isArrival ? 'Arrival Day — Free Day. Airport to Hotel transfer provided.' : undefined,
+            departureNote: isDeparture ? 'Departure Day — Free Day. Hotel to Airport transfer provided.' : undefined,
+            activities: dayActivities,
+        });
+    }
+
+    return days;
+}
 
 function getDayName(dateStr) {
     if (!dateStr) return '';
@@ -101,9 +167,15 @@ exports.createItinerary = async (req, res) => {
         const role = req.user?.role;
 
         const requestedUserId = req.body?.userId;
-        const userId = role === 'supplier' ? requestedUserId : authUserId;
+        let userId = role === 'supplier' ? requestedUserId : authUserId;
 
-        if (!userId) return res.status(401).json({ msg: 'User not authenticated' });
+        const bookingIdValEarly = req.body?.bookingId || req.body?.requestId;
+        if (!userId && bookingIdValEarly && mongoose.Types.ObjectId.isValid(bookingIdValEarly)) {
+            const booking = await Booking.findById(bookingIdValEarly).select('user').lean();
+            userId = booking?.user;
+        }
+
+        if (!userId) return res.status(400).json({ msg: 'Traveler user is required on this booking' });
         if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ msg: 'Invalid userId format' });
 
         const tripData = req.body?.tripData;
@@ -132,14 +204,18 @@ exports.createItinerary = async (req, res) => {
         }
 
         const itinerary = new Itinerary({
-            ...req.body,
             userId,
             supplierId: supplierIdVal,
             bookingId: bookingIdVal,
             title: title || resolvedDestination,
             destination: resolvedDestination,
-            country: country || req.body?.country,
-            city: city || req.body?.city,
+            country: country || undefined,
+            city: city || undefined,
+            location: req.body?.location,
+            startDate: req.body?.startDate,
+            endDate: req.body?.endDate,
+            numberOfTravelers: Number(req.body?.numberOfTravelers) || 2,
+            budget: parseBudget(req.body?.budget ?? tripData?.budget),
             tripData: tripData || req.body?.tripData,
             days: Array.isArray(req.body?.days) ? req.body.days : [],
         });
@@ -156,13 +232,12 @@ exports.createItinerary = async (req, res) => {
 
 exports.getItineraryById = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id)
-            .populate('controlPanel.hotelId', 'name city country pricePerNight rooms');
+        const itinerary = await Itinerary.findById(req.params.id).lean();
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
         res.json(itinerary);
     } catch (err) {
         console.error(err.message);
-        res.status(500).send('Server error');
+        res.status(500).json({ msg: 'Server error', error: err?.message });
     }
 };
 
@@ -173,16 +248,40 @@ exports.getItineraryByBookingId = async (req, res) => {
             return res.status(400).json({ msg: 'Invalid bookingId format' });
         }
 
-        const itinerary = await Itinerary.findOne({ bookingId })
-            .populate('controlPanel.hotelId', 'name city country pricePerNight rooms');
+        const itinerary = await Itinerary.findOne({ bookingId }).lean();
 
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found for this booking' });
         res.json(itinerary);
     } catch (err) {
         console.error('getItineraryByBookingId error:', err?.message);
-        res.status(500).send('Server error');
+        res.status(500).json({ msg: 'Server error', error: err?.message });
     }
 };
+
+async function fetchActivitiesForDestination(country, city) {
+    const query = { status: 'approved' };
+    const orClause = [];
+    if (country) orClause.push({ country: new RegExp(`^${escapeRegExp(country)}$`, 'i') });
+    if (city) orClause.push({ location: new RegExp(escapeRegExp(city), 'i') });
+    if (orClause.length) query.$or = orClause;
+    return Activity.find(query)
+        .select('_id title description duration price category image location')
+        .lean();
+}
+
+async function saveGeneratedDays(itinerary, days, source) {
+    itinerary.days = days;
+    itinerary.aiGenerated = true;
+    itinerary.aiGeneratedAt = new Date();
+    itinerary.updatedAt = new Date();
+    await itinerary.save();
+    return resPayload(itinerary, source);
+}
+
+function resPayload(itinerary, source) {
+    const doc = itinerary.toObject ? itinerary.toObject() : itinerary;
+    return { itinerary: doc, source };
+}
 
 // ─── GENERATE itinerary with AI ──────────────────────────────────────────────
 
@@ -192,49 +291,50 @@ exports.generateItinerary = async (req, res) => {
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
 
         const country = (itinerary.country || itinerary.tripData?.country || itinerary.destination || '').trim();
-        const city = (itinerary.city || itinerary.tripData?.city || itinerary.destination || '').trim();
+        const city = (itinerary.city || itinerary.tripData?.city || itinerary.tripData?.destination || '').trim();
 
         if (!country && !city) {
             return res.status(400).json({ msg: 'Itinerary must have country or city to generate' });
         }
 
+        const activities = await fetchActivitiesForDestination(country, city);
+
         // ── Level 1: same country + city already generated in DB ─────────────
-        const existing = await Itinerary.findOne({
-            $or: [
-                { country: new RegExp(`^${country}$`, 'i'), city: new RegExp(`^${city}$`, 'i') },
-                { country: new RegExp(`^${country}$`, 'i') },
-            ],
+        const existingQuery = {
             aiGenerated: true,
             _id: { $ne: itinerary._id },
             days: { $exists: true, $not: { $size: 0 } },
-        }).sort({ aiGeneratedAt: -1 }).lean();
+        };
+        if (country && city) {
+            existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
+            existingQuery.city = new RegExp(`^${escapeRegExp(city)}$`, 'i');
+        } else if (country) {
+            existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
+        }
+
+        const existing = await Itinerary.findOne(existingQuery).sort({ aiGeneratedAt: -1 }).lean();
 
         if (existing && Array.isArray(existing.days) && existing.days.length > 0) {
             const adaptedDays = adaptDaysToItinerary(existing.days, itinerary);
-            itinerary.days = adaptedDays;
-            itinerary.aiGenerated = true;
-            itinerary.aiGeneratedAt = new Date();
-            itinerary.updatedAt = new Date();
-            await itinerary.save();
-            return res.json({ itinerary, source: 'database' });
+            await saveGeneratedDays(itinerary, adaptedDays, 'database');
+            return res.json(resPayload(itinerary, 'database'));
         }
 
-        // ── Level 2: call OpenAI ──────────────────────────────────────────────
-        if (!process.env.OPENAI_API_KEY) {
-            return res.status(500).json({ msg: 'OPENAI_API_KEY not configured' });
+        // ── Level 2: call OpenAI (or template fallback) ───────────────────────
+        const openai = getOpenAIClient();
+        if (!openai) {
+            const templateDays = buildDefaultDays(itinerary, activities);
+            await saveGeneratedDays(itinerary, templateDays, 'template');
+            return res.json({
+                ...resPayload(itinerary, 'template'),
+                warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
+            });
         }
 
-        const activities = await Activity.find({
-            $or: [
-                { country: new RegExp(`^${country}$`, 'i') },
-                { location: new RegExp(city, 'i') },
-            ],
-            status: 'approved',
-        }).select('_id title description duration price category image location').lean();
-
-        const hotel = itinerary.controlPanel?.hotelId
-            ? await Hotel.findById(itinerary.controlPanel.hotelId).lean()
-            : null;
+        let hotel = null;
+        if (itinerary.controlPanel?.hotelId && mongoose.Types.ObjectId.isValid(itinerary.controlPanel.hotelId)) {
+            hotel = await Hotel.findById(itinerary.controlPanel.hotelId).lean();
+        }
 
         const cp = itinerary.controlPanel || {};
         const startDate = itinerary.startDate
@@ -304,24 +404,29 @@ Return ONLY a JSON array with this exact structure:
   }
 ]`;
 
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt },
-            ],
-            temperature: 0.4,
-            max_tokens: 4000,
-        });
-
         let aiDays;
         try {
+            const completion = await openai.chat.completions.create({
+                model: 'gpt-4o',
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ],
+                temperature: 0.4,
+                max_tokens: 4000,
+            });
+
             const raw = completion.choices[0].message.content.trim();
             const jsonStr = raw.startsWith('[') ? raw : raw.replace(/```json\n?/, '').replace(/```\n?$/, '').trim();
             aiDays = JSON.parse(jsonStr);
-        } catch (parseErr) {
-            console.error('Failed to parse AI response:', parseErr.message);
-            return res.status(500).json({ msg: 'AI returned invalid JSON', error: parseErr.message });
+        } catch (aiErr) {
+            console.error('OpenAI generate failed, using template fallback:', aiErr?.message);
+            const templateDays = buildDefaultDays(itinerary, activities);
+            await saveGeneratedDays(itinerary, templateDays, 'template');
+            return res.json({
+                ...resPayload(itinerary, 'template'),
+                warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
+            });
         }
 
         // Attach real activity images from DB where we have an activityId
@@ -342,15 +447,10 @@ Return ONLY a JSON array with this exact structure:
             }),
         }));
 
-        itinerary.days = enrichedDays;
-        itinerary.aiGenerated = true;
-        itinerary.aiGeneratedAt = new Date();
-        itinerary.updatedAt = new Date();
-        await itinerary.save();
-
-        return res.json({ itinerary, source: 'ai' });
+        await saveGeneratedDays(itinerary, enrichedDays, 'ai');
+        return res.json(resPayload(itinerary, 'ai'));
     } catch (err) {
-        console.error('generateItinerary error:', err?.message);
+        console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });
     }
 };
