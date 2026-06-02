@@ -4,6 +4,7 @@ const Itinerary = require('../models/Itinerary');
 const Activity = require('../models/Activity');
 const Hotel = require('../models/Hotel');
 const Booking = require('../models/Booking');
+const { parseBudget, applyBudgetToDocument } = require('../utils/parseBudget');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -11,16 +12,6 @@ const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Frid
 
 function escapeRegExp(value) {
     return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function parseBudget(value) {
-    if (value === null || value === undefined) return undefined;
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    const raw = String(value).trim();
-    if (!raw || raw === '—' || raw.toLowerCase() === 'n/a') return undefined;
-    const cleaned = raw.replace(/[^0-9.]/g, '');
-    const num = Number(cleaned);
-    return Number.isFinite(num) ? num : undefined;
 }
 
 function getOpenAIClient() {
@@ -191,6 +182,8 @@ exports.createItinerary = async (req, res) => {
         if (bookingIdVal) {
             const existingForBooking = await Itinerary.findOne({ bookingId: bookingIdVal });
             if (existingForBooking) {
+                applyBudgetToDocument(existingForBooking);
+                await existingForBooking.save();
                 return res.json(existingForBooking);
             }
         }
@@ -203,7 +196,8 @@ exports.createItinerary = async (req, res) => {
             return res.status(400).json({ msg: 'Missing required fields: destination (or country/city)' });
         }
 
-        const itinerary = new Itinerary({
+        const parsedBudget = parseBudget(req.body?.budget ?? tripData?.budget);
+        const itineraryData = {
             userId,
             supplierId: supplierIdVal,
             bookingId: bookingIdVal,
@@ -215,10 +209,14 @@ exports.createItinerary = async (req, res) => {
             startDate: req.body?.startDate,
             endDate: req.body?.endDate,
             numberOfTravelers: Number(req.body?.numberOfTravelers) || 2,
-            budget: parseBudget(req.body?.budget ?? tripData?.budget),
             tripData: tripData || req.body?.tripData,
             days: Array.isArray(req.body?.days) ? req.body.days : [],
-        });
+        };
+        if (parsedBudget !== undefined) {
+            itineraryData.budget = parsedBudget;
+        }
+
+        const itinerary = new Itinerary(itineraryData);
 
         await itinerary.save();
         res.status(201).json(itinerary);
@@ -270,6 +268,7 @@ async function fetchActivitiesForDestination(country, city) {
 }
 
 async function saveGeneratedDays(itinerary, days, source) {
+    applyBudgetToDocument(itinerary);
     itinerary.days = days;
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
@@ -289,6 +288,8 @@ exports.generateItinerary = async (req, res) => {
     try {
         const itinerary = await Itinerary.findById(req.params.id);
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+
+        applyBudgetToDocument(itinerary);
 
         const country = (itinerary.country || itinerary.tripData?.country || itinerary.destination || '').trim();
         const city = (itinerary.city || itinerary.tripData?.city || itinerary.tripData?.destination || '').trim();

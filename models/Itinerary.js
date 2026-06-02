@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { applyBudgetToDocument } = require('../utils/parseBudget');
 
 const ItinerarySchema = new mongoose.Schema({
     userId: {
@@ -111,5 +112,10 @@ ItinerarySchema.index({ userId: 1, createdAt: -1 });
 ItinerarySchema.index({ supplierId: 1, createdAt: -1 });
 ItinerarySchema.index({ bookingId: 1 });
 ItinerarySchema.index({ country: 1, city: 1, aiGenerated: 1 });
+
+// Fix legacy string budgets ("N/A", "$500") before validation/save
+ItinerarySchema.pre('validate', function sanitizeBudget() {
+    applyBudgetToDocument(this);
+});
 
 module.exports = mongoose.model('Itinerary', ItinerarySchema);
