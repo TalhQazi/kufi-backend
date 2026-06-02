@@ -251,6 +251,7 @@ exports.createItinerary = async (req, res) => {
         const itinerary = new Itinerary(itineraryData);
 
         await itinerary.save();
+        await itinerary.populate('controlPanel.hotelId');
         res.status(201).json(itinerary);
     } catch (err) {
         console.error('createItinerary error:', err?.message);
@@ -262,7 +263,7 @@ exports.createItinerary = async (req, res) => {
 
 exports.getItineraryById = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id).lean();
+        const itinerary = await Itinerary.findById(req.params.id).populate('controlPanel.hotelId').lean();
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
         res.json(itinerary);
     } catch (err) {
@@ -278,7 +279,7 @@ exports.getItineraryByBookingId = async (req, res) => {
             return res.status(400).json({ msg: 'Invalid bookingId format' });
         }
 
-        const itinerary = await Itinerary.findOne({ bookingId }).lean();
+        const itinerary = await Itinerary.findOne({ bookingId }).populate('controlPanel.hotelId').lean();
 
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found for this booking' });
         res.json(itinerary);
@@ -306,6 +307,7 @@ async function saveGeneratedDays(itinerary, days, source) {
     itinerary.aiGeneratedAt = new Date();
     itinerary.updatedAt = new Date();
     await itinerary.save();
+    await itinerary.populate('controlPanel.hotelId');
     return resPayload(itinerary, source);
 }
 
@@ -557,6 +559,7 @@ exports.saveControlPanel = async (req, res) => {
         itinerary.controlPanel = { ...((itinerary.controlPanel || {})), ...req.body };
         itinerary.updatedAt = new Date();
         await itinerary.save();
+        await itinerary.populate('controlPanel.hotelId');
 
         res.json(itinerary);
     } catch (err) {
@@ -579,6 +582,7 @@ exports.saveDays = async (req, res) => {
         itinerary.days = req.body.days;
         itinerary.updatedAt = new Date();
         await itinerary.save();
+        await itinerary.populate('controlPanel.hotelId');
 
         res.json(itinerary);
     } catch (err) {
