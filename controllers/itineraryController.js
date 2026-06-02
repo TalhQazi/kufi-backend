@@ -20,7 +20,7 @@ function getOpenAIClient() {
     return new OpenAI({ apiKey: key });
 }
 
-function buildDefaultDays(itinerary, activities = []) {
+function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false) {
     const startDate = itinerary.startDate
         ? new Date(itinerary.startDate).toISOString().split('T')[0]
         : null;
@@ -31,26 +31,11 @@ function buildDefaultDays(itinerary, activities = []) {
     const usableActs = Array.isArray(activities) ? activities : [];
 
     const days = [];
+    const activeDayIndices = [];
     for (let idx = 0; idx < tripDays; idx++) {
         const newDate = startDate ? addDays(startDate, idx) : '';
         const isArrival = idx === 0;
         const isDeparture = idx === tripDays - 1;
-        const dayActivities = [];
-
-        if (!isArrival && !isDeparture && usableActs.length > 0) {
-            const act = usableActs[idx % usableActs.length];
-            dayActivities.push({
-                activityId: String(act._id),
-                title: act.title,
-                description: act.description || '',
-                startTime: '09:00',
-                endTime: '11:00',
-                price: Number(act.price) || 0,
-                category: act.category || 'general',
-                image: act.image || '',
-                isSupplierOnly: true,
-            });
-        }
 
         days.push({
             day: idx + 1,
@@ -60,9 +45,56 @@ function buildDefaultDays(itinerary, activities = []) {
             isDepartureDay: isDeparture,
             arrivalNote: isArrival ? 'Arrival Day — Free Day. Airport to Hotel transfer provided.' : undefined,
             departureNote: isDeparture ? 'Departure Day — Free Day. Hotel to Airport transfer provided.' : undefined,
-            activities: dayActivities,
+            activities: [],
         });
+
+        if (!isArrival && !isDeparture) {
+            activeDayIndices.push(idx);
+        }
     }
+
+    if (activeDayIndices.length === 0) {
+        for (let idx = 0; idx < tripDays; idx++) {
+            activeDayIndices.push(idx);
+        }
+    }
+
+    let actsToUse = [];
+    if (isBookingSpecific) {
+        actsToUse = usableActs;
+    } else {
+        actsToUse = usableActs.slice(0, activeDayIndices.length * 2);
+    }
+
+    actsToUse.forEach((act, actIdx) => {
+        const targetDayIdx = activeDayIndices[actIdx % activeDayIndices.length];
+        const existingCount = days[targetDayIdx].activities.length;
+        
+        let startTime = '09:00';
+        let endTime = '11:00';
+        if (existingCount === 1) {
+            startTime = '11:30';
+            endTime = '13:30';
+        } else if (existingCount === 2) {
+            startTime = '14:30';
+            endTime = '16:30';
+        } else if (existingCount >= 3) {
+            startTime = '17:00';
+            endTime = '19:00';
+        }
+
+        days[targetDayIdx].activities.push({
+            activityId: act._id ? String(act._id) : null,
+            title: act.title || '',
+            description: act.description || '',
+            startTime,
+            endTime,
+            price: Number(act.price) || 0,
+            category: act.category || 'general',
+            image: act.image || '',
+            isSupplierOnly: true,
+        });
+    });
 
     return days;
 }
@@ -298,9 +330,33 @@ exports.generateItinerary = async (req, res) => {
             return res.status(400).json({ msg: 'Itinerary must have country or city to generate' });
         }
 
+        // Fetch general approved activities for the destination
         const activities = await fetchActivitiesForDestination(country, city);
 
+        // Fetch traveler's selected activities from the booking if applicable
+        let bookingActivities = [];
+        if (itinerary.bookingId && mongoose.Types.ObjectId.isValid(itinerary.bookingId)) {
+            const booking = await Booking.findById(itinerary.bookingId).populate('items.activity').lean();
+            if (booking && Array.isArray(booking.items)) {
+                bookingActivities = booking.items.map(item => {
+                    if (item.activity && typeof item.activity === 'object') {
+                        return item.activity;
+                    } else {
+                        return {
+                            _id: item.activity || null,
+                            title: item.title,
+                            description: '',
+                            price: 0,
+                            category: 'general',
+                            image: ''
+                        };
+                    }
+                }).filter(Boolean);
+            }
+        }
+
         // ── Level 1: same country + city already generated in DB ─────────────
+        // ONLY reuse if the booking does not have its own specific activities, to avoid overriding with dummy data
         const existingQuery = {
             aiGenerated: true,
             _id: { $ne: itinerary._id },
@@ -315,7 +371,7 @@ exports.generateItinerary = async (req, res) => {
 
         const existing = await Itinerary.findOne(existingQuery).sort({ aiGeneratedAt: -1 }).lean();
 
-        if (existing && Array.isArray(existing.days) && existing.days.length > 0) {
+        if (bookingActivities.length === 0 && existing && Array.isArray(existing.days) && existing.days.length > 0) {
             const adaptedDays = adaptDaysToItinerary(existing.days, itinerary);
             await saveGeneratedDays(itinerary, adaptedDays, 'database');
             return res.json(resPayload(itinerary, 'database'));
@@ -324,7 +380,11 @@ exports.generateItinerary = async (req, res) => {
         // ── Level 2: call OpenAI (or template fallback) ───────────────────────
         const openai = getOpenAIClient();
         if (!openai) {
-            const templateDays = buildDefaultDays(itinerary, activities);
+            const templateDays = buildDefaultDays(
+                itinerary,
+                bookingActivities.length > 0 ? bookingActivities : activities,
+                bookingActivities.length > 0
+            );
             await saveGeneratedDays(itinerary, templateDays, 'template');
             return res.json({
                 ...resPayload(itinerary, 'template'),
@@ -348,6 +408,12 @@ exports.generateItinerary = async (req, res) => {
 
         const systemPrompt = `You are a professional travel itinerary planner. Create a detailed day-by-day itinerary as valid JSON only. No markdown, no explanation — just raw JSON.`;
 
+        const requiredActivitiesPrompt = bookingActivities.length > 0
+            ? `\nREQUIRED TRAVELER ACTIVITIES (You MUST schedule these activities into the days):
+${bookingActivities.map(a => `- id:${a._id || 'custom'} | "${a.title}" | price:$${a.price || 0} | category:${a.category || 'general'}`).join('\n')}
+Note: Make sure to assign the corresponding "activityId" to the activity objects in the JSON response.`
+            : '';
+
         const userPrompt = `Create a ${tripDays}-day travel itinerary for ${city || country}.
 
 Trip details:
@@ -365,12 +431,14 @@ Scheduling rules:
 - Last day is departure day — keep free (no activities), just hotel/airport transfer
 - Start activities on arrival day: ${cp.startOnArrival ? 'yes' : 'no'}
 - End activities on departure day: ${cp.endOnDeparture ? 'yes' : 'no'}
+- You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days, distributing them evenly.
 
 Available activities (use activityId from this list when assigning):
 ${activities.length > 0
     ? activities.map(a => `- id:${a._id} | "${a.title}" | duration:${a.duration || '2 hours'} | price:$${a.price || 0} | category:${a.category || 'general'}`).join('\n')
     : '(no pre-loaded activities — create generic appropriate activities for the destination)'
 }
+${requiredActivitiesPrompt}
 
 Return ONLY a JSON array with this exact structure:
 [
@@ -422,7 +490,11 @@ Return ONLY a JSON array with this exact structure:
             aiDays = JSON.parse(jsonStr);
         } catch (aiErr) {
             console.error('OpenAI generate failed, using template fallback:', aiErr?.message);
-            const templateDays = buildDefaultDays(itinerary, activities);
+            const templateDays = buildDefaultDays(
+                itinerary,
+                bookingActivities.length > 0 ? bookingActivities : activities,
+                bookingActivities.length > 0
+            );
             await saveGeneratedDays(itinerary, templateDays, 'template');
             return res.json({
                 ...resPayload(itinerary, 'template'),
@@ -430,18 +502,37 @@ Return ONLY a JSON array with this exact structure:
             });
         }
 
-        // Attach real activity images from DB where we have an activityId
+        // Attach real activity images and details from DB where we have matches
         const actMap = {};
         activities.forEach(a => { actMap[String(a._id)] = a; });
+
+        const bookingActMap = {};
+        bookingActivities.forEach(a => {
+            if (a._id) bookingActMap[String(a._id)] = a;
+        });
 
         const enrichedDays = aiDays.map((d, idx) => ({
             ...d,
             day: idx + 1,
             dayName: getDayName(d.date) || d.dayName || '',
             activities: (d.activities || []).map(act => {
-                const dbAct = act.activityId ? actMap[act.activityId] : null;
+                let dbAct = act.activityId ? (actMap[act.activityId] || bookingActMap[act.activityId]) : null;
+                
+                // Title fallback matching
+                if (!dbAct && act.title) {
+                    const cleanTitle = act.title.trim().toLowerCase();
+                    dbAct = activities.find(a => a.title.trim().toLowerCase() === cleanTitle) ||
+                            bookingActivities.find(a => a.title.trim().toLowerCase() === cleanTitle);
+                }
+
                 return {
-                    ...act,
+                    activityId: dbAct ? String(dbAct._id) : (act.activityId || null),
+                    title: dbAct ? dbAct.title : (act.title || ''),
+                    description: dbAct ? dbAct.description : (act.description || ''),
+                    startTime: act.startTime || '',
+                    endTime: act.endTime || '',
+                    price: dbAct ? (Number(dbAct.price) || 0) : (Number(act.price) || 0),
+                    category: dbAct ? dbAct.category : (act.category || 'general'),
                     image: act.image || dbAct?.image || '',
                     isSupplierOnly: true,
                 };
