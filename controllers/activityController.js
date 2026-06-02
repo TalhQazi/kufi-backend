@@ -38,7 +38,7 @@ const sanitizeActivityPayload = (body) => {
 // Get all activities
 exports.getActivities = async (req, res) => {
     try {
-        const { country, city, category, status } = req.query;
+        const { country, city, category, status, includeImages } = req.query;
         const filter = {};
 
         if (country) {
@@ -69,15 +69,21 @@ exports.getActivities = async (req, res) => {
         // take 30+ seconds. The frontend list views render a placeholder
         // when image is null and load the full image only on the detail
         // endpoint (`GET /api/activities/:id`) when the user opens an item.
+        const selectFields = includeImages === 'true'
+            ? '-images -description -addOns -coordinates'
+            : '-image -images -description -addOns -coordinates';
+
         const activities = await Activity.find(filter)
-            .select('-image -images -description -addOns -coordinates')
+            .select(selectFields)
             .lean()
             .sort({ createdAt: -1 })
             .limit(100)
             .maxTimeMS(10000);
 
-        for (const a of activities) {
-            a.image = null;
+        if (includeImages !== 'true') {
+            for (const a of activities) {
+                a.image = null;
+            }
         }
 
         res.json(activities);
