@@ -80,6 +80,11 @@ const ItinerarySchema = new mongoose.Schema({
     aiGeneratedAt: {
         type: Date
     },
+    generationSource: {
+        type: String,
+        enum: ['ai', 'template'],
+        default: 'ai'
+    },
     controlPanel: {
         activityStartTime: { type: String, default: '09:00' },
         activityEndTime: { type: String, default: '19:00' },

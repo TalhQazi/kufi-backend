@@ -163,7 +163,7 @@ exports.getUserItineraries = async (req, res) => {
             title: 1, destination: 1, location: 1, status: 1, imageUrl: 1,
             startDate: 1, endDate: 1, numberOfTravelers: 1, budget: 1,
             notes: 1, tripData: 1, country: 1, city: 1, aiGenerated: 1,
-            aiGeneratedAt: 1, createdAt: 1, updatedAt: 1,
+            aiGeneratedAt: 1, generationSource: 1, createdAt: 1, updatedAt: 1,
         };
 
         let itineraries;
@@ -306,6 +306,7 @@ async function saveGeneratedDays(itinerary, days, source) {
     itinerary.days = days;
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
+    itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
     itinerary.updatedAt = new Date();
     await itinerary.save();
     await itinerary.populate('controlPanel.hotelId');
