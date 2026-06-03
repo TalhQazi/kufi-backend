@@ -358,26 +358,36 @@ exports.generateItinerary = async (req, res) => {
             }
         }
 
-        // ── Level 1: same country + city already generated in DB ─────────────
-        // ONLY reuse if the booking does not have its own specific activities, to avoid overriding with dummy data
-        const existingQuery = {
-            aiGenerated: true,
-            _id: { $ne: itinerary._id },
-            days: { $exists: true, $not: { $size: 0 } },
-        };
-        if (country && city) {
-            existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
-            existingQuery.city = new RegExp(`^${escapeRegExp(city)}$`, 'i');
-        } else if (country) {
-            existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
-        }
+        const mode = req.body.mode || 'ai';
 
-        const existing = await Itinerary.findOne(existingQuery).sort({ aiGeneratedAt: -1 }).lean();
+        if (mode === 'template') {
+            const existingQuery = {
+                aiGenerated: true,
+                _id: { $ne: itinerary._id },
+                days: { $exists: true, $not: { $size: 0 } },
+            };
+            if (country && city) {
+                existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
+                existingQuery.city = new RegExp(`^${escapeRegExp(city)}$`, 'i');
+            } else if (country) {
+                existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
+            }
 
-        if (bookingActivities.length === 0 && existing && Array.isArray(existing.days) && existing.days.length > 0) {
-            const adaptedDays = adaptDaysToItinerary(existing.days, itinerary);
-            await saveGeneratedDays(itinerary, adaptedDays, 'database');
-            return res.json(resPayload(itinerary, 'database'));
+            const existing = await Itinerary.findOne(existingQuery).sort({ aiGeneratedAt: -1 }).lean();
+
+            if (existing && Array.isArray(existing.days) && existing.days.length > 0) {
+                const adaptedDays = adaptDaysToItinerary(existing.days, itinerary);
+                await saveGeneratedDays(itinerary, adaptedDays, 'database');
+                return res.json(resPayload(itinerary, 'database'));
+            } else {
+                const templateDays = buildDefaultDays(
+                    itinerary,
+                    bookingActivities.length > 0 ? bookingActivities : activities,
+                    bookingActivities.length > 0
+                );
+                await saveGeneratedDays(itinerary, templateDays, 'template');
+                return res.json(resPayload(itinerary, 'template'));
+            }
         }
 
         // ── Level 2: call OpenAI (or template fallback) ───────────────────────
