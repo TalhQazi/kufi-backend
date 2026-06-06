@@ -10,3 +10,9 @@ dist/
 *.log
 itinerary v2.xlsx
 .env.example
+
+# Local dev secrets and test scripts
+nano.env
+check_*.js
+test-*.js
+test_*.js
