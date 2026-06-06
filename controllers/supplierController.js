@@ -109,7 +109,7 @@ exports.getMyBookings = async (req, res) => {
         // Don't pull `image` via populate — some activities store 5MB base64
         // strings in that field which makes this endpoint take 30+ seconds.
         // The supplier UI doesn't display activity thumbnails on bookings.
-        const bookings = await Booking.find(query)
+        let bookings = await Booking.find(query)
             .sort({ createdAt: -1 })
             .populate('user', 'name email')
             .populate('items.activity', 'title')
@@ -117,7 +117,25 @@ exports.getMyBookings = async (req, res) => {
             .lean()
             .maxTimeMS(10000);
 
-        res.json(bookings);
+        if (bookings.length > 0) {
+            const bookingIds = bookings.map(b => b._id);
+            const itineraries = await mongoose.model('Itinerary')
+                .find({ bookingId: { $in: bookingIds } })
+                .select('_id status aiGenerated days startDate endDate updatedAt title destination')
+                .lean();
+
+            const itinMap = {};
+            itineraries.forEach(itin => {
+                if (itin.bookingId) itinMap[String(itin.bookingId)] = itin;
+            });
+
+            bookings = bookings.map(b => ({
+                ...b,
+                itinerary: itinMap[String(b._id)] || null
+            }));
+        }
+
+        res.json(bookings); // Note: frontend expects an array or {bookings: array} based on `rawBookings` parsing
     } catch (err) {
         console.error('Get My Bookings Error:', err.message);
         if (res.headersSent) return;
