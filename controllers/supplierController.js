@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Activity = require('../models/Activity');
 const Booking = require('../models/Booking');
+const Itinerary = require('../models/Itinerary');
 
 const normalizeStringArray = (value) => {
     if (!Array.isArray(value)) return [];
@@ -119,7 +120,7 @@ exports.getMyBookings = async (req, res) => {
 
         if (bookings.length > 0) {
             const bookingIds = bookings.map(b => b._id);
-            const itineraries = await mongoose.model('Itinerary')
+            const itineraries = await Itinerary
                 .find({ bookingId: { $in: bookingIds } })
                 .select('_id status aiGenerated days startDate endDate updatedAt title destination')
                 .lean();
