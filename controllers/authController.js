@@ -14,6 +14,7 @@ const formatAuthUser = (user) => {
         email: u.email,
         role: u.role,
         status: u.status,
+        avatar: u.avatar,
         darkMode: Boolean(u.preferences?.darkMode),
     };
 };
@@ -283,6 +284,9 @@ exports.googleLogin = async (req, res) => {
                 avatar: picture,
                 status: 'active'
             });
+            await user.save();
+        } else if (!user.avatar && picture) {
+            user.avatar = picture;
             await user.save();
         }
 

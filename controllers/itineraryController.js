@@ -441,10 +441,8 @@ Scheduling rules:
 - Activity start time each day: ${cp.activityStartTime || '09:00'}
 - Activity end time each day: ${cp.activityEndTime || '19:00'}
 - Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'} (no activities during lunch)
-- Day 1 is arrival day — keep free (no activities), just airport/hotel transfer
-- Last day is departure day — keep free (no activities), just hotel/airport transfer
-- Start activities on arrival day: ${cp.startOnArrival ? 'yes' : 'no'}
-- End activities on departure day: ${cp.endOnDeparture ? 'yes' : 'no'}
+- Day 1 is arrival day — ${cp.startOnArrival ? 'you MAY schedule activities today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
+- Last day is departure day — ${cp.endOnDeparture ? 'you MAY schedule activities today before check-out' : 'keep free (no activities), just hotel/airport transfer'}
 - You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days, distributing them evenly.
 
 Available activities (use activityId from this list when assigning):
@@ -567,6 +565,13 @@ exports.saveControlPanel = async (req, res) => {
     try {
         const itinerary = await Itinerary.findById(req.params.id);
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+
+        if (req.body.startDate !== undefined) {
+            itinerary.startDate = req.body.startDate;
+        }
+        if (req.body.endDate !== undefined) {
+            itinerary.endDate = req.body.endDate;
+        }
 
         itinerary.controlPanel = { ...((itinerary.controlPanel || {})), ...req.body };
         itinerary.updatedAt = new Date();

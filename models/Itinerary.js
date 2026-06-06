@@ -101,7 +101,7 @@ const ItinerarySchema = new mongoose.Schema({
         }],
         hotelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Hotel' },
         numberOfRooms: { type: Number, default: 1 },
-        budgetUplift: { type: Number, default: 0.15 }
+        budgetUplift: { type: Number, default: 15 }
     },
     createdAt: {
         type: Date,
