@@ -122,7 +122,7 @@ exports.getMyBookings = async (req, res) => {
             const bookingIds = bookings.map(b => b._id);
             const itineraries = await Itinerary
                 .find({ bookingId: { $in: bookingIds } })
-                .select('_id status aiGenerated days startDate endDate updatedAt title destination')
+                .select('_id bookingId status aiGenerated days startDate endDate updatedAt title destination')
                 .lean();
 
             const itinMap = {};
