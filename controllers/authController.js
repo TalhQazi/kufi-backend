@@ -274,6 +274,7 @@ exports.googleLogin = async (req, res) => {
         const { name, email, picture } = googleRes.data;
 
         let user = await User.findOne({ email });
+        let isNewUser = false;
 
         if (!user) {
             user = new User({
@@ -285,6 +286,7 @@ exports.googleLogin = async (req, res) => {
                 status: 'active'
             });
             await user.save();
+            isNewUser = true;
         } else if (!user.avatar && picture) {
             user.avatar = picture;
             await user.save();
@@ -296,6 +298,28 @@ exports.googleLogin = async (req, res) => {
                 role: user.role
             }
         };
+
+        if (isNewUser) {
+            try {
+                await sendEmail({
+                    to: user.email,
+                    subject: 'Welcome to Kufi!',
+                    templateKey: 'userRegistration',
+                    html: `
+                        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                            <h2 style="color: #a26e35;">Hello ${user.name}!</h2>
+                            <p>Welcome to Kufi! Your account has been successfully created via Google. You can now explore destinations and book activities.</p>
+                            <div style="margin-top: 30px; text-align: center;">
+                                <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Start Exploring</a>
+                            </div>
+                            <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for joining us.</p>
+                        </div>
+                    `
+                });
+            } catch (emailErr) {
+                console.error('Error sending Google registration email:', emailErr);
+            }
+        }
 
         jwt.sign(
             payload,

@@ -234,10 +234,38 @@ exports.updateBookingStatus = async (req, res) => {
         if (!booking) return res.status(404).json({ message: 'Booking not found' });
 
         const normalizedStatus = String(status || '').trim().toLowerCase();
-        
+
         if (normalizedStatus === 'confirmed') {
             booking.status = 'confirmed';
             await booking.save();
+
+            // Notify traveler that supplier accepted their request
+            try {
+                const recipientEmail = booking.contactDetails?.email;
+                const travelerName = booking.contactDetails?.firstName || booking.contactDetails?.name || 'Traveler';
+                const destination = booking.tripDetails?.country || booking.destination || 'your destination';
+                if (recipientEmail) {
+                    await sendEmail({
+                        to: recipientEmail,
+                        subject: 'Your Trip Request Has Been Accepted!',
+                        templateKey: 'itineraryReply',
+                        html: `
+                            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                                <h2 style="color: #a26e35;">Great news, ${travelerName}!</h2>
+                                <p>Your trip request to <strong>${destination}</strong> has been accepted by a supplier. They are now preparing your personalized itinerary.</p>
+                                <p>You will receive another email once your itinerary is ready to view.</p>
+                                <div style="margin-top: 30px; text-align: center;">
+                                    <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">View My Dashboard</a>
+                                </div>
+                                <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for choosing Kufi Travel.</p>
+                            </div>
+                        `
+                    });
+                }
+            } catch (emailErr) {
+                console.error('Error sending booking accepted email:', emailErr);
+            }
+
             return res.json(booking);
         }
 

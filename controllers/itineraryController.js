@@ -4,7 +4,9 @@ const Itinerary = require('../models/Itinerary');
 const Activity = require('../models/Activity');
 const Hotel = require('../models/Hotel');
 const Booking = require('../models/Booking');
+const User = require('../models/User');
 const { parseBudget, applyBudgetToDocument } = require('../utils/parseBudget');
+const { sendEmail } = require('../utils/emailService');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -761,10 +763,49 @@ exports.saveDays = async (req, res) => {
             return res.status(400).json({ msg: 'days must be an array' });
         }
 
+        const wasNotSentBefore = ['Pending', 'Pending Review'].includes(itinerary.status);
+
         itinerary.days = req.body.days;
         itinerary.updatedAt = new Date();
+
+        // Mark as ready for traveler on first save
+        if (wasNotSentBefore) {
+            itinerary.status = 'Supplier Replied Back';
+        }
+
         await itinerary.save();
         await itinerary.populate('controlPanel.hotelId');
+
+        // Send email to traveler only on the first save (status transition)
+        if (wasNotSentBefore) {
+            try {
+                const travelerUser = await User.findById(itinerary.userId).lean();
+                const recipientEmail = travelerUser?.email;
+                const travelerName = travelerUser?.name || 'Traveler';
+                const destination = itinerary.destination || itinerary.title || 'your destination';
+
+                if (recipientEmail) {
+                    await sendEmail({
+                        to: recipientEmail,
+                        subject: 'Your Itinerary Is Ready!',
+                        templateKey: 'itineraryReply',
+                        html: `
+                            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                                <h2 style="color: #a26e35;">Your itinerary is ready, ${travelerName}!</h2>
+                                <p>Your personalized itinerary for <strong>${destination}</strong> has been prepared by your supplier and is now available to view.</p>
+                                <p>Log in to your dashboard to review the full day-by-day plan and proceed with booking.</p>
+                                <div style="margin-top: 30px; text-align: center;">
+                                    <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">View My Itinerary</a>
+                                </div>
+                                <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for choosing Kufi Travel.</p>
+                            </div>
+                        `
+                    });
+                }
+            } catch (emailErr) {
+                console.error('Error sending itinerary ready email:', emailErr);
+            }
+        }
 
         res.json(itinerary);
     } catch (err) {
