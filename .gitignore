@@ -13,6 +13,12 @@ itinerary v2.xlsx
 
 # Local dev secrets and test scripts
 nano.env
+audit-*.js
+audit_*.js
+check-*.js
 check_*.js
+time-*.js
+time_*.js
+db-perf.js
 test-*.js
 test_*.js
