@@ -20,7 +20,101 @@ function getOpenAIClient() {
     return new OpenAI({ apiKey: key });
 }
 
-function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false) {
+function getActivitiesForBudget(bookingActivities, activities, budget) {
+    const required = Array.isArray(bookingActivities) ? bookingActivities : [];
+    const available = Array.isArray(activities) ? activities : [];
+    
+    if (budget === undefined || budget === null || typeof budget !== 'number') {
+        return required.length > 0 ? required : available;
+    }
+
+    const selected = [...required];
+    let total = required.reduce((sum, a) => sum + (Number(a.price) || 0), 0);
+
+    const requiredIds = new Set(required.map(r => String(r._id)));
+    const remainingAvailable = available.filter(a => !requiredIds.has(String(a._id)));
+
+    // Sort remaining available activities by price ascending to fit as many as possible
+    const sortedAvailable = [...remainingAvailable].sort((a, b) => (Number(a.price) || 0) - (Number(b.price) || 0));
+
+    for (const act of sortedAvailable) {
+        const price = Number(act.price) || 0;
+        if (total + price <= budget) {
+            selected.push(act);
+            total += price;
+        }
+    }
+
+    return selected;
+}
+
+function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr) {
+    const toMin = (t) => {
+        if (!t) return 0;
+        const [h, m] = t.split(':').map(Number);
+        return h * 60 + (m || 0);
+    };
+    const toTimeStr = (m) => {
+        const h = Math.floor(m / 60);
+        const mins = m % 60;
+        return `${String(h).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+    };
+
+    const dayStart = toMin(startStr || '09:00');
+    const dayEnd = toMin(endStr || '19:00');
+    const lunchStart = toMin(lunchStartStr || '13:00');
+    const lunchEnd = toMin(lunchEndStr || '14:00');
+
+    const slotDuration = 120; // 2 hours
+    const slots = [];
+    let current = dayStart;
+
+    while (current + slotDuration <= dayEnd) {
+        const slotEnd = current + slotDuration;
+        const overlapsLunch = (current < lunchEnd && slotEnd > lunchStart);
+
+        if (overlapsLunch) {
+            current = lunchEnd;
+            continue;
+        }
+
+        slots.push({ start: current, end: slotEnd });
+        current = slotEnd;
+    }
+
+    const slot = slots[index % (slots.length || 1)] || { start: dayStart, end: dayStart + slotDuration };
+    return {
+        startTime: toTimeStr(slot.start),
+        endTime: toTimeStr(slot.end)
+    };
+}
+
+function enforceActivityBudget(days, maxActivityBudget) {
+    if (maxActivityBudget === undefined || maxActivityBudget === null) {
+        return days;
+    }
+
+    let total = 0;
+    return days.map(d => {
+        const keptActivities = [];
+        for (const act of (d.activities || [])) {
+            const price = Number(act.price) || 0;
+            if (total + price <= maxActivityBudget) {
+                keptActivities.push(act);
+                total += price;
+            } else {
+                console.log(`Enforcing budget: removing activity "${act.title}" with price $${price} (total would be $${total + price} vs max $${maxActivityBudget})`);
+            }
+        }
+        return {
+            ...d,
+            activities: keptActivities
+        };
+    });
+}
+
+function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined) {
+    const cp = itinerary.controlPanel || {};
     const startDate = itinerary.startDate
         ? new Date(itinerary.startDate).toISOString().split('T')[0]
         : null;
@@ -28,7 +122,13 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false)
         ? new Date(itinerary.endDate).toISOString().split('T')[0]
         : null;
     const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
-    const usableActs = Array.isArray(activities) ? activities : [];
+    
+    // Respect the budget constraint
+    const usableActs = getActivitiesForBudget(
+        isBookingSpecific ? activities : [],
+        activities,
+        activityBudget !== undefined ? activityBudget : itinerary.budget
+    );
 
     const days = [];
     const activeDayIndices = [];
@@ -37,22 +137,32 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false)
         const isArrival = idx === 0;
         const isDeparture = idx === tripDays - 1;
 
+        // Respect cp.startOnArrival / cp.endOnDeparture settings
+        let isActive = true;
+        if (isArrival && !cp.startOnArrival) {
+            isActive = false;
+        }
+        if (isDeparture && !cp.endOnDeparture) {
+            isActive = false;
+        }
+
         days.push({
             day: idx + 1,
             date: newDate,
             dayName: getDayName(newDate),
             isArrivalDay: isArrival,
             isDepartureDay: isDeparture,
-            arrivalNote: isArrival ? 'Arrival Day — Free Day. Airport to Hotel transfer provided.' : undefined,
-            departureNote: isDeparture ? 'Departure Day — Free Day. Hotel to Airport transfer provided.' : undefined,
+            arrivalNote: isArrival && !cp.startOnArrival ? 'Arrival Day — Free Day. Airport to Hotel transfer provided.' : undefined,
+            departureNote: isDeparture && !cp.endOnDeparture ? 'Departure Day — Free Day. Hotel to Airport transfer provided.' : undefined,
             activities: [],
         });
 
-        if (!isArrival && !isDeparture) {
+        if (isActive) {
             activeDayIndices.push(idx);
         }
     }
 
+    // Fallback if no days are active
     if (activeDayIndices.length === 0) {
         for (let idx = 0; idx < tripDays; idx++) {
             activeDayIndices.push(idx);
@@ -68,20 +178,24 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false)
 
     actsToUse.forEach((act, actIdx) => {
         const targetDayIdx = activeDayIndices[actIdx % activeDayIndices.length];
+        const targetDate = days[targetDayIdx].date;
         const existingCount = days[targetDayIdx].activities.length;
         
-        let startTime = '09:00';
-        let endTime = '11:00';
-        if (existingCount === 1) {
-            startTime = '11:30';
-            endTime = '13:30';
-        } else if (existingCount === 2) {
-            startTime = '14:30';
-            endTime = '16:30';
-        } else if (existingCount >= 3) {
-            startTime = '17:00';
-            endTime = '19:00';
-        }
+        // Find overrides or default values
+        const dayOverride = (cp.perDayOverrides || []).find(o => o.date === targetDate) || {};
+        
+        const activityStartTime = dayOverride.startTime || cp.activityStartTime || '09:00';
+        const activityEndTime = dayOverride.endTime || cp.activityEndTime || '19:00';
+        const lunchStart = dayOverride.lunchStart || cp.lunchStart || '13:00';
+        const lunchEnd = dayOverride.lunchEnd || cp.lunchEnd || '14:00';
+
+        const { startTime, endTime } = getActivityTimeSlot(
+            existingCount,
+            activityStartTime,
+            activityEndTime,
+            lunchStart,
+            lunchEnd
+        );
 
         days[targetDayIdx].activities.push({
             activityId: act._id ? String(act._id) : null,
@@ -244,6 +358,7 @@ exports.createItinerary = async (req, res) => {
             numberOfTravelers: Number(req.body?.numberOfTravelers) || 2,
             tripData: tripData || req.body?.tripData,
             days: Array.isArray(req.body?.days) ? req.body.days : [],
+            controlPanel: req.body?.controlPanel || undefined,
         };
         if (parsedBudget !== undefined) {
             itineraryData.budget = parsedBudget;
@@ -297,7 +412,7 @@ async function fetchActivitiesForDestination(country, city) {
     if (city) orClause.push({ location: new RegExp(escapeRegExp(city), 'i') });
     if (orClause.length) query.$or = orClause;
     return Activity.find(query)
-        .select('_id title description duration price category image location')
+        .select('_id title description duration price category location')
         .lean();
 }
 
@@ -340,7 +455,7 @@ exports.generateItinerary = async (req, res) => {
         // Fetch traveler's selected activities from the booking if applicable
         let bookingActivities = [];
         if (itinerary.bookingId && mongoose.Types.ObjectId.isValid(itinerary.bookingId)) {
-            const booking = await Booking.findById(itinerary.bookingId).populate('items.activity').lean();
+            const booking = await Booking.findById(itinerary.bookingId).populate({ path: 'items.activity', select: '-image' }).lean();
             if (booking && Array.isArray(booking.items)) {
                 bookingActivities = booking.items.map(item => {
                     if (item.activity && typeof item.activity === 'object') {
@@ -357,6 +472,46 @@ exports.generateItinerary = async (req, res) => {
                     }
                 }).filter(Boolean);
             }
+        }
+
+        // LOAD HOTEL AND CALCULATE ACTIVITY BUDGET EARLY
+        let hotel = null;
+        if (itinerary.controlPanel?.hotelId && mongoose.Types.ObjectId.isValid(itinerary.controlPanel.hotelId)) {
+            hotel = await Hotel.findById(itinerary.controlPanel.hotelId).lean();
+        }
+
+        const cp = itinerary.controlPanel || {};
+        const startDate = itinerary.startDate
+            ? new Date(itinerary.startDate).toISOString().split('T')[0]
+            : null;
+        const endDate = itinerary.endDate
+            ? new Date(itinerary.endDate).toISOString().split('T')[0]
+            : null;
+        const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
+
+        // Calculate available budget for activities by accounting for hotel and uplift
+        let upliftRaw = cp.budgetUplift ?? 15;
+        let upliftPct = Math.min(Math.max((upliftRaw > 0 && upliftRaw < 1) ? upliftRaw : (Number(upliftRaw) / 100), 0), 1);
+        let hotelCost = 0;
+        if (hotel) {
+            const nights = Math.max(1, tripDays - 1);
+            const rooms = cp.numberOfRooms || 1;
+            hotelCost = (hotel.pricePerNight || 0) * nights * rooms;
+        }
+
+        let activityBudget = undefined;
+        let activityBudgetStr = 'flexible';
+        let budgetRulePrompt = '';
+
+        if (itinerary.budget) {
+            let maxTotalActivitiesCost = (itinerary.budget / (1 + upliftPct)) - hotelCost;
+            maxTotalActivitiesCost = Math.floor(maxTotalActivitiesCost);
+            if (maxTotalActivitiesCost < 0) maxTotalActivitiesCost = 0; // AI must not schedule paid activities if budget is consumed
+            
+            activityBudget = maxTotalActivitiesCost;
+            activityBudgetStr = maxTotalActivitiesCost;
+
+            budgetRulePrompt = `\nCRITICAL BUDGET RULE: You have EXACTLY $${activityBudgetStr} to spend on activities. The total sum of the prices of all scheduled activities in your response MUST NOT exceed $${activityBudgetStr}. You must select a subset of the available activities (or adjust activity selections) so that the sum of their 'price' fields is strictly less than or equal to $${activityBudgetStr}. Note: DO NOT worry about hotel prices or service fees, they are already accounted for. JUST keep the sum of activity prices under $${activityBudgetStr}.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -384,7 +539,8 @@ exports.generateItinerary = async (req, res) => {
                 const templateDays = buildDefaultDays(
                     itinerary,
                     bookingActivities.length > 0 ? bookingActivities : activities,
-                    bookingActivities.length > 0
+                    bookingActivities.length > 0,
+                    activityBudget
                 );
                 await saveGeneratedDays(itinerary, templateDays, 'template');
                 return res.json(resPayload(itinerary, 'template'));
@@ -397,7 +553,8 @@ exports.generateItinerary = async (req, res) => {
             const templateDays = buildDefaultDays(
                 itinerary,
                 bookingActivities.length > 0 ? bookingActivities : activities,
-                bookingActivities.length > 0
+                bookingActivities.length > 0,
+                activityBudget
             );
             await saveGeneratedDays(itinerary, templateDays, 'template');
             return res.json({
@@ -405,20 +562,6 @@ exports.generateItinerary = async (req, res) => {
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
-
-        let hotel = null;
-        if (itinerary.controlPanel?.hotelId && mongoose.Types.ObjectId.isValid(itinerary.controlPanel.hotelId)) {
-            hotel = await Hotel.findById(itinerary.controlPanel.hotelId).lean();
-        }
-
-        const cp = itinerary.controlPanel || {};
-        const startDate = itinerary.startDate
-            ? new Date(itinerary.startDate).toISOString().split('T')[0]
-            : null;
-        const endDate = itinerary.endDate
-            ? new Date(itinerary.endDate).toISOString().split('T')[0]
-            : null;
-        const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
 
         const systemPrompt = `You are a professional travel itinerary planner. Create a detailed day-by-day itinerary as valid JSON only. No markdown, no explanation — just raw JSON.`;
 
@@ -428,22 +571,50 @@ ${bookingActivities.map(a => `- id:${a._id || 'custom'} | "${a.title}" | price:$
 Note: Make sure to assign the corresponding "activityId" to the activity objects in the JSON response.`
             : '';
 
+        const overridesPrompt = Array.isArray(cp.perDayOverrides) && cp.perDayOverrides.length > 0
+            ? `\nSpecific day-by-day scheduling overrides (Use these instead of the default rules for these specific dates):
+${cp.perDayOverrides.map(o => `- Date: ${o.date} | Start: ${o.startTime || 'default'} | End: ${o.endTime || 'default'} | Lunch: ${o.lunchStart || 'default'} to ${o.lunchEnd || 'default'}`).join('\n')}`
+            : '';
+
+        let day1Example = `  {
+    "day": 1,
+    "date": "${startDate || 'YYYY-MM-DD'}",
+    "dayName": "Monday",
+    "isArrivalDay": true,
+    "isDepartureDay": false,
+    "arrivalNote": "${cp.startOnArrival ? 'Arrival Day — Checked in and ready for activities.' : 'Arrival Day — Free Day. Airport to Hotel transfer provided.'}",
+    "activities": ${cp.startOnArrival ? `[
+      {
+        "activityId": "null",
+        "title": "Welcome Dinner",
+        "description": "Relaxing first evening dinner",
+        "startTime": "19:00",
+        "endTime": "21:00",
+        "price": 30,
+        "category": "dining",
+        "image": "",
+        "isSupplierOnly": false
+      }
+    ]` : '[]'}
+  }`;
+
         const userPrompt = `Create a ${tripDays}-day travel itinerary for ${city || country}.
 
 Trip details:
 - Start date: ${startDate || 'not specified'}
 - End date: ${endDate || 'not specified'}
 - Travelers: ${itinerary.numberOfTravelers || 2}
-- Budget: $${itinerary.budget || 'flexible'}
+- Activity Budget Limit: $${activityBudgetStr} (DO NOT EXCEED)
 - Hotel: ${hotel ? hotel.name : 'not specified'}
 
 Scheduling rules:
 - Activity start time each day: ${cp.activityStartTime || '09:00'}
 - Activity end time each day: ${cp.activityEndTime || '19:00'}
 - Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'} (no activities during lunch)
-- Day 1 is arrival day — ${cp.startOnArrival ? 'you MAY schedule activities today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
-- Last day is departure day — ${cp.endOnDeparture ? 'you MAY schedule activities today before check-out' : 'keep free (no activities), just hotel/airport transfer'}
-- You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days, distributing them evenly.
+- Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
+- Last day is departure day — ${cp.endOnDeparture ? 'you MUST schedule at least one activity today before check-out' : 'keep free (no activities), just hotel/airport transfer'}${overridesPrompt}
+- You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days, distributing them evenly.${budgetRulePrompt}
+- When creating generic/custom activities, assign accurate estimated prices so the budget can be calculated correctly.
 
 Available activities (use activityId from this list when assigning):
 ${activities.length > 0
@@ -454,15 +625,7 @@ ${requiredActivitiesPrompt}
 
 Return ONLY a JSON array with this exact structure:
 [
-  {
-    "day": 1,
-    "date": "${startDate || 'YYYY-MM-DD'}",
-    "dayName": "Monday",
-    "isArrivalDay": true,
-    "isDepartureDay": false,
-    "arrivalNote": "Arrival Day — Free Day. Airport to Hotel transfer provided.",
-    "activities": []
-  },
+${day1Example},
   {
     "day": 2,
     "date": "YYYY-MM-DD",
@@ -505,7 +668,8 @@ Return ONLY a JSON array with this exact structure:
             const templateDays = buildDefaultDays(
                 itinerary,
                 bookingActivities.length > 0 ? bookingActivities : activities,
-                bookingActivities.length > 0
+                bookingActivities.length > 0,
+                activityBudget
             );
             await saveGeneratedDays(itinerary, templateDays, 'template');
             return res.json({
@@ -551,7 +715,8 @@ Return ONLY a JSON array with this exact structure:
             }),
         }));
 
-        await saveGeneratedDays(itinerary, enrichedDays, 'ai');
+        const finalDays = enforceActivityBudget(enrichedDays, activityBudget);
+        await saveGeneratedDays(itinerary, finalDays, 'ai');
         return res.json(resPayload(itinerary, 'ai'));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);

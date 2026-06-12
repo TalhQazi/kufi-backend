@@ -4,13 +4,11 @@ const Booking = require('../models/Booking');
 const GlobalSettings = require('../models/GlobalSettings');
 const EmailSettings = require('../models/EmailSettings');
 const { sendEmail } = require('../utils/emailService');
+const { parseBudget } = require('../utils/parseBudget');
 
 const parseBudgetNumber = (value) => {
-    if (!value) return 0;
-    const raw = String(value);
-    const digits = raw.replace(/[^0-9.]/g, '');
-    const num = Number(digits);
-    return Number.isFinite(num) ? num : 0;
+    const num = parseBudget(value);
+    return num !== undefined ? num : 0;
 };
 
 const timeAgo = (date) => {
@@ -33,25 +31,45 @@ const timeAgo = (date) => {
 exports.getSystemStats = async (req, res) => {
     try {
         const adminId = req.user.id;
-        const adminUser = await User.findById(adminId).select('lastReadNotifications').lean().maxTimeMS(60000);
+        const adminUser = await User.findById(adminId).select('lastReadNotifications').lean().maxTimeMS(10000);
         const lastRead = adminUser?.lastReadNotifications || new Date(0);
 
-        const [totalUsers, totalSuppliers, totalActivities, totalBookings, pendingRequests, unreadBookings, unreadSuppliers] = await Promise.all([
-            User.countDocuments({ role: 'user' }).maxTimeMS(60000),
-            User.countDocuments({ role: 'supplier' }).maxTimeMS(60000),
-            Activity.countDocuments().maxTimeMS(60000),
-            Booking.countDocuments().maxTimeMS(60000),
-            Booking.countDocuments({ status: 'pending' }).maxTimeMS(60000),
-            Booking.countDocuments({ createdAt: { $gt: lastRead } }).maxTimeMS(60000),
-            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } }).maxTimeMS(60000)
+        const [roleCounts, bookingStats, totalActivities, unreadSuppliers, confirmedBookings] = await Promise.all([
+            User.aggregate([
+                { $group: { _id: '$role', count: { $sum: 1 } } }
+            ]).option({ maxTimeMS: 10000 }),
+            Booking.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        total: { $sum: 1 },
+                        pending: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+                        unread: { $sum: { $cond: [{ $gt: ['$createdAt', lastRead] }, 1, 0] } }
+                    }
+                }
+            ]).option({ maxTimeMS: 10000 }),
+            Activity.countDocuments().maxTimeMS(10000),
+            User.countDocuments({ role: 'supplier', createdAt: { $gt: lastRead } }).maxTimeMS(10000),
+            Booking.find({ status: 'confirmed' })
+                .select('tripDetails.budget')
+                .sort({ createdAt: -1 })
+                .limit(500)
+                .lean()
+                .maxTimeMS(10000)
         ]);
 
-        const confirmedBookings = await Booking.find({ status: 'confirmed' })
-            .select('tripDetails.budget')
-            .sort({ createdAt: -1 })
-            .limit(500)
-            .lean()
-            .maxTimeMS(60000);
+        const userCountMap = {};
+        (roleCounts || []).forEach(r => {
+            if (r._id) userCountMap[r._id] = r.count;
+        });
+
+        const totalUsers = userCountMap['user'] || 0;
+        const totalSuppliers = userCountMap['supplier'] || 0;
+
+        const bStats = bookingStats?.[0] || { total: 0, pending: 0, unread: 0 };
+        const totalBookings = bStats.total;
+        const pendingRequests = bStats.pending;
+        const unreadBookings = bStats.unread;
 
         const revenue = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
 

@@ -10,11 +10,13 @@ function parseBudget(value) {
         return undefined;
     }
 
-    const match = raw.replace(/,/g, '').match(/(\d+(?:\.\d+)?)/);
-    if (!match) return undefined;
+    const matches = raw.replace(/,/g, '').match(/\d+(?:\.\d+)?/g);
+    if (!matches || matches.length === 0) return undefined;
 
-    const num = Number(match[1]);
-    return Number.isFinite(num) ? num : undefined;
+    const numbers = matches.map(Number).filter(Number.isFinite);
+    if (numbers.length === 0) return undefined;
+
+    return Math.max(...numbers);
 }
 
 function applyBudgetToDocument(doc) {

@@ -4,6 +4,7 @@ const User = require('../models/User');
 const AnalyticsSession = require('../models/AnalyticsSession');
 const AnalyticsDaily = require('../models/AnalyticsDaily');
 const mongoose = require('mongoose');
+const { parseBudget } = require('../utils/parseBudget');
 
 const getDayKey = (date = new Date()) => {
     const d = new Date(date);
@@ -25,11 +26,8 @@ const getLastNDays = (n) => {
 };
 
 const parseBudgetNumber = (value) => {
-    if (!value) return 0;
-    const raw = String(value);
-    const digits = raw.replace(/[^0-9.]/g, '');
-    const num = Number(digits);
-    return Number.isFinite(num) ? num : 0;
+    const num = parseBudget(value);
+    return num !== undefined ? num : 0;
 };
 
 const safePercent = (part, total) => {
@@ -184,25 +182,68 @@ exports.getAdminAnalytics = async (req, res) => {
         const now = new Date();
         const activeCutoff = new Date(now.getTime() - 5 * 60 * 1000);
 
+        const days = getLastNDays(7);
+        const dayKeys = days.map((d) => getDayKey(d));
+
         const [
             totalTraffic,
             activeUsers,
             totalUsers,
-            totalBookings
+            totalBookings,
+            confirmedBookings,
+            dailyRows,
+            bookingsByCategoryAgg,
+            totals
         ] = await Promise.all([
             AnalyticsSession.countDocuments().maxTimeMS(5000),
             AnalyticsSession.countDocuments({ lastSeenAt: { $gte: activeCutoff } }).maxTimeMS(5000),
             User.countDocuments({ role: 'user' }).maxTimeMS(5000),
-            Booking.countDocuments().maxTimeMS(5000)
+            Booking.countDocuments().maxTimeMS(5000),
+            Booking.find({ status: 'confirmed' })
+                .select('tripDetails createdAt items')
+                .sort({ createdAt: -1 })
+                .limit(1000)
+                .lean()
+                .maxTimeMS(5000),
+            AnalyticsDaily.find({ day: { $in: dayKeys } })
+                .select('day visitors pageViews')
+                .lean()
+                .maxTimeMS(5000),
+            Activity.aggregate([
+                {
+                    $lookup: {
+                        from: 'bookings',
+                        localField: '_id',
+                        foreignField: 'items.activity',
+                        as: 'bookingRefs'
+                    }
+                },
+                {
+                    $project: {
+                        category: { $ifNull: ['$category', 'Other'] },
+                        bookingCount: { $size: '$bookingRefs' }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$category',
+                        count: { $sum: '$bookingCount' }
+                    }
+                },
+                { $sort: { count: -1 } },
+                { $limit: 6 }
+            ]).option({ maxTimeMS: 10000 }),
+            AnalyticsSession.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalSeconds: { $sum: '$totalSeconds' },
+                        totalPageViews: { $sum: '$pageViews' }
+                    }
+                }
+            ]).option({ maxTimeMS: 5000 })
         ]);
 
-        const confirmedBookings = await Booking.find({ status: 'confirmed' })
-            .select('tripDetails createdAt items')
-            .sort({ createdAt: -1 })
-            .limit(1000)
-            .lean()
-            .maxTimeMS(5000);
-            
         const revenueNumber = (confirmedBookings || []).reduce((sum, b) => sum + parseBudgetNumber(b.tripDetails?.budget), 0);
         const conversionRate = safePercent(totalBookings, totalTraffic);
 
@@ -213,9 +254,6 @@ exports.getAdminAnalytics = async (req, res) => {
             { label: 'Conversion Rate', value: `${conversionRate}%`, change: 'Bookings/Visitors', icon: 'Percent', color: 'bg-orange-500' },
         ];
 
-        const days = getLastNDays(7);
-        const dayKeys = days.map((d) => getDayKey(d));
-        const dailyRows = await AnalyticsDaily.find({ day: { $in: dayKeys } }).select('day visitors pageViews').lean().maxTimeMS(5000);
         const dailyMap = new Map((dailyRows || []).map((r) => [r.day, r]));
 
         const trafficLabels = days.map((d) => d.toLocaleDateString('en-US', { weekday: 'short' }));
@@ -242,31 +280,6 @@ exports.getAdminAnalytics = async (req, res) => {
             ]
         };
 
-        const bookingsByCategoryAgg = await Activity.aggregate([
-            {
-                $lookup: {
-                    from: 'bookings',
-                    localField: '_id',
-                    foreignField: 'items.activity',
-                    as: 'bookingRefs'
-                }
-            },
-            {
-                $project: {
-                    category: { $ifNull: ['$category', 'Other'] },
-                    bookingCount: { $size: '$bookingRefs' }
-                }
-            },
-            {
-                $group: {
-                    _id: '$category',
-                    count: { $sum: '$bookingCount' }
-                }
-            },
-            { $sort: { count: -1 } },
-            { $limit: 6 }
-        ]).option({ maxTimeMS: 10000 });
-
         const categoryLabels = (bookingsByCategoryAgg || []).map((r) => r._id || 'Other');
         const categoryCounts = (bookingsByCategoryAgg || []).map((r) => Number(r.count || 0));
         const colors = ['#2563eb', '#22c55e', '#f97316', '#facc15', '#a855f7', '#ef4444'];
@@ -280,16 +293,7 @@ exports.getAdminAnalytics = async (req, res) => {
             ]
         };
 
-        const sessionCount = await AnalyticsSession.countDocuments().maxTimeMS(5000);
-        const totals = await AnalyticsSession.aggregate([
-            {
-                $group: {
-                    _id: null,
-                    totalSeconds: { $sum: '$totalSeconds' },
-                    totalPageViews: { $sum: '$pageViews' }
-                }
-            }
-        ]).option({ maxTimeMS: 5000 });
+        const sessionCount = totalTraffic;
         
         const totalSeconds = Number(totals?.[0]?.totalSeconds || 0);
         const totalPageViews = Number(totals?.[0]?.totalPageViews || 0);
