@@ -285,9 +285,11 @@ exports.getUserItineraries = async (req, res) => {
         let itineraries;
         if (role === 'supplier') {
             itineraries = await Itinerary.find({ supplierId: userId }, projection)
+                .populate('supplierId', 'name avatar profileImage')
                 .sort({ createdAt: -1 }).limit(50).lean().maxTimeMS(8000);
         } else {
             itineraries = await Itinerary.find({ userId }, projection)
+                .populate('supplierId', 'name avatar profileImage')
                 .sort({ createdAt: -1 }).limit(50).lean().maxTimeMS(8000);
         }
 
