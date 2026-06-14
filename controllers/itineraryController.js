@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const OpenAI = require('openai');
+const bcrypt = require('bcryptjs');
 const Itinerary = require('../models/Itinerary');
 const Activity = require('../models/Activity');
 const Hotel = require('../models/Hotel');
@@ -311,9 +312,36 @@ exports.createItinerary = async (req, res) => {
         let userId = role === 'supplier' ? requestedUserId : authUserId;
 
         const bookingIdValEarly = req.body?.bookingId || req.body?.requestId;
-        if (!userId && bookingIdValEarly && mongoose.Types.ObjectId.isValid(bookingIdValEarly)) {
-            const booking = await Booking.findById(bookingIdValEarly).select('user').lean();
-            userId = booking?.user;
+        let bookingDoc = null;
+        if (bookingIdValEarly && mongoose.Types.ObjectId.isValid(bookingIdValEarly)) {
+            bookingDoc = await Booking.findById(bookingIdValEarly);
+            if (bookingDoc) {
+                userId = userId || bookingDoc.user;
+            }
+        }
+
+        // If traveler user is still not resolved, resolve by email or create a placeholder guest account
+        if (!userId && bookingDoc && bookingDoc.contactDetails?.email) {
+            const emailClean = String(bookingDoc.contactDetails.email).trim().toLowerCase();
+            let existingUser = await User.findOne({ email: new RegExp(`^${escapeRegExp(emailClean)}$`, 'i') });
+            if (existingUser) {
+                userId = existingUser._id;
+            } else {
+                const name = `${bookingDoc.contactDetails.firstName || ''} ${bookingDoc.contactDetails.lastName || ''}`.trim() || 'Guest Traveler';
+                const hashedPassword = await bcrypt.hash('KufiGuest123!', 10);
+                const newUser = new User({
+                    name,
+                    email: emailClean,
+                    password: hashedPassword,
+                    role: 'user',
+                    status: 'active',
+                    phone: bookingDoc.contactDetails.phone || '',
+                });
+                await newUser.save();
+                userId = newUser._id;
+            }
+            bookingDoc.user = userId;
+            await bookingDoc.save();
         }
 
         if (!userId) return res.status(400).json({ msg: 'Traveler user is required on this booking' });
