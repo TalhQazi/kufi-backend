@@ -420,9 +420,40 @@ async function fetchActivitiesForDestination(country, city) {
         .lean();
 }
 
+function trimTrailingEmptyDays(days) {
+    if (!Array.isArray(days) || days.length === 0) return days;
+
+    let lastNonEmptyIndex = -1;
+    for (let i = days.length - 1; i >= 0; i--) {
+        if (days[i].activities && days[i].activities.length > 0) {
+            lastNonEmptyIndex = i;
+            break;
+        }
+    }
+
+    let trimmed;
+    if (lastNonEmptyIndex !== -1) {
+        trimmed = days.slice(0, lastNonEmptyIndex + 1);
+    } else {
+        trimmed = days.slice(0, 1);
+    }
+
+    return trimmed.map((d, idx) => {
+        const item = d.toObject ? d.toObject() : d;
+        return {
+            ...item,
+            day: idx + 1,
+            isArrivalDay: idx === 0,
+            isDepartureDay: idx === trimmed.length - 1,
+            departureNote: (idx === trimmed.length - 1) ? (days[days.length - 1]?.departureNote || item.departureNote) : undefined,
+            arrivalNote: (idx === 0) ? (days[0]?.arrivalNote || item.arrivalNote) : undefined
+        };
+    });
+}
+
 async function saveGeneratedDays(itinerary, days, source) {
     applyBudgetToDocument(itinerary);
-    itinerary.days = days;
+    itinerary.days = trimTrailingEmptyDays(days);
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
