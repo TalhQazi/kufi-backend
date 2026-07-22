@@ -380,6 +380,12 @@ exports.updateGlobalSettings = async (req, res) => {
         if (commissionPercentage !== undefined) settings.commissionPercentage = commissionPercentage;
         if (stripePublicKey !== undefined) settings.stripePublicKey = stripePublicKey;
         if (req.body.googleAnalyticsId !== undefined) settings.googleAnalyticsId = req.body.googleAnalyticsId;
+        if (req.body.countdownMinutes !== undefined) {
+            const mins = Number(req.body.countdownMinutes);
+            if (Number.isFinite(mins) && mins > 0) {
+                settings.countdownMinutes = mins;
+            }
+        }
         
         settings.updatedAt = Date.now();
         await settings.save();

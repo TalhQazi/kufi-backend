@@ -2,6 +2,7 @@ const Booking = require('../models/Booking');
 const Activity = require('../models/Activity');
 const User = require('../models/User');
 const { sendEmail } = require('../utils/emailService');
+const { notifyPreset } = require('../utils/createNotification');
 const mongoose = require('mongoose');
 
 // Normalize country key
@@ -158,6 +159,24 @@ exports.createBooking = async (req, res) => {
 
         const newBooking = new Booking(normalized);
         const booking = await newBooking.save();
+
+        try {
+            const userId = booking.user;
+            if (userId) {
+                const destination = booking.tripDetails?.country || 'your destination';
+                await notifyPreset('request_received', {
+                    userId,
+                    bookingId: booking._id,
+                    destination,
+                    sendEmailNotify: Boolean(booking.contactDetails?.email),
+                    emailTo: booking.contactDetails?.email,
+                    message: `We received your trip request to ${destination}.`,
+                });
+            }
+        } catch (notifErr) {
+            console.error('Error creating booking notification:', notifErr?.message || notifErr);
+        }
+
         res.json(booking);
     } catch (err) {
         console.error(err);
@@ -177,6 +196,7 @@ exports.getUserBookings = async (req, res) => {
             .sort({ createdAt: -1 })
             .limit(100)
             .populate('items.activity')
+            .populate('supplier', 'name email businessName')
             .lean();
 
         res.json({ bookings });
@@ -235,6 +255,9 @@ exports.updateBookingStatus = async (req, res) => {
 
         const normalizedStatus = String(status || '').trim().toLowerCase();
 
+        const destination = booking.tripDetails?.country || booking.destination || 'your destination';
+        const userId = booking.user;
+
         if (normalizedStatus === 'confirmed') {
             booking.status = 'confirmed';
             await booking.save();
@@ -243,8 +266,16 @@ exports.updateBookingStatus = async (req, res) => {
             try {
                 const recipientEmail = booking.contactDetails?.email;
                 const travelerName = booking.contactDetails?.firstName || booking.contactDetails?.name || 'Traveler';
-                const destination = booking.tripDetails?.country || booking.destination || 'your destination';
-                if (recipientEmail) {
+                if (userId) {
+                    await notifyPreset('accepted', {
+                        userId,
+                        bookingId: booking._id,
+                        destination,
+                        sendEmailNotify: Boolean(recipientEmail),
+                        emailTo: recipientEmail,
+                        message: `Your trip request to ${destination} has been accepted. Your supplier is preparing your itinerary.`,
+                    });
+                } else if (recipientEmail) {
                     await sendEmail({
                         to: recipientEmail,
                         subject: 'Your Trip Request Has Been Accepted!',
@@ -263,15 +294,63 @@ exports.updateBookingStatus = async (req, res) => {
                     });
                 }
             } catch (emailErr) {
-                console.error('Error sending booking accepted email:', emailErr);
+                console.error('Error sending booking accepted notification:', emailErr);
             }
 
             return res.json(booking);
         }
 
-        if (normalizedStatus === 'cancelled') {
+        if (normalizedStatus === 'cancelled' || normalizedStatus === 'canceled') {
             booking.status = 'cancelled';
             await booking.save();
+            try {
+                if (userId) {
+                    await notifyPreset('cancelled', {
+                        userId,
+                        bookingId: booking._id,
+                        destination,
+                        message: `Your trip request to ${destination} has been cancelled.`,
+                    });
+                }
+            } catch (notifErr) {
+                console.error('Error creating cancelled notification:', notifErr?.message || notifErr);
+            }
+            return res.json(booking);
+        }
+
+        if (normalizedStatus === 'rejected') {
+            booking.status = 'cancelled';
+            await booking.save();
+            try {
+                if (userId) {
+                    await notifyPreset('rejected', {
+                        userId,
+                        bookingId: booking._id,
+                        destination,
+                        message: `Your trip request to ${destination} was rejected.`,
+                    });
+                }
+            } catch (notifErr) {
+                console.error('Error creating rejected notification:', notifErr?.message || notifErr);
+            }
+            return res.json(booking);
+        }
+
+        if (normalizedStatus === 'under_review' || normalizedStatus === 'under review' || normalizedStatus === 'pending review') {
+            booking.status = booking.status || 'pending';
+            await booking.save();
+            try {
+                if (userId) {
+                    await notifyPreset('under_review', {
+                        userId,
+                        bookingId: booking._id,
+                        destination,
+                        message: `Your trip request to ${destination} is under review.`,
+                    });
+                }
+            } catch (notifErr) {
+                console.error('Error creating under review notification:', notifErr?.message || notifErr);
+            }
             return res.json(booking);
         }
 
@@ -307,8 +386,30 @@ exports.updateBookingAdjustment = async (req, res) => {
 exports.updateBooking = async (req, res) => {
     try {
         const { id } = req.params;
+        const prev = await Booking.findById(id);
+        if (!prev) return res.status(404).json({ message: 'Booking not found' });
+
         const booking = await Booking.findByIdAndUpdate(id, { $set: req.body }, { new: true }).lean();
         if (!booking) return res.status(404).json({ message: 'Booking not found' });
+
+        try {
+            const nextStatus = String(req.body?.status || '').trim().toLowerCase();
+            const prevStatus = String(prev.status || '').trim().toLowerCase();
+            const userId = booking.user;
+            const destination = booking.tripDetails?.country || 'your destination';
+            if (userId && nextStatus && nextStatus !== prevStatus) {
+                if (nextStatus === 'confirmed') {
+                    await notifyPreset('accepted', { userId, bookingId: booking._id, destination });
+                } else if (nextStatus === 'cancelled' || nextStatus === 'canceled') {
+                    await notifyPreset('cancelled', { userId, bookingId: booking._id, destination });
+                } else if (nextStatus === 'rejected') {
+                    await notifyPreset('rejected', { userId, bookingId: booking._id, destination });
+                }
+            }
+        } catch (notifErr) {
+            console.error('Error notifying on booking update:', notifErr?.message || notifErr);
+        }
+
         res.json(booking);
     } catch (err) {
         console.error('Error updating booking:', err.message);

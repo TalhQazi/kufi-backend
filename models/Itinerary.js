@@ -91,7 +91,7 @@ const ItinerarySchema = new mongoose.Schema({
         lunchStart: { type: String, default: '13:00' },
         lunchEnd: { type: String, default: '14:00' },
         startOnArrival: { type: Boolean, default: false },
-        endOnDeparture: { type: Boolean, default: false },
+        endOnDeparture: { type: Boolean, default: true },
         perDayOverrides: [{
             date: String,
             startTime: String,
@@ -101,8 +101,19 @@ const ItinerarySchema = new mongoose.Schema({
         }],
         hotelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Hotel' },
         numberOfRooms: { type: Number, default: 1 },
-        budgetUplift: { type: Number, default: 15 }
+        budgetUplift: { type: Number, default: 15 },
+        customCosts: [{
+            id: String,
+            label: String,
+            amount: Number,
+            unit: { type: String, enum: ['flat', 'per_day'], default: 'flat' }
+        }]
     },
+    extraFields: [{
+        id: String,
+        label: String,
+        value: String
+    }],
     createdAt: {
         type: Date,
         default: Date.now

@@ -108,22 +108,71 @@ exports.createSupplierActivity = async (req, res) => {
 exports.getMyBookings = async (req, res) => {
     try {
         const supplierId = req.user.id;
-        const { status, limit } = req.query;
+        const {
+            status,
+            limit,
+            page = 1,
+            search = '',
+            sort = 'createdAt',
+            order = 'desc',
+            paymentStatus,
+            tab,
+        } = req.query;
 
-        let query = { supplier: supplierId };
+        let query = { supplier: new mongoose.Types.ObjectId(supplierId) };
         if (status) query.status = status;
 
-        const fetchLimit = limit ? parseInt(limit) : 50;
+        // Tab filters used by supplier requests UI
+        if (tab === 'new') {
+            query.status = 'pending';
+        } else if (tab === 'in_progress') {
+            query.status = { $in: ['confirmed', 'accepted'] };
+            query.paymentStatus = { $ne: 'paid' };
+        } else if (tab === 'upcoming') {
+            query.status = { $in: ['confirmed', 'accepted'] };
+            query.paymentStatus = 'paid';
+        }
 
-        // Don't pull `image` via populate — some activities store 5MB base64
-        // strings in that field which makes this endpoint take 30+ seconds.
-        // The supplier UI doesn't display activity thumbnails on bookings.
+        if (paymentStatus) {
+            query.paymentStatus = paymentStatus;
+        }
+
+        const searchTerm = String(search || '').trim();
+        if (searchTerm) {
+            const rx = new RegExp(searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+            query.$or = [
+                { 'contactDetails.firstName': rx },
+                { 'contactDetails.lastName': rx },
+                { 'contactDetails.email': rx },
+                { 'contactDetails.name': rx },
+                { 'tripDetails.destination': rx },
+                { 'tripDetails.country': rx },
+                { 'tripDetails.city': rx },
+                { destination: rx },
+                { location: rx },
+                { code: rx },
+            ];
+        }
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const hasPaging = req.query.page != null || req.query.tab != null || req.query.search;
+        const pageSize = hasPaging
+            ? Math.min(100, Math.max(1, parseInt(limit, 10) || 20))
+            : Math.min(200, Math.max(1, parseInt(limit, 10) || 100));
+        const sortField = ['createdAt', 'status', 'date'].includes(String(sort))
+            ? String(sort)
+            : 'createdAt';
+        const sortDir = String(order).toLowerCase() === 'asc' ? 1 : -1;
+
+        const total = await Booking.countDocuments(query).maxTimeMS(10000);
+
         let bookings = await Booking.find(query)
-            .select('user items.activity items.title items.travelers contactDetails tripDetails location destination date dateRange startDate guests travelers pax budget tripData amount totalAmount price status avatar image profileImage preferences adjustmentCard adjustmentRequestedAt code createdAt')
-            .sort({ createdAt: -1 })
+            .select('user items.activity items.title items.travelers contactDetails tripDetails location destination date dateRange startDate guests travelers pax budget tripData amount totalAmount price status paymentStatus avatar image profileImage preferences adjustmentCard adjustmentRequestedAt code createdAt updatedAt')
+            .sort({ [sortField]: sortDir })
+            .skip((pageNum - 1) * pageSize)
+            .limit(pageSize)
             .populate('user', 'name email avatar phone')
             .populate('items.activity', 'title')
-            .limit(fetchLimit)
             .lean()
             .maxTimeMS(10000);
 
@@ -145,7 +194,15 @@ exports.getMyBookings = async (req, res) => {
             }));
         }
 
-        res.json(bookings); // Note: frontend expects an array or {bookings: array} based on `rawBookings` parsing
+        res.json({
+            bookings,
+            pagination: {
+                page: pageNum,
+                limit: pageSize,
+                total,
+                totalPages: Math.max(1, Math.ceil(total / pageSize)),
+            },
+        });
     } catch (err) {
         console.error('Get My Bookings Error:', err.message);
         if (res.headersSent) return;

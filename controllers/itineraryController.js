@@ -8,10 +8,15 @@ const Booking = require('../models/Booking');
 const User = require('../models/User');
 const { parseBudget, applyBudgetToDocument } = require('../utils/parseBudget');
 const { sendEmail } = require('../utils/emailService');
+const { notifyPreset } = require('../utils/createNotification');
+const {
+    toDateString,
+    addDays,
+    daysBetween,
+    getDayName,
+} = require('../utils/calendarDate');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
-
-const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 function escapeRegExp(value) {
     return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -118,12 +123,8 @@ function enforceActivityBudget(days, maxActivityBudget) {
 
 function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined) {
     const cp = itinerary.controlPanel || {};
-    const startDate = itinerary.startDate
-        ? new Date(itinerary.startDate).toISOString().split('T')[0]
-        : null;
-    const endDate = itinerary.endDate
-        ? new Date(itinerary.endDate).toISOString().split('T')[0]
-        : null;
+    const startDate = toDateString(itinerary.startDate);
+    const endDate = toDateString(itinerary.endDate);
     const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
     
     // Respect the budget constraint
@@ -133,6 +134,10 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
         activityBudget !== undefined ? activityBudget : itinerary.budget
     );
 
+    // Departure day is active by default (not auto Free Day). Only skip when
+    // endOnDeparture is explicitly false. Arrival still respects startOnArrival.
+    const endOnDeparture = cp.endOnDeparture !== false;
+
     const days = [];
     const activeDayIndices = [];
     for (let idx = 0; idx < tripDays; idx++) {
@@ -140,12 +145,11 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
         const isArrival = idx === 0;
         const isDeparture = idx === tripDays - 1;
 
-        // Respect cp.startOnArrival / cp.endOnDeparture settings
         let isActive = true;
         if (isArrival && !cp.startOnArrival) {
             isActive = false;
         }
-        if (isDeparture && !cp.endOnDeparture) {
+        if (isDeparture && !endOnDeparture) {
             isActive = false;
         }
 
@@ -155,8 +159,8 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
             dayName: getDayName(newDate),
             isArrivalDay: isArrival,
             isDepartureDay: isDeparture,
-            arrivalNote: isArrival && !cp.startOnArrival ? 'Arrival Day — Free Day. Airport to Hotel transfer provided.' : undefined,
-            departureNote: isDeparture && !cp.endOnDeparture ? 'Departure Day — Free Day. Hotel to Airport transfer provided.' : undefined,
+            arrivalNote: isArrival && !cp.startOnArrival ? 'Arrival Day — Airport to Hotel transfer provided.' : (isArrival ? 'Arrival Day — Checked in and ready for activities.' : undefined),
+            departureNote: isDeparture ? 'Departure Day — Hotel to Airport transfer provided.' : undefined,
             activities: [],
         });
 
@@ -216,33 +220,13 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
     return days;
 }
 
-function getDayName(dateStr) {
-    if (!dateStr) return '';
-    const d = new Date(dateStr);
-    return isNaN(d.getTime()) ? '' : DAY_NAMES[d.getDay()];
-}
-
-function addDays(dateStr, n) {
-    const d = new Date(dateStr);
-    d.setDate(d.getDate() + n);
-    return d.toISOString().split('T')[0];
-}
-
-function daysBetween(start, end) {
-    const a = new Date(start);
-    const b = new Date(end);
-    const diff = Math.round((b - a) / (1000 * 60 * 60 * 24));
-    return Math.max(1, diff + 1);
-}
-
 // Shift template days to new itinerary's dates, keep activity structure intact
 function adaptDaysToItinerary(templateDays, itinerary) {
-    const startDate = itinerary.startDate
-        ? new Date(itinerary.startDate).toISOString().split('T')[0]
-        : null;
+    const startDate = toDateString(itinerary.startDate);
+    const endDate = toDateString(itinerary.endDate);
 
-    const tripLength = (itinerary.startDate && itinerary.endDate)
-        ? daysBetween(itinerary.startDate, itinerary.endDate)
+    const tripLength = (startDate && endDate)
+        ? daysBetween(startDate, endDate)
         : templateDays.length;
 
     // Trim or pad to match trip length
@@ -254,13 +238,17 @@ function adaptDaysToItinerary(templateDays, itinerary) {
 
     return days.map((d, idx) => {
         const newDate = startDate ? addDays(startDate, idx) : (d.date || '');
+        const isArrival = idx === 0;
+        const isDeparture = idx === days.length - 1;
         return {
             ...d,
             day: idx + 1,
             date: newDate,
             dayName: getDayName(newDate),
-            isArrivalDay: idx === 0,
-            isDepartureDay: idx === days.length - 1,
+            isArrivalDay: isArrival,
+            isDepartureDay: isDeparture,
+            departureNote: isDeparture ? (d.departureNote || 'Departure Day — Hotel to Airport transfer provided.') : undefined,
+            arrivalNote: isArrival ? (d.arrivalNote || 'Arrival Day — Checked in and ready for activities.') : undefined,
         };
     });
 }
@@ -297,6 +285,26 @@ exports.getUserItineraries = async (req, res) => {
         res.json(itineraries);
     } catch (err) {
         console.error('getUserItineraries error:', err?.message);
+        res.status(500).json({ msg: 'Server error', error: err?.message });
+    }
+};
+
+// ─── ADMIN list all itineraries ──────────────────────────────────────────────
+
+exports.getAllItinerariesAdmin = async (req, res) => {
+    try {
+        if (req.user?.role !== 'admin') {
+            return res.status(403).json({ msg: 'Admin only' });
+        }
+        const itineraries = await Itinerary.find({})
+            .select('title destination status days startDate endDate createdAt updatedAt supplierId userId bookingId')
+            .sort({ updatedAt: -1 })
+            .limit(100)
+            .lean()
+            .maxTimeMS(10000);
+        res.json(itineraries);
+    } catch (err) {
+        console.error('getAllItinerariesAdmin error:', err?.message);
         res.status(500).json({ msg: 'Server error', error: err?.message });
     }
 };
@@ -400,6 +408,21 @@ exports.createItinerary = async (req, res) => {
 
         await itinerary.save();
         await itinerary.populate('controlPanel.hotelId');
+
+        try {
+            if (itinerary.userId) {
+                await notifyPreset('under_review', {
+                    userId: itinerary.userId,
+                    bookingId: itinerary.bookingId,
+                    itineraryId: itinerary._id,
+                    destination: itinerary.destination,
+                    message: `Your trip to ${itinerary.destination || 'your destination'} is under review.`,
+                });
+            }
+        } catch (notifErr) {
+            console.error('Error creating under_review notification:', notifErr?.message || notifErr);
+        }
+
         res.status(201).json(itinerary);
     } catch (err) {
         console.error('createItinerary error:', err?.message);
@@ -448,40 +471,34 @@ async function fetchActivitiesForDestination(country, city) {
         .lean();
 }
 
-function trimTrailingEmptyDays(days) {
+/** Normalize day metadata without dropping empty departure/arrival days. */
+function normalizeTripDays(days) {
     if (!Array.isArray(days) || days.length === 0) return days;
 
-    let lastNonEmptyIndex = -1;
-    for (let i = days.length - 1; i >= 0; i--) {
-        if (days[i].activities && days[i].activities.length > 0) {
-            lastNonEmptyIndex = i;
-            break;
-        }
-    }
-
-    let trimmed;
-    if (lastNonEmptyIndex !== -1) {
-        trimmed = days.slice(0, lastNonEmptyIndex + 1);
-    } else {
-        trimmed = days.slice(0, 1);
-    }
-
-    return trimmed.map((d, idx) => {
+    return days.map((d, idx) => {
         const item = d.toObject ? d.toObject() : d;
+        const isArrival = idx === 0;
+        const isDeparture = idx === days.length - 1;
         return {
             ...item,
             day: idx + 1,
-            isArrivalDay: idx === 0,
-            isDepartureDay: idx === trimmed.length - 1,
-            departureNote: (idx === trimmed.length - 1) ? (days[days.length - 1]?.departureNote || item.departureNote) : undefined,
-            arrivalNote: (idx === 0) ? (days[0]?.arrivalNote || item.arrivalNote) : undefined
+            date: toDateString(item.date) || item.date || '',
+            dayName: item.dayName || getDayName(item.date),
+            isArrivalDay: isArrival,
+            isDepartureDay: isDeparture,
+            departureNote: isDeparture
+                ? (item.departureNote || 'Departure Day — Hotel to Airport transfer provided.')
+                : undefined,
+            arrivalNote: isArrival
+                ? (item.arrivalNote || 'Arrival Day — Checked in and ready for activities.')
+                : undefined,
         };
     });
 }
 
 async function saveGeneratedDays(itinerary, days, source) {
     applyBudgetToDocument(itinerary);
-    itinerary.days = trimTrailingEmptyDays(days);
+    itinerary.days = normalizeTripDays(days);
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
@@ -544,12 +561,8 @@ exports.generateItinerary = async (req, res) => {
         }
 
         const cp = itinerary.controlPanel || {};
-        const startDate = itinerary.startDate
-            ? new Date(itinerary.startDate).toISOString().split('T')[0]
-            : null;
-        const endDate = itinerary.endDate
-            ? new Date(itinerary.endDate).toISOString().split('T')[0]
-            : null;
+        const startDate = toDateString(itinerary.startDate);
+        const endDate = toDateString(itinerary.endDate);
         const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
 
         // Calculate available budget for activities by accounting for hotel and uplift
@@ -562,19 +575,26 @@ exports.generateItinerary = async (req, res) => {
             hotelCost = (hotel.pricePerNight || 0) * nights * rooms;
         }
 
+        const customCostsTotal = (Array.isArray(cp.customCosts) ? cp.customCosts : []).reduce((sum, cost) => {
+            const amount = Number(cost?.amount) || 0;
+            if (!amount) return sum;
+            if (cost?.unit === 'per_day') return sum + (amount * Math.max(1, tripDays || 1));
+            return sum + amount;
+        }, 0);
+
         let activityBudget = undefined;
         let activityBudgetStr = 'flexible';
         let budgetRulePrompt = '';
 
         if (itinerary.budget) {
-            let maxTotalActivitiesCost = (itinerary.budget / (1 + upliftPct)) - hotelCost;
+            let maxTotalActivitiesCost = (itinerary.budget / (1 + upliftPct)) - hotelCost - customCostsTotal;
             maxTotalActivitiesCost = Math.floor(maxTotalActivitiesCost);
             if (maxTotalActivitiesCost < 0) maxTotalActivitiesCost = 0; // AI must not schedule paid activities if budget is consumed
             
             activityBudget = maxTotalActivitiesCost;
             activityBudgetStr = maxTotalActivitiesCost;
 
-            budgetRulePrompt = `\nCRITICAL BUDGET RULE: You have EXACTLY $${activityBudgetStr} to spend on activities. The total sum of the prices of all scheduled activities in your response MUST NOT exceed $${activityBudgetStr}. You must select a subset of the available activities (or adjust activity selections) so that the sum of their 'price' fields is strictly less than or equal to $${activityBudgetStr}. Note: DO NOT worry about hotel prices or service fees, they are already accounted for. JUST keep the sum of activity prices under $${activityBudgetStr}.`;
+            budgetRulePrompt = `\nCRITICAL BUDGET RULE: You have EXACTLY $${activityBudgetStr} to spend on activities. The total sum of the prices of all scheduled activities in your response MUST NOT exceed $${activityBudgetStr}. You must select a subset of the available activities (or adjust activity selections) so that the sum of their 'price' fields is strictly less than or equal to $${activityBudgetStr}. Note: DO NOT worry about hotel prices, custom costs, or service fees, they are already accounted for. JUST keep the sum of activity prices under $${activityBudgetStr}.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -675,7 +695,7 @@ Scheduling rules:
 - Activity end time each day: ${cp.activityEndTime || '19:00'}
 - Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'} (no activities during lunch)
 - Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
-- Last day is departure day — ${cp.endOnDeparture ? 'you MUST schedule at least one activity today before check-out' : 'keep free (no activities), just hotel/airport transfer'}${overridesPrompt}
+- Last day is departure day — ${cp.endOnDeparture === false ? 'keep free (no activities), just hotel/airport transfer, but still include the day with departureNote' : 'you MAY schedule activities before check-out; always include departureNote. Do NOT omit the departure day even if it has few/no activities'}${overridesPrompt}
 - You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days, distributing them evenly.${budgetRulePrompt}
 - When creating generic/custom activities, assign accurate estimated prices so the budget can be calculated correctly.
 
@@ -824,53 +844,156 @@ exports.saveDays = async (req, res) => {
             return res.status(400).json({ msg: 'days must be an array' });
         }
 
-        const wasNotSentBefore = ['Pending', 'Pending Review'].includes(itinerary.status);
-
-        itinerary.days = req.body.days;
-        itinerary.updatedAt = new Date();
-
-        // Mark as ready for traveler on first save
-        if (wasNotSentBefore) {
-            itinerary.status = 'Supplier Replied Back';
+        // Draft save only — do not change status or email traveler
+        itinerary.days = normalizeTripDays(req.body.days);
+        if (Array.isArray(req.body.extraFields)) {
+            itinerary.extraFields = req.body.extraFields;
         }
-
+        itinerary.updatedAt = new Date();
         await itinerary.save();
         await itinerary.populate('controlPanel.hotelId');
-
-        // Send email to traveler only on the first save (status transition)
-        if (wasNotSentBefore) {
-            try {
-                const travelerUser = await User.findById(itinerary.userId).lean();
-                const recipientEmail = travelerUser?.email;
-                const travelerName = travelerUser?.name || 'Traveler';
-                const destination = itinerary.destination || itinerary.title || 'your destination';
-
-                if (recipientEmail) {
-                    await sendEmail({
-                        to: recipientEmail,
-                        subject: 'Your Itinerary Is Ready!',
-                        templateKey: 'itineraryReply',
-                        html: `
-                            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
-                                <h2 style="color: #a26e35;">Your itinerary is ready, ${travelerName}!</h2>
-                                <p>Your personalized itinerary for <strong>${destination}</strong> has been prepared by your supplier and is now available to view.</p>
-                                <p>Log in to your dashboard to review the full day-by-day plan and proceed with booking.</p>
-                                <div style="margin-top: 30px; text-align: center;">
-                                    <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">View My Itinerary</a>
-                                </div>
-                                <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for choosing Kufi Travel.</p>
-                            </div>
-                        `
-                    });
-                }
-            } catch (emailErr) {
-                console.error('Error sending itinerary ready email:', emailErr);
-            }
-        }
 
         res.json(itinerary);
     } catch (err) {
         console.error('saveDays error:', err?.message);
+        res.status(500).json({ msg: 'Server error', error: err?.message });
+    }
+};
+
+async function sendItineraryReadyEmail(itinerary) {
+    try {
+        const travelerUser = await User.findById(itinerary.userId).lean();
+        const recipientEmail = travelerUser?.email;
+        const travelerName = travelerUser?.name || 'Traveler';
+        const destination = itinerary.destination || itinerary.title || 'your destination';
+
+        if (!recipientEmail) return;
+
+        await sendEmail({
+            to: recipientEmail,
+            subject: 'Your Itinerary Is Ready!',
+            templateKey: 'itineraryReply',
+            html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;">
+                    <h2 style="color: #a26e35;">Your itinerary is ready, ${travelerName}!</h2>
+                    <p>Your personalized itinerary for <strong>${destination}</strong> has been prepared by your supplier and is now available to view.</p>
+                    <p>Log in to your dashboard to review the full day-by-day plan and proceed with booking.</p>
+                    <div style="margin-top: 30px; text-align: center;">
+                        <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">View My Itinerary</a>
+                    </div>
+                    <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for choosing Kufi Travel.</p>
+                </div>
+            `
+        });
+    } catch (emailErr) {
+        console.error('Error sending itinerary ready email:', emailErr);
+    }
+}
+
+// ─── SUBMIT itinerary to traveler ────────────────────────────────────────────
+
+exports.submitItinerary = async (req, res) => {
+    try {
+        const itinerary = await Itinerary.findById(req.params.id);
+        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+
+        if (Array.isArray(req.body.days)) {
+            itinerary.days = normalizeTripDays(req.body.days);
+        }
+        if (Array.isArray(req.body.extraFields)) {
+            itinerary.extraFields = req.body.extraFields;
+        }
+
+        const errors = [];
+        if (!toDateString(itinerary.startDate)) errors.push('Start date is required');
+        if (!toDateString(itinerary.endDate)) errors.push('End date is required');
+        if (!Array.isArray(itinerary.days) || itinerary.days.length === 0) {
+            errors.push('At least one itinerary day is required');
+        }
+        if (!itinerary.userId) errors.push('Traveler account is missing on this itinerary');
+
+        const emptyExtra = (itinerary.extraFields || []).find(
+            (f) => String(f.label || '').trim() && !String(f.value || '').trim()
+        );
+        if (emptyExtra) {
+            errors.push(`Extra field "${emptyExtra.label}" needs a value`);
+        }
+
+        if (errors.length) {
+            return res.status(400).json({ msg: 'Validation failed', errors });
+        }
+
+        const wasDraft = ['Pending', 'Pending Review'].includes(itinerary.status);
+        itinerary.status = 'Supplier Replied Back';
+        itinerary.updatedAt = new Date();
+        await itinerary.save();
+        await itinerary.populate('controlPanel.hotelId');
+
+        if (wasDraft || req.body.forceNotify) {
+            await sendItineraryReadyEmail(itinerary);
+        }
+
+        try {
+            if (itinerary.userId) {
+                const destination = itinerary.destination || itinerary.title || 'your destination';
+                if (wasDraft) {
+                    await notifyPreset('itinerary_generated', {
+                        userId: itinerary.userId,
+                        bookingId: itinerary.bookingId,
+                        itineraryId: itinerary._id,
+                        destination,
+                        message: `Your itinerary for ${destination} is ready to view.`,
+                    });
+                    await notifyPreset('approved', {
+                        userId: itinerary.userId,
+                        bookingId: itinerary.bookingId,
+                        itineraryId: itinerary._id,
+                        destination,
+                        message: `Your itinerary for ${destination} has been approved and is ready for review.`,
+                    });
+                } else {
+                    await notifyPreset('itinerary_updated', {
+                        userId: itinerary.userId,
+                        bookingId: itinerary.bookingId,
+                        itineraryId: itinerary._id,
+                        destination,
+                        message: `Your itinerary for ${destination} has been updated.`,
+                    });
+                }
+            }
+        } catch (notifErr) {
+            console.error('Error creating itinerary submit notification:', notifErr?.message || notifErr);
+        }
+
+        res.json(itinerary);
+    } catch (err) {
+        console.error('submitItinerary error:', err?.message);
+        res.status(500).json({ msg: 'Server error', error: err?.message });
+    }
+};
+
+// ─── CLEAR all activities from itinerary days (admin) ────────────────────────
+
+exports.clearActivities = async (req, res) => {
+    try {
+        if (req.user?.role !== 'admin') {
+            return res.status(403).json({ msg: 'Admin only' });
+        }
+        const itinerary = await Itinerary.findById(req.params.id);
+        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+
+        itinerary.days = normalizeTripDays(
+            (itinerary.days || []).map((d) => {
+                const item = d.toObject ? d.toObject() : d;
+                return { ...item, activities: [] };
+            })
+        );
+        itinerary.updatedAt = new Date();
+        await itinerary.save();
+        await itinerary.populate('controlPanel.hotelId');
+        res.json(itinerary);
+    } catch (err) {
+        console.error('clearActivities error:', err?.message);
         res.status(500).json({ msg: 'Server error', error: err?.message });
     }
 };

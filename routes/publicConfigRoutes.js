@@ -10,12 +10,14 @@ router.get('/', async (req, res) => {
         if (!settings) {
             return res.json({
                 stripePublicKey: '',
-                googleAnalyticsId: ''
+                googleAnalyticsId: '',
+                countdownMinutes: 30,
             });
         }
         res.json({
             stripePublicKey: settings.stripePublicKey,
-            googleAnalyticsId: settings.googleAnalyticsId
+            googleAnalyticsId: settings.googleAnalyticsId,
+            countdownMinutes: settings.countdownMinutes ?? 30,
         });
     } catch (err) {
         console.error('Error fetching public config:', err.message);

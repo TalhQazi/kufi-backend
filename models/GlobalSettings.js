@@ -13,6 +13,10 @@ const GlobalSettingsSchema = new mongoose.Schema({
         type: String,
         default: ''
     },
+    countdownMinutes: {
+        type: Number,
+        default: 30,
+    },
     updatedAt: {
         type: Date,
         default: Date.now

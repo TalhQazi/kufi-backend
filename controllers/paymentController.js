@@ -102,9 +102,14 @@ exports.getPublicSettings = async (req, res) => {
     try {
         let settings = await GlobalSettings.findOne();
         if (!settings) {
-            settings = { commissionPercentage: 10, stripePublicKey: '' };
+            settings = { commissionPercentage: 10, stripePublicKey: '', countdownMinutes: 30 };
         }
-        res.json(settings);
+        res.json({
+            commissionPercentage: settings.commissionPercentage ?? 10,
+            stripePublicKey: settings.stripePublicKey || '',
+            countdownMinutes: settings.countdownMinutes ?? 30,
+            googleAnalyticsId: settings.googleAnalyticsId || '',
+        });
     } catch (err) {
         console.error('Error fetching public settings:', err);
         res.status(500).json({ message: 'Server Error' });

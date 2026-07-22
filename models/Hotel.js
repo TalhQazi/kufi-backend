@@ -11,6 +11,7 @@ const HotelSchema = new mongoose.Schema({
     description: { type: String, default: '' },
     amenities: [{ type: String }],
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
+    sortOrder: { type: Number, default: 0 },
 }, { timestamps: true });
 
 HotelSchema.index({ country: 1, city: 1, status: 1 });

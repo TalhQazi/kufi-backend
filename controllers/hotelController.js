@@ -7,7 +7,7 @@ exports.getHotels = async (req, res) => {
         if (country) filter.country = new RegExp(`^${country.trim()}$`, 'i');
         if (city) filter.city = new RegExp(`^${city.trim()}$`, 'i');
 
-        const hotels = await Hotel.find(filter).sort({ rating: -1 }).lean();
+        const hotels = await Hotel.find(filter).sort({ sortOrder: 1, name: 1 }).lean();
         res.json(hotels);
     } catch (err) {
         res.status(500).json({ msg: 'Server error', error: err.message });
@@ -22,7 +22,7 @@ exports.getAllHotels = async (req, res) => {
         if (city) filter.city = new RegExp(city.trim(), 'i');
         if (status) filter.status = status;
 
-        const hotels = await Hotel.find(filter).sort({ createdAt: -1 }).lean();
+        const hotels = await Hotel.find(filter).sort({ sortOrder: 1, name: 1 }).lean();
         res.json(hotels);
     } catch (err) {
         res.status(500).json({ msg: 'Server error', error: err.message });
