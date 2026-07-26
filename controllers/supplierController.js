@@ -124,12 +124,12 @@ exports.getMyBookings = async (req, res) => {
 
         // Tab filters used by supplier requests UI
         if (tab === 'new') {
-            query.status = { $in: ['pending', 'confirmed', 'accepted'] };
+            query.status = 'pending';
         } else if (tab === 'in_progress') {
-            query.status = { $in: ['confirmed', 'accepted'] };
+            query.status = { $in: ['confirmed', 'accepted', 'Supplier Replied Back'] };
             query.paymentStatus = { $ne: 'paid' };
         } else if (tab === 'upcoming') {
-            query.status = { $in: ['confirmed', 'accepted'] };
+            query.status = { $in: ['confirmed', 'accepted', 'Supplier Replied Back'] };
             query.paymentStatus = 'paid';
         }
 
