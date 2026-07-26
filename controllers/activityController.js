@@ -74,9 +74,7 @@ exports.getActivities = async (req, res) => {
         // take 30+ seconds. The frontend list views render a placeholder
         // when image is null and load the full image only on the detail
         // endpoint (`GET /api/activities/:id`) when the user opens an item.
-        const selectFields = includeImages === 'true'
-            ? '-images -description -addOns -coordinates'
-            : '-image -images -description -addOns -coordinates';
+        const selectFields = '-images -description -addOns -coordinates';
 
         const activities = await Activity.find(filter)
             .select(selectFields)
@@ -94,12 +92,6 @@ exports.getActivities = async (req, res) => {
             const dateB = new Date(b.createdAt || 0).getTime();
             return dateB - dateA;
         });
-
-        if (includeImages !== 'true') {
-            for (const a of activities) {
-                a.image = null;
-            }
-        }
 
         res.json(activities);
     } catch (err) {
