@@ -117,7 +117,7 @@ const NOTIFICATION_PRESETS = {
     },
 };
 
-async function notifyPreset(presetKey, { userId, bookingId, itineraryId, message, destination, sendEmailNotify = false, emailTo } = {}) {
+async function notifyPreset(presetKey, { userId, bookingId, itineraryId, message, destination, sendEmailNotify = true, emailTo } = {}) {
     const preset = NOTIFICATION_PRESETS[presetKey];
     if (!preset || !userId) return null;
 
@@ -132,7 +132,7 @@ async function notifyPreset(presetKey, { userId, bookingId, itineraryId, message
         sendEmailNotify,
         emailTo,
         emailSubject: `${preset.title}${destSuffix}`,
-        emailHtml: `<p>${message || preset.message}${destSuffix ? ` — <strong>${destination}</strong>` : ''}</p>`,
+        emailHtml: `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e1e1e1; border-radius: 10px;"><h2 style="color: #a26e35;">${preset.title}</h2><p>${message || preset.message}${destSuffix ? ` — <strong>${destination}</strong>` : ''}</p><p style="margin-top: 20px; font-size: 12px; color: #777;">Thank you for choosing Kufi Travel.</p></div>`,
     });
 }
 
