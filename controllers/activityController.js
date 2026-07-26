@@ -81,9 +81,19 @@ exports.getActivities = async (req, res) => {
         const activities = await Activity.find(filter)
             .select(selectFields)
             .lean()
-            .sort({ order: 1, createdAt: -1 })
             .limit(100)
             .maxTimeMS(10000);
+
+        activities.sort((a, b) => {
+            const orderA = Number(a.order) || 0;
+            const orderB = Number(b.order) || 0;
+            if (orderA > 0 && orderB > 0) return orderA - orderB;
+            if (orderA > 0 && orderB === 0) return -1;
+            if (orderA === 0 && orderB > 0) return 1;
+            const dateA = new Date(a.createdAt || 0).getTime();
+            const dateB = new Date(b.createdAt || 0).getTime();
+            return dateB - dateA;
+        });
 
         if (includeImages !== 'true') {
             for (const a of activities) {
