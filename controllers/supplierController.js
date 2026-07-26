@@ -122,14 +122,37 @@ exports.getMyBookings = async (req, res) => {
         let query = { supplier: new mongoose.Types.ObjectId(supplierId) };
         if (status) query.status = status;
 
+        // Find itineraries that have been generated / submitted for this supplier's bookings
+        const generatedItineraries = await Itinerary.find({
+            bookingId: { $ne: null },
+            $or: [{ aiGenerated: true }, { status: 'Supplier Replied Back' }]
+        }).select('bookingId').lean().maxTimeMS(5000);
+
+        const generatedBookingIds = generatedItineraries
+            .map(i => i.bookingId)
+            .filter(Boolean)
+            .map(id => new mongoose.Types.ObjectId(id));
+
         // Tab filters used by supplier requests UI
         if (tab === 'new') {
+            // New requests: pending/confirmed/accepted requests where AI itinerary has NOT yet been submitted
             query.status = { $in: ['pending', 'confirmed', 'accepted'] };
+            if (generatedBookingIds.length > 0) {
+                query._id = { $nin: generatedBookingIds };
+            }
         } else if (tab === 'in_progress') {
-            query.status = { $in: ['confirmed', 'accepted', 'Supplier Replied Back'] };
+            // In Progress: generated/submitted itineraries not yet paid by customer
             query.paymentStatus = { $ne: 'paid' };
+            if (generatedBookingIds.length > 0) {
+                query.$or = [
+                    { status: 'Supplier Replied Back' },
+                    { _id: { $in: generatedBookingIds } }
+                ];
+            } else {
+                query.status = 'Supplier Replied Back';
+            }
         } else if (tab === 'upcoming') {
-            query.status = { $in: ['confirmed', 'accepted', 'Supplier Replied Back'] };
+            // Upcoming Trip / Bookings: customer HAS paid
             query.paymentStatus = 'paid';
         }
 
