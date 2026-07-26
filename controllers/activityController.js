@@ -32,6 +32,11 @@ const sanitizeActivityPayload = (body) => {
         }
     }
 
+    if (Object.prototype.hasOwnProperty.call(next, 'order')) {
+        const orderNum = Number(next.order);
+        next.order = Number.isFinite(orderNum) ? orderNum : 0;
+    }
+
     return next;
 };
 
@@ -76,7 +81,7 @@ exports.getActivities = async (req, res) => {
         const activities = await Activity.find(filter)
             .select(selectFields)
             .lean()
-            .sort({ createdAt: -1 })
+            .sort({ order: 1, createdAt: -1 })
             .limit(100)
             .maxTimeMS(10000);
 

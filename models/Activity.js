@@ -64,9 +64,14 @@ const ActivitySchema = new mongoose.Schema({
             type: Number,
             default: null
         }
+    },
+    order: {
+        type: Number,
+        default: 0
     }
 }, { timestamps: true });
 
+ActivitySchema.index({ order: 1, createdAt: -1 });
 ActivitySchema.index({ supplier: 1, status: 1 });
 ActivitySchema.index({ status: 1, country: 1, category: 1 });
 ActivitySchema.index({ location: 1, status: 1 });
