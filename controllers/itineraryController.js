@@ -811,20 +811,22 @@ ${day1Example},
 
 exports.saveControlPanel = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id);
-        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+        const existing = await Itinerary.findById(req.params.id);
+        if (!existing) return res.status(404).json({ msg: 'Itinerary not found' });
 
-        if (req.body.startDate !== undefined) {
-            itinerary.startDate = req.body.startDate;
-        }
-        if (req.body.endDate !== undefined) {
-            itinerary.endDate = req.body.endDate;
-        }
+        const { startDate, endDate, ...cpFields } = req.body || {};
+        const updateFields = {
+            updatedAt: new Date(),
+            controlPanel: { ...((existing.controlPanel || {})), ...cpFields }
+        };
+        if (startDate !== undefined) updateFields.startDate = startDate;
+        if (endDate !== undefined) updateFields.endDate = endDate;
 
-        itinerary.controlPanel = { ...((itinerary.controlPanel || {})), ...req.body };
-        itinerary.updatedAt = new Date();
-        await itinerary.save();
-        await itinerary.populate('controlPanel.hotelId');
+        const itinerary = await Itinerary.findByIdAndUpdate(
+            req.params.id,
+            { $set: updateFields },
+            { new: true }
+        ).populate('controlPanel.hotelId');
 
         res.json(itinerary);
     } catch (err) {
@@ -837,21 +839,25 @@ exports.saveControlPanel = async (req, res) => {
 
 exports.saveDays = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id);
-        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
-
         if (!Array.isArray(req.body.days)) {
             return res.status(400).json({ msg: 'days must be an array' });
         }
 
-        // Draft save only — do not change status or email traveler
-        itinerary.days = normalizeTripDays(req.body.days);
+        const updateFields = {
+            days: normalizeTripDays(req.body.days),
+            updatedAt: new Date()
+        };
         if (Array.isArray(req.body.extraFields)) {
-            itinerary.extraFields = req.body.extraFields;
+            updateFields.extraFields = req.body.extraFields;
         }
-        itinerary.updatedAt = new Date();
-        await itinerary.save();
-        await itinerary.populate('controlPanel.hotelId');
+
+        const itinerary = await Itinerary.findByIdAndUpdate(
+            req.params.id,
+            { $set: updateFields },
+            { new: true }
+        ).populate('controlPanel.hotelId');
+
+        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
 
         res.json(itinerary);
     } catch (err) {
