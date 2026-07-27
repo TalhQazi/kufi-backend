@@ -78,8 +78,9 @@ exports.getActivities = async (req, res) => {
 
         const activities = await Activity.find(filter)
             .select(selectFields)
+            .sort({ createdAt: -1 })
             .lean()
-            .limit(100)
+            .limit(1000)
             .maxTimeMS(10000);
 
         activities.sort((a, b) => {
@@ -88,8 +89,8 @@ exports.getActivities = async (req, res) => {
             if (orderA > 0 && orderB > 0) return orderA - orderB;
             if (orderA > 0 && orderB === 0) return -1;
             if (orderA === 0 && orderB > 0) return 1;
-            const dateA = new Date(a.createdAt || 0).getTime();
-            const dateB = new Date(b.createdAt || 0).getTime();
+            const dateA = new Date(a.createdAt || a._id?.getTimestamp?.() || 0).getTime();
+            const dateB = new Date(b.createdAt || b._id?.getTimestamp?.() || 0).getTime();
             return dateB - dateA;
         });
 
