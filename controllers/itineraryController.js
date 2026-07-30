@@ -134,8 +134,17 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
         activityBudget !== undefined ? activityBudget : itinerary.budget
     );
 
-    // Departure day is active by default (not auto Free Day). Only skip when
-    // endOnDeparture is explicitly false. Arrival still respects startOnArrival.
+    // Prioritize landmark/iconic activities (e.g. Pyramids, Sphinx)
+    const sortedActs = [...usableActs].sort((a, b) => {
+        const titleA = String(a.title || '').toLowerCase();
+        const titleB = String(b.title || '').toLowerCase();
+        const isLandmarkA = /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum/i.test(titleA);
+        const isLandmarkB = /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum/i.test(titleB);
+        if (isLandmarkA && !isLandmarkB) return -1;
+        if (!isLandmarkA && isLandmarkB) return 1;
+        return (Number(b.rating) || 0) - (Number(a.rating) || 0);
+    });
+
     const endOnDeparture = cp.endOnDeparture !== false;
 
     const days = [];
@@ -169,26 +178,38 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
         }
     }
 
-    // Fallback if no days are active
     if (activeDayIndices.length === 0) {
         for (let idx = 0; idx < tripDays; idx++) {
             activeDayIndices.push(idx);
         }
     }
 
-    let actsToUse = [];
-    if (isBookingSpecific) {
-        actsToUse = usableActs;
-    } else {
-        actsToUse = usableActs.slice(0, activeDayIndices.length * 2);
-    }
+    // Group activities geographically by location/city
+    const geoGroups = {};
+    sortedActs.forEach(act => {
+        const locKey = (act.city || act.location || itinerary.city || 'default').trim().toLowerCase();
+        if (!geoGroups[locKey]) geoGroups[locKey] = [];
+        geoGroups[locKey].push(act);
+    });
 
-    actsToUse.forEach((act, actIdx) => {
-        const targetDayIdx = activeDayIndices[actIdx % activeDayIndices.length];
-        const targetDate = days[targetDayIdx].date;
-        const existingCount = days[targetDayIdx].activities.length;
+    const groupedActsOrdered = Object.values(geoGroups).flat();
+    let actsToUse = isBookingSpecific ? groupedActsOrdered : groupedActsOrdered.slice(0, activeDayIndices.length * 3);
+
+    // Distribute grouped activities sequentially across days to maintain geographic clustering
+    let currentDayPointer = 0;
+    actsToUse.forEach((act) => {
+        const targetDayIdx = activeDayIndices[currentDayPointer % activeDayIndices.length];
+        const dayActs = days[targetDayIdx].activities;
+
+        // Advance to next day if current day reaches 3 activities to avoid overcrowding single days
+        if (dayActs.length >= 3 && activeDayIndices.length > 1 && currentDayPointer < activeDayIndices.length - 1) {
+            currentDayPointer++;
+        }
+
+        const effectiveDayIdx = activeDayIndices[currentDayPointer % activeDayIndices.length];
+        const targetDate = days[effectiveDayIdx].date;
+        const existingCount = days[effectiveDayIdx].activities.length;
         
-        // Find overrides or default values
         const dayOverride = (cp.perDayOverrides || []).find(o => o.date === targetDate) || {};
         
         const activityStartTime = dayOverride.startTime || cp.activityStartTime || '09:00';
@@ -204,10 +225,11 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
             lunchEnd
         );
 
-        days[targetDayIdx].activities.push({
+        days[effectiveDayIdx].activities.push({
             activityId: act._id ? String(act._id) : null,
             title: act.title || '',
             description: act.description || '',
+            location: act.location || act.city || itinerary.city || '',
             startTime,
             endTime,
             price: Number(act.price) || 0,
@@ -467,7 +489,7 @@ async function fetchActivitiesForDestination(country, city) {
     if (city) orClause.push({ location: new RegExp(escapeRegExp(city), 'i') });
     if (orClause.length) query.$or = orClause;
     return Activity.find(query)
-        .select('_id title description duration price category location')
+        .select('_id title description duration price category location country city image images rating reviews highlights')
         .lean();
 }
 
@@ -565,7 +587,7 @@ exports.generateItinerary = async (req, res) => {
         const endDate = toDateString(itinerary.endDate);
         const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
 
-        // Calculate available budget for activities by accounting for hotel and uplift
+        // Calculate available budget for activities using uplift as TOLERANCE (not surcharge reduction)
         let upliftRaw = cp.budgetUplift ?? 15;
         let upliftPct = Math.min(Math.max((upliftRaw > 0 && upliftRaw < 1) ? upliftRaw : (Number(upliftRaw) / 100), 0), 1);
         let hotelCost = 0;
@@ -587,14 +609,15 @@ exports.generateItinerary = async (req, res) => {
         let budgetRulePrompt = '';
 
         if (itinerary.budget) {
-            let maxTotalActivitiesCost = (itinerary.budget / (1 + upliftPct)) - hotelCost - customCostsTotal;
-            maxTotalActivitiesCost = Math.floor(maxTotalActivitiesCost);
-            if (maxTotalActivitiesCost < 0) maxTotalActivitiesCost = 0; // AI must not schedule paid activities if budget is consumed
+            // Uplift is budget tolerance: base budget $1,000 with 15% tolerance = $1,150 max total budget
+            const maxAllowedTotalBudget = Math.floor((Number(itinerary.budget) || 0) * (1 + upliftPct));
+            let maxTotalActivitiesCost = maxAllowedTotalBudget - hotelCost - customCostsTotal;
+            maxTotalActivitiesCost = Math.max(0, Math.floor(maxTotalActivitiesCost));
             
             activityBudget = maxTotalActivitiesCost;
-            activityBudgetStr = maxTotalActivitiesCost;
+            activityBudgetStr = String(maxTotalActivitiesCost);
 
-            budgetRulePrompt = `\nCRITICAL BUDGET RULE: You have EXACTLY $${activityBudgetStr} to spend on activities. The total sum of the prices of all scheduled activities in your response MUST NOT exceed $${activityBudgetStr}. You must select a subset of the available activities (or adjust activity selections) so that the sum of their 'price' fields is strictly less than or equal to $${activityBudgetStr}. Note: DO NOT worry about hotel prices, custom costs, or service fees, they are already accounted for. JUST keep the sum of activity prices under $${activityBudgetStr}.`;
+            budgetRulePrompt = `\nCRITICAL BUDGET TOLERANCE RULE: Customer budget is $${itinerary.budget}. With a ${Math.round(upliftPct * 100)}% budget tolerance allowance, the maximum allowed total trip budget ceiling is $${maxAllowedTotalBudget}. After accounting for hotel accommodation ($${hotelCost}) and custom costs ($${customCostsTotal}), the sum of prices of all scheduled activities MUST NOT exceed $${maxTotalActivitiesCost}. Select high-value, iconic activities strictly under $${maxTotalActivitiesCost}.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -646,18 +669,22 @@ exports.generateItinerary = async (req, res) => {
             });
         }
 
-        const systemPrompt = `You are a professional travel itinerary planner. Create a detailed day-by-day itinerary as valid JSON only. No markdown, no explanation — just raw JSON.`;
+        const systemPrompt = `You are an expert travel itinerary planner and geographic strategist. Create a realistic, highly engaging day-by-day travel itinerary strictly formatted as raw JSON array only. No markdown formatting outside json block, no conversational text.`;
 
         const requiredActivitiesPrompt = bookingActivities.length > 0
             ? `\nREQUIRED TRAVELER ACTIVITIES (You MUST schedule these activities into the days):
-${bookingActivities.map(a => `- id:${a._id || 'custom'} | "${a.title}" | price:$${a.price || 0} | category:${a.category || 'general'}`).join('\n')}
+${bookingActivities.map(a => `- id:${a._id || 'custom'} | "${a.title}" | price:$${a.price || 0} | location:${a.location || a.city || city || 'local'}`).join('\n')}
 Note: Make sure to assign the corresponding "activityId" to the activity objects in the JSON response.`
             : '';
 
         const overridesPrompt = Array.isArray(cp.perDayOverrides) && cp.perDayOverrides.length > 0
-            ? `\nSpecific day-by-day scheduling overrides (Use these instead of the default rules for these specific dates):
+            ? `\nSpecific day-by-day scheduling overrides (Use these instead of default rules for these specific dates):
 ${cp.perDayOverrides.map(o => `- Date: ${o.date} | Start: ${o.startTime || 'default'} | End: ${o.endTime || 'default'} | Lunch: ${o.lunchStart || 'default'} to ${o.lunchEnd || 'default'}`).join('\n')}`
             : '';
+
+        const startingPointAnchor = hotel
+            ? `Hotel: ${hotel.name} (${hotel.city || city || 'City Center'}, ${hotel.country || country || ''})`
+            : `Downtown / City Center of ${city || country || 'destination'}`;
 
         let day1Example = `  {
     "day": 1,
@@ -669,8 +696,8 @@ ${cp.perDayOverrides.map(o => `- Date: ${o.date} | Start: ${o.startTime || 'defa
     "activities": ${cp.startOnArrival ? `[
       {
         "activityId": "null",
-        "title": "Welcome Dinner",
-        "description": "Relaxing first evening dinner",
+        "title": "Welcome Dinner & Evening Walk",
+        "description": "Relaxing first evening dinner and orientation",
         "startTime": "19:00",
         "endTime": "21:00",
         "price": 30,
@@ -681,28 +708,30 @@ ${cp.perDayOverrides.map(o => `- Date: ${o.date} | Start: ${o.startTime || 'defa
     ]` : '[]'}
   }`;
 
-        const userPrompt = `Create a ${tripDays}-day travel itinerary for ${city || country}.
+        const userPrompt = `Create a complete ${tripDays}-day travel itinerary for ${city || country}.
 
 Trip details:
+- Destination: ${city || country}
 - Start date: ${startDate || 'not specified'}
 - End date: ${endDate || 'not specified'}
 - Travelers: ${itinerary.numberOfTravelers || 2}
-- Activity Budget Limit: $${activityBudgetStr} (DO NOT EXCEED)
-- Hotel: ${hotel ? hotel.name : 'not specified'}
+- Activity Budget Ceiling: $${activityBudgetStr} (DO NOT EXCEED)
+- STARTING POINT / ORIGIN (0,0 ANCHOR): ${startingPointAnchor}. The trip begins from this starting location.
 
-Scheduling rules:
-- Activity start time each day: ${cp.activityStartTime || '09:00'}
-- Activity end time each day: ${cp.activityEndTime || '19:00'}
-- Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'} (no activities during lunch)
-- Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
-- Last day is departure day — ${cp.endOnDeparture === false ? 'keep free (no activities), just hotel/airport transfer, but still include the day with departureNote' : 'you MAY schedule activities before check-out; always include departureNote. Do NOT omit the departure day even if it has few/no activities'}${overridesPrompt}
-- You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days, distributing them evenly.${budgetRulePrompt}
-- When creating generic/custom activities, assign accurate estimated prices so the budget can be calculated correctly.
+Mandatory Constraints:
+1. GEOGRAPHICAL CLUSTERING RULE: Activities scheduled on the same day MUST be located in the same city or local district. DO NOT mix activities from distant cities (e.g., Cairo and Luxor, or Dubai and Abu Dhabi) on the same day. Dedicate separate consecutive days to separate cities (e.g. Cairo Days 1-2, Luxor Days 3-4).
+2. MANDATORY ICONIC LANDMARKS RULE: You MUST unconditionally include famous landmark attractions of the destination (e.g. Pyramids of Giza, Great Sphinx, Egyptian Museum for Cairo/Egypt; Karnak Temple, Valley of the Kings for Luxor; Burj Khalifa for Dubai; etc.) in the itinerary.
+3. Activity start time each day: ${cp.activityStartTime || '09:00'}
+4. Activity end time each day: ${cp.activityEndTime || '19:00'}
+5. Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'} (no activities scheduled during lunch)
+6. Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
+7. Last day (Day ${tripDays}) is departure day — always include departureNote.${overridesPrompt}
+8. You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days.${budgetRulePrompt}
 
-Available activities (use activityId from this list when assigning):
+Available activities (prefer these pre-loaded activities and match activityId when assigning):
 ${activities.length > 0
-    ? activities.map(a => `- id:${a._id} | "${a.title}" | duration:${a.duration || '2 hours'} | price:$${a.price || 0} | category:${a.category || 'general'}`).join('\n')
-    : '(no pre-loaded activities — create generic appropriate activities for the destination)'
+    ? activities.map(a => `- id:${a._id} | "${a.title}" | location:${a.location || a.city || city || 'local'} | duration:${a.duration || '2 hours'} | price:$${a.price || 0} | category:${a.category || 'general'}`).join('\n')
+    : '(no pre-loaded activities — create realistic iconic activities with location and pricing for the destination)'
 }
 ${requiredActivitiesPrompt}
 
@@ -910,6 +939,11 @@ exports.submitItinerary = async (req, res) => {
             itinerary.extraFields = req.body.extraFields;
         }
 
+        // Clean out empty/blank extra fields automatically before validating
+        itinerary.extraFields = (itinerary.extraFields || []).filter(
+            (f) => String(f.label || '').trim() && String(f.value || '').trim()
+        );
+
         const errors = [];
         if (!toDateString(itinerary.startDate)) errors.push('Start date is required');
         if (!toDateString(itinerary.endDate)) errors.push('End date is required');
@@ -917,13 +951,6 @@ exports.submitItinerary = async (req, res) => {
             errors.push('At least one itinerary day is required');
         }
         if (!itinerary.userId) errors.push('Traveler account is missing on this itinerary');
-
-        const emptyExtra = (itinerary.extraFields || []).find(
-            (f) => String(f.label || '').trim() && !String(f.value || '').trim()
-        );
-        if (emptyExtra) {
-            errors.push(`Extra field "${emptyExtra.label}" needs a value`);
-        }
 
         if (errors.length) {
             return res.status(400).json({ msg: 'Validation failed', errors });
