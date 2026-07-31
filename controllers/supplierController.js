@@ -122,38 +122,67 @@ exports.getMyBookings = async (req, res) => {
         let query = { supplier: new mongoose.Types.ObjectId(supplierId) };
         if (status) query.status = status;
 
-        // Find itineraries that have been generated / submitted for this supplier's bookings
-        const generatedItineraries = await Itinerary.find({
+        // Itinerary lifecycle drives the request tabs.
+        //   Pending / Pending Review          -> still a supplier draft (stays in "New Requests")
+        //   Supplier Replied Back / Ready     -> sent to the traveler ("In Progress")
+        //   Accepted / Payment Completed /    -> traveler accepted ("Upcoming Trip" / Booking)
+        //   Completed
+        // NOTE: `aiGenerated` is deliberately NOT used here. Generating with AI is not an
+        // action the traveler ever sees, so it must never move a request between tabs.
+        const SENT_TO_TRAVELER_STATUSES = ['Supplier Replied Back', 'Ready'];
+        const TRAVELER_ACCEPTED_STATUSES = ['Accepted', 'Payment Completed', 'Completed'];
+
+        const trackedItineraries = await Itinerary.find({
             bookingId: { $ne: null },
-            $or: [{ aiGenerated: true }, { status: 'Supplier Replied Back' }]
-        }).select('bookingId').lean().maxTimeMS(5000);
+            status: { $in: [...SENT_TO_TRAVELER_STATUSES, ...TRAVELER_ACCEPTED_STATUSES] }
+        }).select('bookingId status').lean().maxTimeMS(5000);
 
-        const generatedBookingIds = generatedItineraries
-            .map(i => i.bookingId)
+        const toObjectIds = (list) => list
             .filter(Boolean)
-            .map(id => new mongoose.Types.ObjectId(id));
+            .filter((id) => mongoose.Types.ObjectId.isValid(id))
+            .map((id) => new mongoose.Types.ObjectId(id));
 
-        // Tab filters used by supplier requests UI
+        const sentBookingIds = toObjectIds(
+            trackedItineraries
+                .filter((i) => SENT_TO_TRAVELER_STATUSES.includes(i.status))
+                .map((i) => i.bookingId)
+        );
+        const acceptedBookingIds = toObjectIds(
+            trackedItineraries
+                .filter((i) => TRAVELER_ACCEPTED_STATUSES.includes(i.status))
+                .map((i) => i.bookingId)
+        );
+
+        // Tab conditions live in $and so a later `search` $or cannot overwrite them.
+        const tabConditions = [];
+
         if (tab === 'new') {
-            // New requests: pending/confirmed/accepted requests where AI itinerary has NOT yet been submitted
+            // New requests: not yet sent to the traveler and not yet paid.
             query.status = { $in: ['pending', 'confirmed', 'accepted'] };
-            if (generatedBookingIds.length > 0) {
-                query._id = { $nin: generatedBookingIds };
+            tabConditions.push({ paymentStatus: { $ne: 'paid' } });
+            const excluded = [...sentBookingIds, ...acceptedBookingIds];
+            if (excluded.length > 0) {
+                tabConditions.push({ _id: { $nin: excluded } });
             }
         } else if (tab === 'in_progress') {
-            // In Progress: generated/submitted itineraries not yet paid by customer
-            query.paymentStatus = { $ne: 'paid' };
-            if (generatedBookingIds.length > 0) {
-                query.$or = [
-                    { status: 'Supplier Replied Back' },
-                    { _id: { $in: generatedBookingIds } }
-                ];
-            } else {
-                query.status = 'Supplier Replied Back';
+            // In Progress: itinerary sent to the traveler, awaiting their acceptance/payment.
+            tabConditions.push({ paymentStatus: { $ne: 'paid' } });
+            tabConditions.push({ _id: { $in: sentBookingIds } });
+            if (acceptedBookingIds.length > 0) {
+                tabConditions.push({ _id: { $nin: acceptedBookingIds } });
             }
         } else if (tab === 'upcoming') {
-            // Upcoming Trip / Bookings: customer HAS paid
-            query.paymentStatus = 'paid';
+            // Upcoming Trip / Booking: traveler accepted the itinerary (or already paid).
+            tabConditions.push({
+                $or: [
+                    { paymentStatus: 'paid' },
+                    ...(acceptedBookingIds.length > 0 ? [{ _id: { $in: acceptedBookingIds } }] : []),
+                ],
+            });
+        }
+
+        if (tabConditions.length > 0) {
+            query.$and = [...(query.$and || []), ...tabConditions];
         }
 
         if (paymentStatus) {

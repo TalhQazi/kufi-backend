@@ -518,21 +518,32 @@ function normalizeTripDays(days) {
     });
 }
 
-async function saveGeneratedDays(itinerary, days, source) {
+/**
+ * Apply generated days to the itinerary document.
+ *
+ * By default the result is NOT written to the database: the supplier must stay in
+ * control of when a generated itinerary becomes a draft ("Save to Draft") or is sent
+ * to the traveler ("Send to Traveler"). Persisting here is what used to turn every AI
+ * run into an immediate draft and silently move the request between supplier tabs.
+ * Pass { persist: true } to opt back into the old write-through behaviour.
+ */
+async function saveGeneratedDays(itinerary, days, source, { persist = false } = {}) {
     applyBudgetToDocument(itinerary);
     itinerary.days = normalizeTripDays(days);
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
     itinerary.updatedAt = new Date();
-    await itinerary.save();
+    if (persist) {
+        await itinerary.save();
+    }
     await itinerary.populate('controlPanel.hotelId');
-    return resPayload(itinerary, source);
+    return resPayload(itinerary, source, persist);
 }
 
-function resPayload(itinerary, source) {
+function resPayload(itinerary, source, persisted = false) {
     const doc = itinerary.toObject ? itinerary.toObject() : itinerary;
-    return { itinerary: doc, source };
+    return { itinerary: doc, source, persisted };
 }
 
 // ─── GENERATE itinerary with AI ──────────────────────────────────────────────
@@ -621,6 +632,9 @@ exports.generateItinerary = async (req, res) => {
         }
 
         const mode = req.body.mode || 'ai';
+        // Generation is a preview by default — the supplier decides whether it becomes a
+        // draft ("Save to Draft") or is sent to the traveler ("Send to Traveler").
+        const persist = req.body?.persist === true;
 
         if (mode === 'template') {
             const existingQuery = {
@@ -639,8 +653,7 @@ exports.generateItinerary = async (req, res) => {
 
             if (existing && Array.isArray(existing.days) && existing.days.length > 0) {
                 const adaptedDays = adaptDaysToItinerary(existing.days, itinerary);
-                await saveGeneratedDays(itinerary, adaptedDays, 'database');
-                return res.json(resPayload(itinerary, 'database'));
+                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist }));
             } else {
                 const templateDays = buildDefaultDays(
                     itinerary,
@@ -648,8 +661,7 @@ exports.generateItinerary = async (req, res) => {
                     bookingActivities.length > 0,
                     activityBudget
                 );
-                await saveGeneratedDays(itinerary, templateDays, 'template');
-                return res.json(resPayload(itinerary, 'template'));
+                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist }));
             }
         }
 
@@ -662,9 +674,8 @@ exports.generateItinerary = async (req, res) => {
                 bookingActivities.length > 0,
                 activityBudget
             );
-            await saveGeneratedDays(itinerary, templateDays, 'template');
             return res.json({
-                ...resPayload(itinerary, 'template'),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist })),
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
@@ -783,9 +794,8 @@ ${day1Example},
                 bookingActivities.length > 0,
                 activityBudget
             );
-            await saveGeneratedDays(itinerary, templateDays, 'template');
             return res.json({
-                ...resPayload(itinerary, 'template'),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist })),
                 warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
             });
         }
@@ -828,8 +838,7 @@ ${day1Example},
         }));
 
         const finalDays = enforceActivityBudget(enrichedDays, activityBudget);
-        await saveGeneratedDays(itinerary, finalDays, 'ai');
-        return res.json(resPayload(itinerary, 'ai'));
+        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist }));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });
@@ -864,6 +873,46 @@ exports.saveControlPanel = async (req, res) => {
     }
 };
 
+/**
+ * Build the `$set` fragment for the trip-level fields the itinerary builder owns
+ * (dates, control panel, AI provenance). Every field is optional so existing
+ * callers that only send `days` keep working exactly as before.
+ */
+function buildBuilderStateUpdate(body, existingControlPanel) {
+    const update = {};
+
+    if (body.startDate !== undefined) update.startDate = body.startDate || null;
+    if (body.endDate !== undefined) update.endDate = body.endDate || null;
+
+    if (body.controlPanel && typeof body.controlPanel === 'object') {
+        const { startDate, endDate, ...cpFields } = body.controlPanel;
+        if (Object.prototype.hasOwnProperty.call(cpFields, 'hotelId')) {
+            cpFields.hotelId = cpFields.hotelId && mongoose.Types.ObjectId.isValid(cpFields.hotelId)
+                ? cpFields.hotelId
+                : null;
+        }
+        const base = existingControlPanel
+            ? (existingControlPanel.toObject ? existingControlPanel.toObject() : existingControlPanel)
+            : {};
+        update.controlPanel = { ...base, ...cpFields };
+
+        // The control panel is the source of truth for trip dates when the caller
+        // did not send them at the top level.
+        if (update.startDate === undefined && startDate !== undefined) update.startDate = startDate || null;
+        if (update.endDate === undefined && endDate !== undefined) update.endDate = endDate || null;
+    }
+
+    if (body.aiGenerated === true) {
+        update.aiGenerated = true;
+        if (!update.aiGeneratedAt) update.aiGeneratedAt = new Date();
+    }
+    if (body.generationSource === 'ai' || body.generationSource === 'template') {
+        update.generationSource = body.generationSource;
+    }
+
+    return update;
+}
+
 // ─── SAVE days (manual edits after AI generation) ────────────────────────────
 
 exports.saveDays = async (req, res) => {
@@ -872,9 +921,13 @@ exports.saveDays = async (req, res) => {
             return res.status(400).json({ msg: 'days must be an array' });
         }
 
+        const existing = await Itinerary.findById(req.params.id).select('controlPanel').lean();
+        if (!existing) return res.status(404).json({ msg: 'Itinerary not found' });
+
         const updateFields = {
             days: normalizeTripDays(req.body.days),
-            updatedAt: new Date()
+            updatedAt: new Date(),
+            ...buildBuilderStateUpdate(req.body, existing.controlPanel)
         };
         if (Array.isArray(req.body.extraFields)) {
             updateFields.extraFields = req.body.extraFields;
@@ -938,6 +991,13 @@ exports.submitItinerary = async (req, res) => {
         if (Array.isArray(req.body.extraFields)) {
             itinerary.extraFields = req.body.extraFields;
         }
+
+        // Persist the builder state (dates / control panel / AI provenance) that the
+        // supplier had on screen, so "Send to Traveler" never loses unsaved edits.
+        const builderState = buildBuilderStateUpdate(req.body, itinerary.controlPanel);
+        Object.entries(builderState).forEach(([key, value]) => {
+            itinerary[key] = value;
+        });
 
         // Clean out empty/blank extra fields automatically before validating
         itinerary.extraFields = (itinerary.extraFields || []).filter(
