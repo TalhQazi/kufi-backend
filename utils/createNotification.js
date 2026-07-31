@@ -1,6 +1,7 @@
 const Notification = require('../models/Notification');
 const User = require('../models/User');
 const { sendEmail } = require('./emailService');
+const { sendPushNotification } = require('./pushService');
 
 /**
  * Create an in-app notification and optionally email the user.
@@ -46,6 +47,23 @@ async function createNotification({
             read: false,
             createdAt: new Date(),
         });
+
+        // Push mirrors every in-app notification. No-ops when push is not configured or
+        // the user has no registered device token; never blocks notification creation.
+        try {
+            await sendPushNotification({
+                userId,
+                title,
+                body: message || title,
+                data: {
+                    type,
+                    bookingId: bookingId ? String(bookingId) : null,
+                    itineraryId: itineraryId ? String(itineraryId) : null,
+                },
+            });
+        } catch (pushErr) {
+            console.error('createNotification push error:', pushErr?.message || pushErr);
+        }
 
         if (sendEmailNotify) {
             try {
