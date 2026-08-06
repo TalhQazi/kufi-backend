@@ -42,6 +42,10 @@ exports.createCheckoutSession = async (req, res) => {
         booking.netAmount = netAmount;
         await booking.save();
 
+        // Determine frontend base URL
+        const frontendUrl = process.env.FRONTEND_URL 
+            || (req.get('origin') ? req.get('origin').replace(/\/$/, '') : (req.headers.referer ? req.headers.referer.replace(/\/$/, '') : 'http://localhost:5173'));
+
         // Create Stripe checkout session
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
@@ -59,8 +63,8 @@ exports.createCheckoutSession = async (req, res) => {
                 },
             ],
             mode: 'payment',
-            success_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/#/payment-success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id}`,
-            cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/#/payment-failed`,
+            success_url: `${frontendUrl}/#/payment-success?session_id={CHECKOUT_SESSION_ID}&booking_id=${booking._id}`,
+            cancel_url: `${frontendUrl}/#/payment-failed`,
             metadata: {
                 bookingId: String(booking._id),
             },

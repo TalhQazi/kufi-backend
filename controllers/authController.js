@@ -5,6 +5,17 @@ const axios = require('axios');
 const crypto = require('crypto');
 const { sendEmail } = require('../utils/emailService');
 
+const getFrontendUrl = (req) => {
+    if (process.env.FRONTEND_URL) {
+        return process.env.FRONTEND_URL.replace(/\/$/, '');
+    }
+    const origin = req?.get ? req.get('origin') : (req?.headers?.origin || req?.headers?.referer);
+    if (origin) {
+        return String(origin).replace(/\/$/, '');
+    }
+    return 'http://localhost:5173';
+};
+
 const formatAuthUser = (user) => {
     const u = user?.toObject ? user.toObject() : user;
     return {
@@ -22,10 +33,14 @@ const formatAuthUser = (user) => {
 // Register User
 exports.registerUser = async (req, res) => {
     let { name, email, password, role, phone, country, city, status } = req.body;
-    email = String(email || '').trim().toLowerCase();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    email = cleanEmail;
 
     try {
-        let user = await User.findOne({ email });
+        const safeRegex = new RegExp('^' + cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '$', 'i');
+        let user = await User.findOne({
+            $or: [{ email: cleanEmail }, { email: safeRegex }]
+        });
         if (user) {
             return res.status(400).json({ msg: 'User already exists' });
         }
@@ -72,7 +87,7 @@ exports.registerUser = async (req, res) => {
                         <h2 style="color: #a26e35;">Hello ${user.name}!</h2>
                         <p>${message}</p>
                         <div style="margin-top: 30px; text-align: center;">
-                            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Login to Kufi</a>
+                            <a href="${getFrontendUrl(req)}/login" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Login to Kufi</a>
                         </div>
                         <p style="margin-top: 30px; font-size: 12px; color: #777;">Thank you for joining us.</p>
                     </div>
@@ -101,9 +116,12 @@ exports.loginUser = async (req, res) => {
             return res.status(400).json({ msg: 'Please provide email and password' });
         }
 
-        email = String(email).trim().toLowerCase();
+        const cleanEmail = String(email || '').trim().toLowerCase();
+        const safeRegex = new RegExp('^' + cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '$', 'i');
 
-        const user = await User.findOne({ email }).lean();
+        const user = await User.findOne({
+            $or: [{ email: cleanEmail }, { email: safeRegex }]
+        }).lean();
         if (!user) {
             return res.status(400).json({ msg: 'Invalid Credentials' });
         }
@@ -141,6 +159,9 @@ exports.loginUser = async (req, res) => {
 exports.getProfile = async (req, res) => {
     try {
         const user = await User.findById(req.user.id).select('-password');
+        if (!user) {
+            return res.status(404).json({ msg: 'User not found' });
+        }
         res.json(user);
     } catch (err) {
         console.error(err.message);
@@ -150,12 +171,6 @@ exports.getProfile = async (req, res) => {
 
 // Update User Profile
 exports.updateProfile = async (req, res) => {
-    const { fullName, phone, country, dob, gender, streetNumber, address, city, state, zipCode, nationality, avatar, businessName, businessAddress, businessLicense } = req.body;
-
-    // Build profile object
-    const profileFields = {};
-    if (fullName) profileFields.fullName = fullName;
-    if (phone) profileFields.phone = phone;
     if (country) profileFields.country = country;
     if (dob) profileFields.dob = dob;
     if (gender) profileFields.gender = gender;
@@ -340,7 +355,16 @@ exports.forgotPassword = async (req, res) => {
     const { email } = req.body;
 
     try {
-        const user = await User.findOne({ email });
+        const cleanEmail = String(email || '').trim().toLowerCase();
+        if (!cleanEmail) {
+            return res.status(400).json({ msg: 'Please provide an email address' });
+        }
+
+        const safeRegex = new RegExp('^' + cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '$', 'i');
+        const user = await User.findOne({
+            $or: [{ email: cleanEmail }, { email: safeRegex }]
+        });
+
         if (!user) {
             return res.status(404).json({ msg: 'No user found with that email' });
         }
@@ -353,10 +377,11 @@ exports.forgotPassword = async (req, res) => {
         await user.save();
 
         // Send Email
-        const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/#reset-password/${resetToken}`;
+        const baseUrl = getFrontendUrl(req);
+        const resetUrl = `${baseUrl}/#reset-password/${resetToken}`;
         
         try {
-            await sendEmail({
+            const emailResult = await sendEmail({
                 to: user.email,
                 subject: 'Password Reset Request',
                 templateKey: 'passwordReset',
@@ -372,6 +397,14 @@ exports.forgotPassword = async (req, res) => {
                     </div>
                 `
             });
+
+            if (emailResult === null) {
+                user.resetPasswordToken = undefined;
+                user.resetPasswordExpires = undefined;
+                await user.save();
+                return res.status(500).json({ msg: 'Email service is not configured. Please contact administrator.' });
+            }
+
             res.json({ msg: 'Email sent' });
         } catch (emailErr) {
             user.resetPasswordToken = undefined;

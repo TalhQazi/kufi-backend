@@ -24,20 +24,28 @@ const sendEmail = async ({ to, subject, html, templateKey }) => {
             return null;
         }
 
-        // Verify we have host and user
-        if (!settings.smtpHost || !settings.smtpUser) {
+        // Verify we have host and user (check DB settings first, then env variables)
+        const smtpHost = settings.smtpHost || process.env.SMTP_HOST;
+        const smtpUser = settings.smtpUser || process.env.SMTP_USER;
+        const smtpPass = settings.smtpPass || process.env.SMTP_PASS;
+        const smtpPort = settings.smtpPort || process.env.SMTP_PORT || 587;
+        const encryption = settings.encryption || process.env.SMTP_ENCRYPTION || 'tls';
+        const fromName = settings.fromName || process.env.SMTP_FROM_NAME || 'Kufi Travel';
+        const fromEmail = settings.fromEmail || process.env.SMTP_FROM || smtpUser;
+
+        if (!smtpHost || !smtpUser) {
             console.warn('SMTP settings are incomplete. Cannot send email.');
             return null;
         }
 
         // Create transporter
         const transporter = nodemailer.createTransport({
-            host: settings.smtpHost,
-            port: settings.smtpPort,
-            secure: settings.encryption === 'ssl', // true for 465, false for other ports
+            host: smtpHost,
+            port: Number(smtpPort),
+            secure: encryption === 'ssl' || String(smtpPort) === '465', // true for 465, false for other ports
             auth: {
-                user: settings.smtpUser,
-                pass: settings.smtpPass,
+                user: smtpUser,
+                pass: smtpPass,
             },
             tls: {
                 // Do not fail on invalid certs
@@ -47,7 +55,7 @@ const sendEmail = async ({ to, subject, html, templateKey }) => {
 
         // Send mail
         const info = await transporter.sendMail({
-            from: `"${settings.fromName}" <${settings.fromEmail || settings.smtpUser}>`,
+            from: `"${fromName}" <${fromEmail}>`,
             to,
             subject,
             html,

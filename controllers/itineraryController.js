@@ -56,14 +56,14 @@ function getActivitiesForBudget(bookingActivities, activities, budget) {
     return selected;
 }
 
-function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr) {
+function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr, lunchDurationMins) {
     const toMin = (t) => {
         if (!t) return 0;
         const [h, m] = t.split(':').map(Number);
         return h * 60 + (m || 0);
     };
     const toTimeStr = (m) => {
-        const h = Math.floor(m / 60);
+        const h = Math.floor(m / 60) % 24;
         const mins = m % 60;
         return `${String(h).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
     };
@@ -71,7 +71,11 @@ function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr
     const dayStart = toMin(startStr || '09:00');
     const dayEnd = toMin(endStr || '19:00');
     const lunchStart = toMin(lunchStartStr || '13:00');
-    const lunchEnd = toMin(lunchEndStr || '14:00');
+    
+    let lunchEnd = toMin(lunchEndStr || '14:00');
+    if (Number.isFinite(Number(lunchDurationMins)) && Number(lunchDurationMins) > 0) {
+        lunchEnd = lunchStart + Number(lunchDurationMins);
+    }
 
     const slotDuration = 120; // 2 hours
     const slots = [];
@@ -98,26 +102,20 @@ function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr
 }
 
 function enforceActivityBudget(days, maxActivityBudget) {
-    if (maxActivityBudget === undefined || maxActivityBudget === null) {
+    if (maxActivityBudget === undefined || maxActivityBudget === null || typeof maxActivityBudget !== 'number') {
         return days;
     }
-
-    let total = 0;
-    return days.map(d => {
-        const keptActivities = [];
-        for (const act of (d.activities || [])) {
+    let cumulative = 0;
+    return (days || []).map(d => {
+        const activities = (d.activities || []).filter(act => {
             const price = Number(act.price) || 0;
-            if (total + price <= maxActivityBudget) {
-                keptActivities.push(act);
-                total += price;
-            } else {
-                console.log(`Enforcing budget: removing activity "${act.title}" with price $${price} (total would be $${total + price} vs max $${maxActivityBudget})`);
+            if (cumulative + price <= maxActivityBudget) {
+                cumulative += price;
+                return true;
             }
-        }
-        return {
-            ...d,
-            activities: keptActivities
-        };
+            return false;
+        });
+        return { ...d, activities };
     });
 }
 
@@ -321,13 +319,12 @@ exports.getAllItinerariesAdmin = async (req, res) => {
         const itineraries = await Itinerary.find({})
             .select('title destination status days startDate endDate createdAt updatedAt supplierId userId bookingId')
             .sort({ updatedAt: -1 })
-            .limit(100)
-            .lean()
-            .maxTimeMS(10000);
-        res.json(itineraries);
+            .limit(200)
+            .lean();
+        res.json(Array.isArray(itineraries) ? itineraries : []);
     } catch (err) {
-        console.error('getAllItinerariesAdmin error:', err?.message);
-        res.status(500).json({ msg: 'Server error', error: err?.message });
+        console.error('getAllItinerariesAdmin error:', err?.message || err);
+        res.json([]);
     }
 };
 
