@@ -3,23 +3,72 @@ const Activity = require('../models/Activity');
 const Booking = require('../models/Booking');
 const Itinerary = require('../models/Itinerary');
 
+const { clearCache } = require('../utils/cache');
+
 const normalizeStringArray = (value) => {
     if (!Array.isArray(value)) return [];
     return value.map((v) => String(v || '').trim()).filter(Boolean);
 };
 
+/**
+ * Fields a supplier may set on their own experience.
+ *
+ * An allowlist rather than a blocklist: `supplier`, `status`, `rating` and `reviews` are
+ * owned by the platform, so spreading a raw request body would let a supplier attach an
+ * experience to a competitor, self-approve it, or fake a 5-star rating.
+ */
+const SUPPLIER_EDITABLE_FIELDS = [
+    'title', 'description', 'highlights', 'location', 'country', 'city',
+    'price', 'duration', 'image', 'images', 'category', 'addOns', 'coordinates',
+];
+
 const sanitizeActivityPayload = (body) => {
-    const next = { ...(body || {}) };
+    const source = body || {};
+    const next = {};
+
+    for (const field of SUPPLIER_EDITABLE_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(source, field)) {
+            next[field] = source[field];
+        }
+    }
 
     if (Object.prototype.hasOwnProperty.call(next, 'highlights')) {
         next.highlights = normalizeStringArray(next.highlights);
     }
-
     if (Object.prototype.hasOwnProperty.call(next, 'addOns') && Array.isArray(next.addOns)) {
         next.addOns = normalizeStringArray(next.addOns);
     }
+    if (Object.prototype.hasOwnProperty.call(next, 'images')) {
+        next.images = normalizeStringArray(next.images);
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'coordinates')) {
+        const coords = next.coordinates;
+        next.coordinates = coords && typeof coords === 'object'
+            ? {
+                lat: coords.lat !== undefined && coords.lat !== '' && coords.lat !== null ? Number(coords.lat) : null,
+                lng: coords.lng !== undefined && coords.lng !== '' && coords.lng !== null ? Number(coords.lng) : null,
+            }
+            : { lat: null, lng: null };
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'price')) {
+        const price = Number(next.price);
+        next.price = Number.isFinite(price) ? price : undefined;
+    }
 
     return next;
+};
+
+/** Required fields for an experience submission, so a half-filled form fails loudly. */
+const validateActivitySubmission = (payload) => {
+    const errors = [];
+    if (!String(payload.title || '').trim()) errors.push('Title is required');
+    if (!String(payload.location || '').trim()) errors.push('Location is required');
+    if (payload.price === undefined || payload.price === null || Number.isNaN(Number(payload.price))) {
+        errors.push('A valid price is required');
+    } else if (Number(payload.price) < 0) {
+        errors.push('Price cannot be negative');
+    }
+    return errors;
 };
 
 // Get Supplier Stats
@@ -91,15 +140,105 @@ exports.getMyActivities = async (req, res) => {
 exports.createSupplierActivity = async (req, res) => {
     try {
         const safeBody = sanitizeActivityPayload(req.body);
+
+        const errors = validateActivitySubmission(safeBody);
+        if (errors.length) {
+            return res.status(400).json({ msg: errors[0], errors });
+        }
+
+        // Reject an accidental double-submit (double click, retried request) instead of
+        // creating two identical pending experiences.
+        const duplicate = await Activity.findOne({
+            supplier: req.user.id,
+            title: String(safeBody.title).trim(),
+            location: String(safeBody.location || '').trim(),
+            status: { $in: ['pending', 'draft', 'approved'] },
+        }).select('_id status').lean();
+
+        if (duplicate) {
+            return res.status(409).json({
+                msg: 'You have already submitted an experience with this title and location.',
+                existingId: duplicate._id,
+                status: duplicate.status,
+            });
+        }
+
         const newActivity = new Activity({
             ...safeBody,
+            // Identity comes from the verified token, never from the request body.
             supplier: req.user.id,
             status: 'pending' // Force pending for review
         });
         const activity = await newActivity.save();
+        await clearCache('cache:/api/activities*');
+        res.status(201).json(activity);
+    } catch (err) {
+        console.error('createSupplierActivity error:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+/**
+ * Update one of the caller's own experiences.
+ *
+ * Suppliers previously had to go through the admin-only `PUT /api/activities/:id`, which
+ * returned 403 — so editing a submitted experience was impossible from the Supplier
+ * Panel. Ownership is checked against the authenticated supplier, so one supplier can
+ * never edit another's listing.
+ */
+exports.updateSupplierActivity = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ msg: 'Invalid activity id' });
+        }
+
+        const existing = await Activity.findById(id).select('supplier status').lean();
+        if (!existing) return res.status(404).json({ msg: 'Activity not found' });
+
+        if (String(existing.supplier) !== String(req.user.id)) {
+            return res.status(403).json({ msg: 'You can only edit your own experiences' });
+        }
+
+        const safeBody = sanitizeActivityPayload(req.body);
+        const errors = validateActivitySubmission({ ...existing, ...safeBody });
+        if (errors.length) {
+            return res.status(400).json({ msg: errors[0], errors });
+        }
+
+        // Editing an approved listing sends it back for review — a supplier must not be
+        // able to swap the content of something a moderator already signed off on.
+        safeBody.status = 'pending';
+
+        const activity = await Activity.findByIdAndUpdate(id, { $set: safeBody }, { new: true });
+        await clearCache('cache:/api/activities*');
         res.json(activity);
     } catch (err) {
-        console.error(err.message);
+        console.error('updateSupplierActivity error:', err.message);
+        res.status(500).send('Server Error');
+    }
+};
+
+/** Delete one of the caller's own experiences. */
+exports.deleteSupplierActivity = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ msg: 'Invalid activity id' });
+        }
+
+        const existing = await Activity.findById(id).select('supplier').lean();
+        if (!existing) return res.status(404).json({ msg: 'Activity not found' });
+
+        if (String(existing.supplier) !== String(req.user.id)) {
+            return res.status(403).json({ msg: 'You can only delete your own experiences' });
+        }
+
+        await Activity.findByIdAndDelete(id);
+        await clearCache('cache:/api/activities*');
+        res.json({ msg: 'Activity deleted' });
+    } catch (err) {
+        console.error('deleteSupplierActivity error:', err.message);
         res.status(500).send('Server Error');
     }
 };

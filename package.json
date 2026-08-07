@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:integration": "node tests/integration/supplier-auth-security.probe.js && node tests/integration/itinerary-controlpanel-geography.probe.js",
+    "migrate:emails": "node scripts/normalize-user-emails.js"
   },
   "keywords": [],
   "author": "",

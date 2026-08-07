@@ -1,32 +1,45 @@
 const express = require('express');
 const router = express.Router();
-const { registerUser, loginUser, getProfile, updateProfile, changePassword, googleLogin, forgotPassword, resetPassword, getPreferences, updatePreferences } = require('../controllers/authController');
+const { registerUser, loginUser, getProfile, updateProfile, changePassword, googleLogin, forgotPassword, resetPassword, getPreferences, updatePreferences, getPasswordPolicy } = require('../controllers/authController');
 const auth = require('../middleware/auth');
+const rateLimit = require('../middleware/rateLimit');
+
+// Credential endpoints are rate limited per IP+email to blunt password guessing and
+// reset-email flooding. Public content routes are deliberately left untouched so search
+// engines and AI crawlers are never throttled.
+const loginLimiter = rateLimit({ scope: 'login', max: Number(process.env.AUTH_RATE_LIMIT_MAX) || 10 });
+const resetLimiter = rateLimit({ scope: 'reset', max: Number(process.env.RESET_RATE_LIMIT_MAX) || 5 });
+const registerLimiter = rateLimit({ scope: 'register', max: Number(process.env.REGISTER_RATE_LIMIT_MAX) || 10 });
 
 // @route   POST api/auth/register
 // @desc    Register user
 // @access  Public
-router.post('/register', registerUser);
+router.post('/register', registerLimiter, registerUser);
 
 // @route   POST api/auth/login
 // @desc    Login user
 // @access  Public
-router.post('/login', loginUser);
+router.post('/login', loginLimiter, loginUser);
 
 // @route   POST api/auth/google
 // @desc    Google login
 // @access  Public
-router.post('/google', googleLogin);
+router.post('/google', loginLimiter, googleLogin);
 
 // @route   POST api/auth/forgot-password
 // @desc    Request password reset
 // @access  Public
-router.post('/forgot-password', forgotPassword);
+router.post('/forgot-password', resetLimiter, forgotPassword);
 
 // @route   POST api/auth/reset-password
 // @desc    Reset password using token
 // @access  Public
-router.post('/reset-password', resetPassword);
+router.post('/reset-password', resetLimiter, resetPassword);
+
+// @route   GET api/auth/password-policy
+// @desc    Active password rules, so the UI can show them before submission
+// @access  Public
+router.get('/password-policy', getPasswordPolicy);
 
 // @route   GET api/auth/profile
 // @desc    Get current user profile
@@ -51,7 +64,7 @@ router.patch('/preferences', auth(), updatePreferences);
 // @route   POST api/auth/change-password
 // @desc    Change user password
 // @access  Private
-router.post('/change-password', auth(), changePassword);
+router.post('/change-password', auth(), rateLimit({ scope: 'change-password', max: 10 }), changePassword);
 
 // @route   GET api/auth/wishlist
 // @desc    Get user's wishlist

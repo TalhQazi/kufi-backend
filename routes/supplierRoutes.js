@@ -5,6 +5,8 @@ const {
     getSupplierStats,
     getMyActivities,
     createSupplierActivity,
+    updateSupplierActivity,
+    deleteSupplierActivity,
     getMyBookings
 } = require('../controllers/supplierController');
 
@@ -20,8 +22,17 @@ router.get('/stats', getSupplierStats);
 router.get('/activities', getMyActivities);
 
 // @route   POST api/supplier/activities
-// @desc    Create new activity
+// @desc    Submit a new experience (always created as 'pending' for admin review)
 router.post('/activities', createSupplierActivity);
+
+// @route   PUT/PATCH api/supplier/activities/:id
+// @desc    Update one of my own experiences. Ownership is enforced server-side.
+router.put('/activities/:id', updateSupplierActivity);
+router.patch('/activities/:id', updateSupplierActivity);
+
+// @route   DELETE api/supplier/activities/:id
+// @desc    Delete one of my own experiences
+router.delete('/activities/:id', deleteSupplierActivity);
 
 // @route   GET api/supplier/bookings
 // @desc    Get bookings for my activities

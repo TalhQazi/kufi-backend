@@ -6,6 +6,7 @@ const { createBooking, getUserBookings, getSupplierBookings, updateBookingStatus
 
 
 const auth = require('../middleware/auth');
+const optionalAuth = require('../middleware/optionalAuth');
 
 
 
@@ -13,9 +14,9 @@ const auth = require('../middleware/auth');
 
 // @desc    Create a booking
 
-// @access  Public
-// set the booking routes perfectly
-router.post('/', createBooking);
+// @access  Public (guests may submit), but a signed-in caller is always bound to their
+//          own account — `optionalAuth` populates req.user when a valid token is sent.
+router.post('/', optionalAuth, createBooking);
 
 
 

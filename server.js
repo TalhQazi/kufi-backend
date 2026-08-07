@@ -47,6 +47,10 @@ app.use('/api/newsletter', require('./routes/newsletterRoutes'));
 app.use('/api/upload', require('./routes/uploadRoutes'));
 app.use('/api/notifications', require('./routes/notificationRoutes'));
 
+// SEO: dynamic sitemap + robots, served from the root (not under /api) so crawlers
+// find them at the conventional locations.
+app.use('/', require('./routes/seoRoutes'));
+
 // Health Check
 app.get('/health', (req, res) => {
     res.json({

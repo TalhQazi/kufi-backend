@@ -15,6 +15,21 @@ const {
     daysBetween,
     getDayName,
 } = require('../utils/calendarDate');
+const {
+    isBreakEntry,
+    countActivities,
+    markBreakEntries,
+    buildBreakEntry,
+    resolveActivityId,
+} = require('../utils/activityClassification');
+const {
+    getCoordinates,
+    validateItineraryGeography,
+    parseDurationMinutes,
+    SAME_AREA_RADIUS_KM,
+    FLIGHT_THRESHOLD_KM,
+} = require('../utils/geo');
+const { planActivitiesAcrossDays, repairItineraryGeography, describeTransfer } = require('../utils/itineraryGeoPlanner');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -26,6 +41,61 @@ function getOpenAIClient() {
     const key = process.env.OPENAI_API_KEY;
     if (!key) return null;
     return new OpenAI({ apiKey: key });
+}
+
+/**
+ * Who may see an itinerary: the traveler it belongs to, the supplier building it, or an
+ * admin. Every itinerary route resolves the document through `loadItineraryFor` so no
+ * handler can forget the check.
+ */
+function canAccessItinerary(itinerary, user) {
+    if (!itinerary || !user?.id) return false;
+    if (user.role === 'admin') return true;
+    if (user.role === 'supplier') return String(itinerary.supplierId || '') === String(user.id);
+    return String(itinerary.userId || '') === String(user.id);
+}
+
+/** Only the owning supplier (or an admin) may edit or generate an itinerary. */
+function canEditItinerary(itinerary, user) {
+    if (!itinerary || !user?.id) return false;
+    if (user.role === 'admin') return true;
+    return user.role === 'supplier' && String(itinerary.supplierId || '') === String(user.id);
+}
+
+/**
+ * Load an itinerary and authorize the caller in one step.
+ *
+ * Responds and returns null when the itinerary is missing or the caller is not allowed
+ * to touch it, so handlers can simply `if (!itinerary) return;`.
+ *
+ * @param {'read'|'edit'} mode
+ */
+async function loadItineraryFor(req, res, mode = 'read', { lean = false } = {}) {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+        res.status(400).json({ msg: 'Invalid itinerary id' });
+        return null;
+    }
+
+    const query = Itinerary.findById(id);
+    const itinerary = lean ? await query.lean() : await query;
+    if (!itinerary) {
+        res.status(404).json({ msg: 'Itinerary not found' });
+        return null;
+    }
+
+    const allowed = mode === 'edit'
+        ? canEditItinerary(itinerary, req.user)
+        : canAccessItinerary(itinerary, req.user);
+
+    if (!allowed) {
+        // 404 rather than 403: a caller with no rights to this record should not be able
+        // to confirm that it exists.
+        res.status(404).json({ msg: 'Itinerary not found' });
+        return null;
+    }
+
+    return itinerary;
 }
 
 function getActivitiesForBudget(bookingActivities, activities, budget) {
@@ -119,7 +189,10 @@ function enforceActivityBudget(days, maxActivityBudget) {
     });
 }
 
-function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined) {
+/** Upper bound on real activities in a single day, before time budgeting narrows it further. */
+const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 3;
+
+function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined, { hotelCoords = null } = {}) {
     const cp = itinerary.controlPanel || {};
     const startDate = toDateString(itinerary.startDate);
     const endDate = toDateString(itinerary.endDate);
@@ -182,62 +255,125 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
         }
     }
 
-    // Group activities geographically by location/city
-    const geoGroups = {};
-    sortedActs.forEach(act => {
-        const locKey = (act.city || act.location || itinerary.city || 'default').trim().toLowerCase();
-        if (!geoGroups[locKey]) geoGroups[locKey] = [];
-        geoGroups[locKey].push(act);
+    // Group activities by real geography (coordinates first, place labels as fallback)
+    // and lay them out so each day stays within one area and within its time budget.
+    // The previous version grouped on a location string only, which put Cairo and Luxor
+    // activities on the same day whenever both were labelled "Egypt".
+    const activeDays = activeDayIndices.map((index) => ({ index, date: days[index].date }));
+    const candidateActs = isBookingSpecific ? sortedActs : sortedActs.slice(0, activeDayIndices.length * 4);
+
+    const { assignments, transfers } = planActivitiesAcrossDays(candidateActs, {
+        activeDays,
+        controlPanel: cp,
+        origin: hotelCoords || null,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
     });
 
-    const groupedActsOrdered = Object.values(geoGroups).flat();
-    let actsToUse = isBookingSpecific ? groupedActsOrdered : groupedActsOrdered.slice(0, activeDayIndices.length * 3);
-
-    // Distribute grouped activities sequentially across days to maintain geographic clustering
-    let currentDayPointer = 0;
-    actsToUse.forEach((act) => {
-        const targetDayIdx = activeDayIndices[currentDayPointer % activeDayIndices.length];
-        const dayActs = days[targetDayIdx].activities;
-
-        // Advance to next day if current day reaches 3 activities to avoid overcrowding single days
-        if (dayActs.length >= 3 && activeDayIndices.length > 1 && currentDayPointer < activeDayIndices.length - 1) {
-            currentDayPointer++;
-        }
-
-        const effectiveDayIdx = activeDayIndices[currentDayPointer % activeDayIndices.length];
-        const targetDate = days[effectiveDayIdx].date;
-        const existingCount = days[effectiveDayIdx].activities.length;
-        
+    activeDayIndices.forEach((dayIdx) => {
+        const targetDate = days[dayIdx].date;
         const dayOverride = (cp.perDayOverrides || []).find(o => o.date === targetDate) || {};
-        
+
         const activityStartTime = dayOverride.startTime || cp.activityStartTime || '09:00';
         const activityEndTime = dayOverride.endTime || cp.activityEndTime || '19:00';
         const lunchStart = dayOverride.lunchStart || cp.lunchStart || '13:00';
         const lunchEnd = dayOverride.lunchEnd || cp.lunchEnd || '14:00';
 
-        const { startTime, endTime } = getActivityTimeSlot(
-            existingCount,
-            activityStartTime,
-            activityEndTime,
-            lunchStart,
-            lunchEnd
-        );
+        const transfer = transfers.get(dayIdx);
+        if (transfer) {
+            days[dayIdx].transferNote = describeTransfer(transfer);
+            days[dayIdx].transfer = transfer;
+        }
 
-        days[effectiveDayIdx].activities.push({
-            activityId: act._id ? String(act._id) : null,
-            title: act.title || '',
-            description: act.description || '',
-            location: act.location || act.city || itinerary.city || '',
-            startTime,
-            endTime,
-            price: Number(act.price) || 0,
-            category: act.category || 'general',
-            image: act.image || '',
-            isSupplierOnly: true,
+        (assignments.get(dayIdx) || []).forEach((act, existingCount) => {
+            const { startTime, endTime } = getActivityTimeSlot(
+                existingCount,
+                activityStartTime,
+                activityEndTime,
+                lunchStart,
+                lunchEnd
+            );
+
+            days[dayIdx].activities.push({
+                activityId: act._id ? String(act._id) : null,
+                title: act.title || '',
+                description: act.description || '',
+                location: act.location || act.city || itinerary.city || '',
+                coordinates: getCoordinates(act) || undefined,
+                duration: act.duration || undefined,
+                startTime,
+                endTime,
+                price: Number(act.price) || 0,
+                category: act.category || 'general',
+                image: act.image || '',
+                isBreak: false,
+                isSupplierOnly: true,
+            });
         });
+
+        // A lunch placeholder keeps the timeline readable. It carries the canonical
+        // `isBreak` marker so it is never counted as an activity anywhere.
+        if (days[dayIdx].activities.length > 0) {
+            days[dayIdx].activities.push(
+                buildBreakEntry({
+                    title: 'Lunch Break',
+                    description: 'Time set aside for lunch.',
+                    startTime: lunchStart,
+                    endTime: lunchEnd,
+                })
+            );
+        }
     });
 
     return days;
+}
+
+/**
+ * Re-attach catalogue data (coordinates, duration, location) to day entries.
+ *
+ * Days cloned from an older itinerary — or returned by the model — carry only what was
+ * stored at the time, and entries written before coordinates existed have none. Without
+ * this the geographic validation layer has nothing to measure and silently does nothing,
+ * so a cloned Cairo+Luxor day would pass straight through.
+ *
+ * Matches on activityId first, then on an exact title, and leaves untouched anything it
+ * cannot resolve.
+ */
+function hydrateDayActivities(days, catalogue) {
+    const byId = new Map();
+    const byTitle = new Map();
+    (catalogue || []).forEach((a) => {
+        byId.set(String(a._id), a);
+        const t = String(a.title || '').trim().toLowerCase();
+        if (t && !byTitle.has(t)) byTitle.set(t, a);
+    });
+
+    return (Array.isArray(days) ? days : []).map((day) => {
+        const item = day?.toObject ? day.toObject() : day;
+        const activities = Array.isArray(item?.activities) ? item.activities : [];
+        return {
+            ...item,
+            activities: activities.map((entry) => {
+                const act = entry?.toObject ? entry.toObject() : entry;
+                if (isBreakEntry(act)) return act;
+
+                const linkedId = resolveActivityId(act.activityId);
+                const match =
+                    (linkedId && byId.get(linkedId)) ||
+                    byTitle.get(String(act.title || '').trim().toLowerCase());
+
+                if (!match) return { ...act, activityId: linkedId };
+
+                const coords = getCoordinates(act) || getCoordinates(match);
+                return {
+                    ...act,
+                    activityId: linkedId || String(match._id),
+                    coordinates: coords || act.coordinates,
+                    duration: act.duration || match.duration,
+                    location: act.location || match.location || match.city,
+                };
+            }),
+        };
+    });
 }
 
 // Shift template days to new itinerary's dates, keep activity structure intact
@@ -343,7 +479,17 @@ exports.createItinerary = async (req, res) => {
         if (bookingIdValEarly && mongoose.Types.ObjectId.isValid(bookingIdValEarly)) {
             bookingDoc = await Booking.findById(bookingIdValEarly);
             if (bookingDoc) {
-                userId = userId || bookingDoc.user;
+                // A supplier may only build an itinerary for a request that was routed
+                // to them — otherwise they could attach themselves to any booking in
+                // the system and read the traveler's details.
+                if (role === 'supplier' && String(bookingDoc.supplier || '') !== String(authUserId)) {
+                    return res.status(403).json({ msg: 'This request is not assigned to you' });
+                }
+                if (role !== 'supplier' && role !== 'admin' && String(bookingDoc.user || '') !== String(authUserId)) {
+                    return res.status(403).json({ msg: 'Access denied' });
+                }
+                // The traveler on the booking is authoritative — not a client-supplied id.
+                userId = bookingDoc.user || userId;
             }
         }
 
@@ -379,7 +525,10 @@ exports.createItinerary = async (req, res) => {
         const destination = req.body?.destination || tripData?.destination || tripData?.location;
 
         const bookingIdVal = req.body?.bookingId || req.body?.requestId;
-        const supplierIdVal = role === 'supplier' ? authUserId : req.body?.supplierId;
+        // A supplier is always recorded as themselves; only an admin may assign one.
+        const supplierIdVal = role === 'supplier'
+            ? authUserId
+            : (role === 'admin' ? req.body?.supplierId : undefined);
 
         if (bookingIdVal && !mongoose.Types.ObjectId.isValid(bookingIdVal)) return res.status(400).json({ msg: 'Invalid bookingId format' });
         if (supplierIdVal && !mongoose.Types.ObjectId.isValid(supplierIdVal)) return res.status(400).json({ msg: 'Invalid supplierId format' });
@@ -453,9 +602,10 @@ exports.createItinerary = async (req, res) => {
 
 exports.getItineraryById = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id).populate('controlPanel.hotelId').lean();
-        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
-        res.json(itinerary);
+        const itinerary = await loadItineraryFor(req, res, 'read');
+        if (!itinerary) return;
+        await itinerary.populate('controlPanel.hotelId');
+        res.json(itinerary.toObject());
     } catch (err) {
         console.error(err.message);
         res.status(500).json({ msg: 'Server error', error: err?.message });
@@ -472,6 +622,9 @@ exports.getItineraryByBookingId = async (req, res) => {
         const itinerary = await Itinerary.findOne({ bookingId }).populate('controlPanel.hotelId').lean();
 
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found for this booking' });
+        if (!canAccessItinerary(itinerary, req.user)) {
+            return res.status(404).json({ msg: 'Itinerary not found for this booking' });
+        }
         res.json(itinerary);
     } catch (err) {
         console.error('getItineraryByBookingId error:', err?.message);
@@ -486,7 +639,9 @@ async function fetchActivitiesForDestination(country, city) {
     if (city) orClause.push({ location: new RegExp(escapeRegExp(city), 'i') });
     if (orClause.length) query.$or = orClause;
     return Activity.find(query)
-        .select('_id title description duration price category location country city image images rating reviews highlights')
+        // `coordinates` drives geographic grouping. `images` is dropped: it was never
+        // read here and is a base64 array, so selecting it pulled megabytes per request.
+        .select('_id title description duration price category location country city image coordinates rating reviews highlights')
         .lean();
 }
 
@@ -494,10 +649,14 @@ async function fetchActivitiesForDestination(country, city) {
 function normalizeTripDays(days) {
     if (!Array.isArray(days) || days.length === 0) return days;
 
-    return days.map((d, idx) => {
+    // Stamp the canonical break marker so persisted data is self-describing and the
+    // legacy title-matching fallback stops being needed for anything written from here on.
+    const marked = markBreakEntries(days);
+
+    return marked.map((d, idx) => {
         const item = d.toObject ? d.toObject() : d;
         const isArrival = idx === 0;
-        const isDeparture = idx === days.length - 1;
+        const isDeparture = idx === marked.length - 1;
         return {
             ...item,
             day: idx + 1,
@@ -524,9 +683,26 @@ function normalizeTripDays(days) {
  * run into an immediate draft and silently move the request between supplier tabs.
  * Pass { persist: true } to opt back into the old write-through behaviour.
  */
-async function saveGeneratedDays(itinerary, days, source, { persist = false } = {}) {
+async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null } = {}) {
     applyBudgetToDocument(itinerary);
-    itinerary.days = normalizeTripDays(days);
+
+    // ── Post-generation validation layer ────────────────────────────────────────
+    // Whatever produced these days (AI, template, or an adapted database template) may
+    // have ignored geography. Validate travel distance, travel time and daily capacity,
+    // and reorganize when the plan is not physically possible.
+    const controlPanel = itinerary.controlPanel?.toObject
+        ? itinerary.controlPanel.toObject()
+        : (itinerary.controlPanel || {});
+
+    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(days, {
+        controlPanel,
+        origin: hotelCoords,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+    });
+
+    const finalValidation = repaired ? repairedValidation : validation;
+
+    itinerary.days = normalizeTripDays(safeDays);
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
@@ -535,22 +711,55 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false } = 
         await itinerary.save();
     }
     await itinerary.populate('controlPanel.hotelId');
-    return resPayload(itinerary, source, persist);
+    return resPayload(itinerary, source, persist, {
+        geographyRepaired: repaired,
+        geographyIssues: finalValidation.issues,
+        dayReports: finalValidation.dayReports,
+    });
 }
 
-function resPayload(itinerary, source, persisted = false) {
+function resPayload(itinerary, source, persisted = false, geography = null) {
     const doc = itinerary.toObject ? itinerary.toObject() : itinerary;
-    return { itinerary: doc, source, persisted };
+    return {
+        itinerary: doc,
+        source,
+        persisted,
+        // Counted with breaks excluded, so the API and the UI can never disagree.
+        totalActivities: countActivities(doc.days),
+        ...(geography ? { geography } : {}),
+    };
 }
 
 // ─── GENERATE itinerary with AI ──────────────────────────────────────────────
 
 exports.generateItinerary = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id);
-        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+        const itinerary = await loadItineraryFor(req, res, 'edit');
+        if (!itinerary) return;
 
         applyBudgetToDocument(itinerary);
+
+        // The supplier may have changed the Control Panel without saving it yet.
+        // Generation must honour what is on their screen, so an in-flight control panel
+        // is applied to the in-memory document for this run. It is only written to the
+        // database when the caller explicitly asks to persist — otherwise generating
+        // would silently commit configuration the supplier had not saved.
+        if (req.body?.controlPanel && typeof req.body.controlPanel === 'object') {
+            const incoming = { ...req.body.controlPanel };
+            delete incoming.startDate;
+            delete incoming.endDate;
+            if (Object.prototype.hasOwnProperty.call(incoming, 'hotelId')) {
+                incoming.hotelId = incoming.hotelId && mongoose.Types.ObjectId.isValid(incoming.hotelId)
+                    ? incoming.hotelId
+                    : null;
+            }
+            itinerary.set('controlPanel', {
+                ...(itinerary.controlPanel?.toObject ? itinerary.controlPanel.toObject() : itinerary.controlPanel || {}),
+                ...incoming,
+            });
+        }
+        if (req.body?.startDate) itinerary.startDate = req.body.startDate;
+        if (req.body?.endDate) itinerary.endDate = req.body.endDate;
 
         const country = (itinerary.country || itinerary.tripData?.country || itinerary.destination || '').trim();
         const city = (itinerary.city || itinerary.tripData?.city || itinerary.tripData?.destination || '').trim();
@@ -591,11 +800,14 @@ exports.generateItinerary = async (req, res) => {
         }
 
         const cp = itinerary.controlPanel || {};
+        // The trip starts from the hotel when one is selected, so it anchors the route.
+        const hotelCoords = getCoordinates(hotel);
         const startDate = toDateString(itinerary.startDate);
         const endDate = toDateString(itinerary.endDate);
         const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
 
         // Calculate available budget for activities using uplift as TOLERANCE (not surcharge reduction)
+        // `??` not `||`: an uplift of 0 is a deliberate "no tolerance", not a missing value.
         let upliftRaw = cp.budgetUplift ?? 15;
         let upliftPct = Math.min(Math.max((upliftRaw > 0 && upliftRaw < 1) ? upliftRaw : (Number(upliftRaw) / 100), 0), 1);
         let hotelCost = 0;
@@ -637,7 +849,10 @@ exports.generateItinerary = async (req, res) => {
             const existingQuery = {
                 aiGenerated: true,
                 _id: { $ne: itinerary._id },
-                days: { $exists: true, $not: { $size: 0 } },
+                // `days` being non-empty is not enough: an itinerary can hold day stubs
+                // with no activities at all. Requiring an actual activity is what stops
+                // "Generate" from cloning an empty plan and returning a blank itinerary.
+                'days.activities.0': { $exists: true },
             };
             if (country && city) {
                 existingQuery.country = new RegExp(`^${escapeRegExp(country)}$`, 'i');
@@ -648,17 +863,26 @@ exports.generateItinerary = async (req, res) => {
 
             const existing = await Itinerary.findOne(existingQuery).sort({ aiGeneratedAt: -1 }).lean();
 
-            if (existing && Array.isArray(existing.days) && existing.days.length > 0) {
-                const adaptedDays = adaptDaysToItinerary(existing.days, itinerary);
-                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist }));
+            // Adapting can trim days off the end, so re-check that the result still holds
+            // activities before returning it — otherwise fall through to building a fresh
+            // plan from the catalogue.
+            const adaptedDays = existing?.days?.length
+                // Hydrate from the catalogue so cloned entries regain the coordinates the
+                // geographic validation layer needs.
+                ? hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), activities)
+                : null;
+
+            if (adaptedDays && countActivities(adaptedDays) > 0) {
+                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords }));
             } else {
                 const templateDays = buildDefaultDays(
                     itinerary,
                     bookingActivities.length > 0 ? bookingActivities : activities,
                     bookingActivities.length > 0,
-                    activityBudget
+                    activityBudget,
+                    { hotelCoords }
                 );
-                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist }));
+                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords }));
             }
         }
 
@@ -669,10 +893,11 @@ exports.generateItinerary = async (req, res) => {
                 itinerary,
                 bookingActivities.length > 0 ? bookingActivities : activities,
                 bookingActivities.length > 0,
-                activityBudget
+                activityBudget,
+                { hotelCoords }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords })),
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
@@ -703,7 +928,7 @@ ${cp.perDayOverrides.map(o => `- Date: ${o.date} | Start: ${o.startTime || 'defa
     "arrivalNote": "${cp.startOnArrival ? 'Arrival Day — Checked in and ready for activities.' : 'Arrival Day — Free Day. Airport to Hotel transfer provided.'}",
     "activities": ${cp.startOnArrival ? `[
       {
-        "activityId": "null",
+        "activityId": null,
         "title": "Welcome Dinner & Evening Walk",
         "description": "Relaxing first evening dinner and orientation",
         "startTime": "19:00",
@@ -727,18 +952,21 @@ Trip details:
 - STARTING POINT / ORIGIN (0,0 ANCHOR): ${startingPointAnchor}. The trip begins from this starting location.
 
 Mandatory Constraints:
-1. GEOGRAPHICAL CLUSTERING RULE: Activities scheduled on the same day MUST be located in the same city or local district. DO NOT mix activities from distant cities (e.g., Cairo and Luxor, or Dubai and Abu Dhabi) on the same day. Dedicate separate consecutive days to separate cities (e.g. Cairo Days 1-2, Luxor Days 3-4).
+1. GEOGRAPHICAL CLUSTERING RULE: Activities scheduled on the same day MUST be within about ${Math.round(SAME_AREA_RADIUS_KM)}km of each other — use the coordinates given for each activity below. Never mix activities from distant bases on the same day. Group each base into consecutive days, and when the trip moves from one base to another put the move on a single travel day with fewer activities, allowing realistic travel time (road at ~70km/h, or a flight for legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km).
 2. MANDATORY ICONIC LANDMARKS RULE: You MUST unconditionally include famous landmark attractions of the destination (e.g. Pyramids of Giza, Great Sphinx, Egyptian Museum for Cairo/Egypt; Karnak Temple, Valley of the Kings for Luxor; Burj Khalifa for Dubai; etc.) in the itinerary.
 3. Activity start time each day: ${cp.activityStartTime || '09:00'}
 4. Activity end time each day: ${cp.activityEndTime || '19:00'}
-5. Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'} (no activities scheduled during lunch)
+5. Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'}. Leave this window free. If you include a lunch/rest placeholder it MUST be marked "isBreak": true and "category": "break" — it is not an activity and must never be given a price or an activityId.
 6. Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
 7. Last day (Day ${tripDays}) is departure day — always include departureNote.${overridesPrompt}
 8. You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days.${budgetRulePrompt}
 
 Available activities (prefer these pre-loaded activities and match activityId when assigning):
 ${activities.length > 0
-    ? activities.map(a => `- id:${a._id} | "${a.title}" | location:${a.location || a.city || city || 'local'} | duration:${a.duration || '2 hours'} | price:$${a.price || 0} | category:${a.category || 'general'}`).join('\n')
+    ? activities.map(a => {
+        const c = getCoordinates(a);
+        return `- id:${a._id} | "${a.title}" | location:${a.location || a.city || city || 'local'}${c ? ` | coords:${c.lat.toFixed(4)},${c.lng.toFixed(4)}` : ''} | duration:${a.duration || '2 hours'} | price:$${a.price || 0} | category:${a.category || 'general'}`;
+    }).join('\n')
     : '(no pre-loaded activities — create realistic iconic activities with location and pricing for the destination)'
 }
 ${requiredActivitiesPrompt}
@@ -754,7 +982,7 @@ ${day1Example},
     "isDepartureDay": false,
     "activities": [
       {
-        "activityId": "id from list or null if custom",
+        "activityId": "<id from the list above, or null (unquoted) for a custom activity>",
         "title": "Activity title",
         "description": "Short description",
         "startTime": "09:00",
@@ -789,10 +1017,11 @@ ${day1Example},
                 itinerary,
                 bookingActivities.length > 0 ? bookingActivities : activities,
                 bookingActivities.length > 0,
-                activityBudget
+                activityBudget,
+                { hotelCoords }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords })),
                 warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
             });
         }
@@ -811,7 +1040,10 @@ ${day1Example},
             day: idx + 1,
             dayName: getDayName(d.date) || d.dayName || '',
             activities: (d.activities || []).map(act => {
-                let dbAct = act.activityId ? (actMap[act.activityId] || bookingActMap[act.activityId]) : null;
+                // Models frequently return the string "null" rather than a real id, so
+                // normalise before using it as a lookup key or as a "is this bookable" test.
+                const rawActivityId = resolveActivityId(act.activityId);
+                let dbAct = rawActivityId ? (actMap[rawActivityId] || bookingActMap[rawActivityId]) : null;
                 
                 // Title fallback matching
                 if (!dbAct && act.title) {
@@ -820,22 +1052,44 @@ ${day1Example},
                             bookingActivities.find(a => a.title.trim().toLowerCase() === cleanTitle);
                 }
 
+                // A break placeholder is not a bookable activity: it never carries a
+                // price, never links to the catalogue, and is excluded from every count.
+                const isBreak = isBreakEntry({ ...act, activityId: dbAct ? String(dbAct._id) : rawActivityId });
+
+                if (isBreak) {
+                    return buildBreakEntry({
+                        title: act.title || 'Break',
+                        description: act.description || '',
+                        startTime: act.startTime || '',
+                        endTime: act.endTime || '',
+                    });
+                }
+
                 return {
-                    activityId: dbAct ? String(dbAct._id) : (act.activityId || null),
+                    activityId: dbAct ? String(dbAct._id) : rawActivityId,
                     title: dbAct ? dbAct.title : (act.title || ''),
                     description: dbAct ? dbAct.description : (act.description || ''),
+                    location: dbAct?.location || dbAct?.city || act.location || '',
+                    // Carried through so the validation layer below can measure real
+                    // distances instead of trusting the model's grouping.
+                    coordinates: getCoordinates(dbAct) || getCoordinates(act) || undefined,
+                    duration: dbAct?.duration || act.duration || undefined,
                     startTime: act.startTime || '',
                     endTime: act.endTime || '',
                     price: dbAct ? (Number(dbAct.price) || 0) : (Number(act.price) || 0),
                     category: dbAct ? dbAct.category : (act.category || 'general'),
                     image: act.image || dbAct?.image || '',
+                    isBreak: false,
                     isSupplierOnly: true,
                 };
             }),
         }));
 
-        const finalDays = enforceActivityBudget(enrichedDays, activityBudget);
-        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist }));
+        const finalDays = hydrateDayActivities(
+            enforceActivityBudget(enrichedDays, activityBudget),
+            [...activities, ...bookingActivities]
+        );
+        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords }));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });
@@ -846,8 +1100,10 @@ ${day1Example},
 
 exports.saveControlPanel = async (req, res) => {
     try {
-        const existing = await Itinerary.findById(req.params.id);
-        if (!existing) return res.status(404).json({ msg: 'Itinerary not found' });
+        // The Control Panel belongs to the Supplier Panel: only the supplier who owns
+        // this itinerary (or an admin) may change its configuration.
+        const existing = await loadItineraryFor(req, res, 'edit');
+        if (!existing) return;
 
         const { startDate, endDate, ...cpFields } = req.body || {};
         const updateFields = {
@@ -918,8 +1174,8 @@ exports.saveDays = async (req, res) => {
             return res.status(400).json({ msg: 'days must be an array' });
         }
 
-        const existing = await Itinerary.findById(req.params.id).select('controlPanel').lean();
-        if (!existing) return res.status(404).json({ msg: 'Itinerary not found' });
+        const existing = await loadItineraryFor(req, res, 'edit');
+        if (!existing) return;
 
         const updateFields = {
             days: normalizeTripDays(req.body.days),
@@ -979,8 +1235,8 @@ async function sendItineraryReadyEmail(itinerary) {
 
 exports.submitItinerary = async (req, res) => {
     try {
-        const itinerary = await Itinerary.findById(req.params.id);
-        if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+        const itinerary = await loadItineraryFor(req, res, 'edit');
+        if (!itinerary) return;
 
         if (Array.isArray(req.body.days)) {
             itinerary.days = normalizeTripDays(req.body.days);

@@ -2,8 +2,25 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
-const crypto = require('crypto');
 const { sendEmail } = require('../utils/emailService');
+const { normalizeEmail, findUserByEmail } = require('../utils/email');
+const { validatePassword } = require('../utils/passwordPolicy');
+const { createResetToken, hashResetToken, EXPIRES_MINUTES } = require('../utils/resetToken');
+
+const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS) || 10;
+
+const hashPassword = (plain) => bcrypt.hash(String(plain), BCRYPT_ROUNDS);
+
+/** Sign a session token for a user document. */
+const signToken = (user) =>
+    new Promise((resolve, reject) => {
+        jwt.sign(
+            { user: { id: String(user._id || user.id), role: user.role } },
+            process.env.JWT_SECRET,
+            { expiresIn: Number(process.env.JWT_EXPIRES_SECONDS) || 360000 },
+            (err, token) => (err ? reject(err) : resolve(token))
+        );
+    });
 
 const getFrontendUrl = (req) => {
     if (process.env.FRONTEND_URL) {
@@ -33,14 +50,28 @@ const formatAuthUser = (user) => {
 // Register User
 exports.registerUser = async (req, res) => {
     let { name, email, password, role, phone, country, city, status } = req.body;
-    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanEmail = normalizeEmail(email);
     email = cleanEmail;
 
     try {
-        const safeRegex = new RegExp('^' + cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '$', 'i');
-        let user = await User.findOne({
-            $or: [{ email: cleanEmail }, { email: safeRegex }]
-        });
+        if (!cleanEmail) {
+            return res.status(400).json({ msg: 'Please provide an email address' });
+        }
+
+        const policy = validatePassword(password);
+        if (!policy.valid) {
+            return res.status(400).json({ msg: policy.errors[0], errors: policy.errors });
+        }
+
+        // `role` is client-supplied, so only the self-service roles are accepted here.
+        // An admin account can never be created through public registration.
+        if (role && !['user', 'supplier'].includes(role)) {
+            return res.status(400).json({ msg: 'Invalid account type' });
+        }
+        // Likewise `status`: a supplier must not be able to self-activate.
+        status = role === 'supplier' ? 'pending' : 'active';
+
+        let user = await findUserByEmail(User, cleanEmail);
         if (user) {
             return res.status(400).json({ msg: 'User already exists' });
         }
@@ -116,40 +147,19 @@ exports.loginUser = async (req, res) => {
             return res.status(400).json({ msg: 'Please provide email and password' });
         }
 
-        const cleanEmail = String(email || '').trim().toLowerCase();
-        const safeRegex = new RegExp('^' + cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '$', 'i');
+        const user = await findUserByEmail(User, email, { lean: true });
 
-        const user = await User.findOne({
-            $or: [{ email: cleanEmail }, { email: safeRegex }]
-        }).lean();
-        if (!user) {
+        // Always run a bcrypt comparison, even when the account does not exist, so the
+        // response time does not reveal whether an address is registered.
+        const hash = user?.password || '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidinv';
+        const isMatch = await bcrypt.compare(String(password), hash);
+
+        if (!user || !isMatch) {
             return res.status(400).json({ msg: 'Invalid Credentials' });
         }
 
-        const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) {
-            return res.status(400).json({ msg: 'Invalid Credentials' });
-        }
-
-        const payload = {
-            user: {
-                id: user._id || user.id,
-                role: user.role
-            }
-        };
-
-        jwt.sign(
-            payload,
-            process.env.JWT_SECRET,
-            { expiresIn: 360000 },
-            (err, token) => {
-                if (err) throw err;
-                res.json({ 
-                    token, 
-                    user: formatAuthUser(user)
-                });
-            }
-        );
+        const token = await signToken(user);
+        res.json({ token, user: formatAuthUser(user) });
     } catch (err) {
         console.error('Login Error:', err.message);
         res.status(500).send('Server error');
@@ -169,24 +179,35 @@ exports.getProfile = async (req, res) => {
     }
 };
 
+/**
+ * Fields a user is allowed to change on their own profile.
+ *
+ * Everything else (role, status, scorePoints, verification flags, password, email) is
+ * deliberately excluded: `$set` with a raw body would otherwise let any user promote
+ * themselves to admin or mark their own business licence as verified.
+ */
+const SELF_EDITABLE_PROFILE_FIELDS = [
+    'name', 'fullName', 'phone', 'country', 'dob', 'gender', 'streetNumber',
+    'address', 'city', 'state', 'zipCode', 'nationality', 'avatar',
+    'businessName', 'businessAddress', 'businessLicense',
+];
+
 // Update User Profile
 exports.updateProfile = async (req, res) => {
-    if (country) profileFields.country = country;
-    if (dob) profileFields.dob = dob;
-    if (gender) profileFields.gender = gender;
-    if (streetNumber) profileFields.streetNumber = streetNumber;
-    if (address) profileFields.address = address;
-    if (city) profileFields.city = city;
-    if (state) profileFields.state = state;
-    if (zipCode) profileFields.zipCode = zipCode;
-    if (nationality) profileFields.nationality = nationality;
-    if (avatar) profileFields.avatar = avatar;
-    // Supplier fields
-    if (businessName) profileFields.businessName = businessName;
-    if (businessAddress) profileFields.businessAddress = businessAddress;
-    if (businessLicense) profileFields.businessLicense = businessLicense;
-    // Set businessProfileStatus to pending if business info is provided
-    if (businessName || businessAddress) {
+    const body = req.body || {};
+    const profileFields = {};
+
+    for (const field of SELF_EDITABLE_PROFILE_FIELDS) {
+        const value = body[field];
+        // Allow clearing a field with an explicit empty string, but ignore undefined/null
+        // so a partial update never wipes data the client did not send.
+        if (value !== undefined && value !== null) {
+            profileFields[field] = value;
+        }
+    }
+
+    // Re-submitting business details puts the supplier back into the approval queue.
+    if (body.businessName || body.businessAddress) {
         profileFields.businessProfileStatus = 'pending';
     }
 
@@ -247,10 +268,20 @@ exports.updatePreferences = async (req, res) => {
 
 // Change Password
 exports.changePassword = async (req, res) => {
-    const { currentPassword, newPassword } = req.body;
+    const { currentPassword, newPassword, confirmPassword } = req.body || {};
 
     if (!currentPassword || !newPassword) {
         return res.status(400).json({ msg: 'Current password and new password are required' });
+    }
+
+    // The client also checks this, but the API is the boundary that has to hold.
+    if (confirmPassword !== undefined && String(confirmPassword) !== String(newPassword)) {
+        return res.status(400).json({ msg: 'New password and confirmation do not match' });
+    }
+
+    const policy = validatePassword(newPassword);
+    if (!policy.valid) {
+        return res.status(400).json({ msg: policy.errors[0], errors: policy.errors });
     }
 
     try {
@@ -259,22 +290,29 @@ exports.changePassword = async (req, res) => {
             return res.status(404).json({ msg: 'User not found' });
         }
 
-        // Check if user has a password (Google users may not)
-        const isMatch = await bcrypt.compare(currentPassword, user.password);
+        const isMatch = await bcrypt.compare(String(currentPassword), user.password || '');
         if (!isMatch) {
             return res.status(400).json({ msg: 'Current password is incorrect' });
         }
 
-        // Hash new password
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
+        const isSameAsOld = await bcrypt.compare(String(newPassword), user.password || '');
+        if (isSameAsOld) {
+            return res.status(400).json({ msg: 'New password must be different from the current password' });
+        }
 
-        user.password = hashedPassword;
+        user.password = await hashPassword(newPassword);
+        // Invalidates every token issued before now (see middleware/auth.js), so other
+        // sessions are signed out. Any pending reset link is voided too.
+        user.passwordChangedAt = new Date();
+        user.resetPasswordToken = undefined;
+        user.resetPasswordExpires = undefined;
         await user.save();
 
-        res.json({ msg: 'Password updated successfully' });
+        // The caller stays signed in: hand back a token minted after the change.
+        const token = await signToken(user);
+        res.json({ msg: 'Password updated successfully', token });
     } catch (err) {
-        console.error(err.message);
+        console.error('changePassword error:', err.message);
         res.status(500).send('Server error');
     }
 };
@@ -286,16 +324,25 @@ exports.googleLogin = async (req, res) => {
     try {
         // Fetch user info from Google using the access token
         const googleRes = await axios.get(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${token}`);
-        const { name, email, picture } = googleRes.data;
+        const { name, picture } = googleRes.data;
+        // Google may return the address in any casing; normalizing here is what stops a
+        // second account being created for a user who already signed up with a password.
+        const email = normalizeEmail(googleRes.data?.email);
 
-        let user = await User.findOne({ email });
+        if (!email) {
+            return res.status(400).json({ msg: 'Google account did not provide an email address' });
+        }
+
+        let user = await findUserByEmail(User, email);
         let isNewUser = false;
 
         if (!user) {
             user = new User({
                 name,
                 email,
-                password: Math.random().toString(36).slice(-8),
+                // Placeholder credential: this account signs in through Google. Random
+                // bytes rather than Math.random so it can never be guessed.
+                password: await hashPassword(require('crypto').randomBytes(32).toString('hex')),
                 role: 'user',
                 avatar: picture,
                 status: 'active'
@@ -354,32 +401,35 @@ exports.googleLogin = async (req, res) => {
 exports.forgotPassword = async (req, res) => {
     const { email } = req.body;
 
+    // Identical response whether or not the address exists — otherwise this endpoint is
+    // an account-enumeration oracle.
+    const genericResponse = {
+        msg: 'If an account exists for that email address, a password reset link has been sent.',
+    };
+
     try {
-        const cleanEmail = String(email || '').trim().toLowerCase();
+        const cleanEmail = normalizeEmail(email);
         if (!cleanEmail) {
             return res.status(400).json({ msg: 'Please provide an email address' });
         }
 
-        const safeRegex = new RegExp('^' + cleanEmail.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '$', 'i');
-        const user = await User.findOne({
-            $or: [{ email: cleanEmail }, { email: safeRegex }]
-        });
+        const user = await findUserByEmail(User, cleanEmail);
 
         if (!user) {
-            return res.status(404).json({ msg: 'No user found with that email' });
+            return res.json(genericResponse);
         }
 
-        // Generate reset token
-        const resetToken = crypto.randomBytes(20).toString('hex');
-        user.resetPasswordToken = resetToken;
-        user.resetPasswordExpires = Date.now() + 3600000; // 1 hour
+        // Random token; only its digest is persisted.
+        const { token: resetToken, tokenHash, expiresAt, expiresInMinutes } = createResetToken();
+        user.resetPasswordToken = tokenHash;
+        user.resetPasswordExpires = expiresAt;
 
         await user.save();
 
         // Send Email
         const baseUrl = getFrontendUrl(req);
-        const resetUrl = `${baseUrl}/#reset-password/${resetToken}`;
-        
+        const resetUrl = `${baseUrl}/reset-password/${resetToken}`;
+
         try {
             const emailResult = await sendEmail({
                 to: user.email,
@@ -393,6 +443,7 @@ exports.forgotPassword = async (req, res) => {
                         <div style="margin-top: 30px; text-align: center;">
                             <a href="${resetUrl}" style="background-color: #a26e35; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Reset Password</a>
                         </div>
+                        <p style="margin-top: 20px; font-size: 13px; color: #777;">This link expires in ${expiresInMinutes} minutes and can only be used once.</p>
                         <p style="margin-top: 30px;">If you did not request this, please ignore this email and your password will remain unchanged.</p>
                     </div>
                 `
@@ -405,7 +456,7 @@ exports.forgotPassword = async (req, res) => {
                 return res.status(500).json({ msg: 'Email service is not configured. Please contact administrator.' });
             }
 
-            res.json({ msg: 'Email sent' });
+            res.json(genericResponse);
         } catch (emailErr) {
             user.resetPasswordToken = undefined;
             user.resetPasswordExpires = undefined;
@@ -421,29 +472,46 @@ exports.forgotPassword = async (req, res) => {
 
 // Reset Password
 exports.resetPassword = async (req, res) => {
-    const { token, password } = req.body;
+    const { token, password } = req.body || {};
 
     try {
+        if (!token) {
+            return res.status(400).json({ msg: 'Password reset token is invalid or has expired' });
+        }
+
+        const policy = validatePassword(password);
+        if (!policy.valid) {
+            return res.status(400).json({ msg: policy.errors[0], errors: policy.errors });
+        }
+
+        // Look the token up by digest; `resetPasswordToken` is `select: false`, so it has
+        // to be requested explicitly.
         const user = await User.findOne({
-            resetPasswordToken: token,
-            resetPasswordExpires: { $gt: Date.now() }
-        });
+            resetPasswordToken: hashResetToken(token),
+            resetPasswordExpires: { $gt: new Date() }
+        }).select('+resetPasswordToken +resetPasswordExpires');
 
         if (!user) {
             return res.status(400).json({ msg: 'Password reset token is invalid or has expired' });
         }
 
-        // Set new password
-        const salt = await bcrypt.genSalt(10);
-        user.password = await bcrypt.hash(password, salt);
+        user.password = await hashPassword(password);
+        // Consume the token so the same link cannot be replayed...
         user.resetPasswordToken = undefined;
         user.resetPasswordExpires = undefined;
+        // ...and sign out every session that existed before the reset.
+        user.passwordChangedAt = new Date();
 
         await user.save();
 
         res.json({ msg: 'Password has been reset' });
     } catch (err) {
-        console.error(err.message);
+        console.error('resetPassword error:', err.message);
         res.status(500).send('Server error');
     }
+};
+
+// Expose the active password policy so the UI can show the rules before submission.
+exports.getPasswordPolicy = (req, res) => {
+    res.json({ ...require('../utils/passwordPolicy').describePolicy(), resetExpiresMinutes: EXPIRES_MINUTES });
 };

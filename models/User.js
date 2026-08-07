@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { normalizeEmail } = require('../utils/email');
 
 const UserSchema = new mongoose.Schema({
     name: {
@@ -11,7 +12,13 @@ const UserSchema = new mongoose.Schema({
     email: {
         type: String,
         required: true,
-        unique: true
+        unique: true,
+        // Emails are case-insensitive. Storing a single normalized form is what makes
+        // the existing unique index enforce that: two accounts can no longer differ by
+        // casing alone. Every read path normalizes too (see utils/email.js).
+        set: normalizeEmail,
+        trim: true,
+        lowercase: true
     },
     password: {
         type: String,
@@ -106,10 +113,19 @@ const UserSchema = new mongoose.Schema({
         type: Date,
         default: Date.now
     },
+    // SHA-256 digest of the reset token. The token itself is only ever sent by email,
+    // so a database leak cannot be replayed against the reset endpoint.
     resetPasswordToken: {
-        type: String
+        type: String,
+        select: false
     },
     resetPasswordExpires: {
+        type: Date,
+        select: false
+    },
+    // Set on every password change/reset. Tokens issued before this moment are rejected
+    // by the auth middleware, which is what logs other sessions out.
+    passwordChangedAt: {
         type: Date
     },
     preferences: {
@@ -122,5 +138,8 @@ const UserSchema = new mongoose.Schema({
 
 UserSchema.index({ role: 1, status: 1 });
 UserSchema.index({ createdAt: -1 });
+// Reset lookups are by token digest, so keep them indexed and sparse (almost every
+// document has no pending reset).
+UserSchema.index({ resetPasswordToken: 1 }, { sparse: true });
 
 module.exports = mongoose.model('User', UserSchema);

@@ -4,6 +4,7 @@ const auth = require('../middleware/auth');
 const {
   getBlogs,
   getBlogById,
+  getBlogImage,
   createBlog,
   updateBlog,
   deleteBlog,
@@ -13,6 +14,11 @@ const {
 // @desc    Get all blogs
 // @access  Public
 router.get('/', getBlogs);
+
+// @route   GET api/blogs/:id/image
+// @desc    Cover image as cacheable binary (declared before /:id so it is not shadowed)
+// @access  Public
+router.get('/:id/image', getBlogImage);
 
 // @route   GET api/blogs/:id
 // @desc    Get blog by ID

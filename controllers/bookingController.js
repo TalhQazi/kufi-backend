@@ -102,6 +102,53 @@ const pickNextSupplierIdForCountry = async (countryLabel, excludedSupplierIds = 
     return suppliers[0]?._id || null;
 };
 
+/**
+ * Can this caller act on this booking?
+ *
+ * - admin     : everything
+ * - supplier  : only bookings assigned to them
+ * - traveler  : only their own bookings (by user id, or by the contact email they used
+ *               when the request was created as a guest)
+ *
+ * Every booking mutation goes through this. Without it any authenticated account could
+ * read, confirm, re-price or mark as paid any booking in the system just by knowing its id.
+ */
+const canAccessBooking = (booking, user) => {
+    if (!booking || !user?.id) return false;
+    if (user.role === 'admin') return true;
+    if (user.role === 'supplier') return String(booking.supplier || '') === String(user.id);
+    return String(booking.user || '') === String(user.id);
+};
+
+/** Fields the traveler/supplier may change through the generic update endpoint. */
+const BOOKING_UPDATABLE_FIELDS = new Set([
+    'contactDetails', 'tripDetails', 'preferences', 'items',
+    'bookingTermSelections', 'adjustmentCard', 'status',
+]);
+
+/**
+ * Money and payment state are set by the payment flow and by admins only. Letting them
+ * through here would allow a traveler to mark their own trip `paid` for free.
+ */
+const BOOKING_PRIVILEGED_FIELDS = [
+    'totalAmount', 'commissionAmount', 'netAmount', 'paymentStatus',
+    'stripeSessionId', 'supplier', 'user', 'transferStatus', 'transferredBy', 'rejectedSuppliers',
+];
+
+const pickBookingUpdate = (body, user) => {
+    const update = {};
+    Object.entries(body || {}).forEach(([key, value]) => {
+        if (BOOKING_UPDATABLE_FIELDS.has(key)) update[key] = value;
+    });
+    // Admins retain full control, matching the admin panel's existing behaviour.
+    if (user?.role === 'admin') {
+        BOOKING_PRIVILEGED_FIELDS.forEach((key) => {
+            if (Object.prototype.hasOwnProperty.call(body || {}, key)) update[key] = body[key];
+        });
+    }
+    return update;
+};
+
 const normalizeBookingPayload = (body) => {
     const travelersRaw = body?.travelers ?? body?.guests;
     const travelers = Number(travelersRaw);
@@ -151,11 +198,24 @@ const normalizeBookingPayload = (body) => {
 exports.createBooking = async (req, res) => {
     try {
         const normalized = normalizeBookingPayload(req.body || {});
+
+        // Identity: the authenticated user always wins. A client-supplied `user` id is
+        // only honoured for genuine guest submissions, and even then it is discarded —
+        // guests are matched by contact email instead.
+        if (req.user?.id) {
+            normalized.user = req.user.id;
+        } else {
+            delete normalized.user;
+        }
+
+        if (!String(normalized?.contactDetails?.email || '').trim()) {
+            return res.status(400).json({ msg: 'A contact email is required to submit a request' });
+        }
+
+        // Supplier assignment is a platform decision, never a client input.
         const tripCountry = normalizeCountryLabel(normalized?.tripDetails?.country);
         const bestSupplierId = await pickBestSupplierIdForCountry(tripCountry);
-        if (bestSupplierId) {
-            normalized.supplier = bestSupplierId;
-        }
+        normalized.supplier = bestSupplierId || undefined;
 
         const newBooking = new Booking(normalized);
         const booking = await newBooking.save();
@@ -187,7 +247,17 @@ exports.createBooking = async (req, res) => {
 exports.getUserBookings = async (req, res) => {
     try {
         const { userId } = req.params;
-        const email = String(req.query?.email || req.user?.email || '').trim();
+
+        // A user may only read their own bookings. Previously any authenticated account
+        // could enumerate anyone's trips (and their contact details) by id.
+        if (req.user?.role !== 'admin' && String(userId) !== String(req.user?.id)) {
+            return res.status(403).json({ msg: 'Access denied' });
+        }
+
+        // Guest requests are linked by contact email, so include the caller's own
+        // address — but never an arbitrary one supplied in the query string.
+        const account = await User.findById(req.user.id).select('email').lean();
+        const email = String(account?.email || '').trim();
 
         const orConditions = [{ user: userId }];
         if (email) orConditions.push({ 'contactDetails.email': email });
@@ -249,9 +319,19 @@ exports.updateBookingStatus = async (req, res) => {
     try {
         const { id } = req.params;
         const { status } = req.body;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid booking id' });
+        }
         const booking = await Booking.findById(id);
 
         if (!booking) return res.status(404).json({ message: 'Booking not found' });
+
+        // Only the assigned supplier (or an admin) may move a request through its
+        // lifecycle. Without this, any supplier could confirm or cancel a competitor's
+        // bookings.
+        if (!canAccessBooking(booking, req.user)) {
+            return res.status(403).json({ message: 'Access denied' });
+        }
 
         const normalizedStatus = String(status || '').trim().toLowerCase();
 
@@ -368,6 +448,16 @@ exports.updateBookingAdjustment = async (req, res) => {
         const { id } = req.params;
         const card = req.body?.card;
 
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid booking id' });
+        }
+
+        const existing = await Booking.findById(id).select('user supplier').lean();
+        if (!existing) return res.status(404).json({ message: 'Booking not found' });
+        if (!canAccessBooking(existing, req.user)) {
+            return res.status(403).json({ message: 'Access denied' });
+        }
+
         const update = {
             adjustmentCard: card,
             adjustmentRequestedAt: new Date(),
@@ -386,10 +476,24 @@ exports.updateBookingAdjustment = async (req, res) => {
 exports.updateBooking = async (req, res) => {
     try {
         const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid booking id' });
+        }
         const prev = await Booking.findById(id);
         if (!prev) return res.status(404).json({ message: 'Booking not found' });
 
-        const booking = await Booking.findByIdAndUpdate(id, { $set: req.body }, { new: true }).lean();
+        if (!canAccessBooking(prev, req.user)) {
+            return res.status(403).json({ message: 'Access denied' });
+        }
+
+        // Allowlist: `$set` on a raw body previously let a traveler set their own
+        // booking to paymentStatus 'paid' and rewrite the amount.
+        const update = pickBookingUpdate(req.body, req.user);
+        if (Object.keys(update).length === 0) {
+            return res.status(400).json({ message: 'No updatable fields supplied' });
+        }
+
+        const booking = await Booking.findByIdAndUpdate(id, { $set: update }, { new: true }).lean();
         if (!booking) return res.status(404).json({ message: 'Booking not found' });
 
         try {

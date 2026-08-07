@@ -40,10 +40,20 @@ const sanitizeActivityPayload = (body) => {
     return next;
 };
 
+/**
+ * Card fields only — everything a list/carousel needs, and nothing else.
+ *
+ * `image` is a base64 data URI averaging ~100KB (some over 4MB), so it is the single
+ * biggest cost in this endpoint. Callers that only render a handful of cards should ask
+ * for a `limit`; callers that do not need pictures at all can pass `fields=summary`.
+ */
+const LIST_EXCLUDED_FIELDS = '-images -description -addOns -coordinates';
+const SUMMARY_FIELDS = '_id title location country price duration category rating reviews status order createdAt';
+
 // Get all activities
 exports.getActivities = async (req, res) => {
     try {
-        const { country, city, category, status, includeImages } = req.query;
+        const { country, city, category, status } = req.query;
         const filter = {};
 
         if (country) {
@@ -74,25 +84,41 @@ exports.getActivities = async (req, res) => {
         // take 30+ seconds. The frontend list views render a placeholder
         // when image is null and load the full image only on the detail
         // endpoint (`GET /api/activities/:id`) when the user opens an item.
-        const selectFields = '-images -description -addOns -coordinates';
+        const wantsSummary = String(req.query.fields || '').toLowerCase() === 'summary';
+        const selectFields = wantsSummary ? SUMMARY_FIELDS : LIST_EXCLUDED_FIELDS;
 
-        const activities = await Activity.find(filter)
-            .select(selectFields)
-            .sort({ createdAt: -1 })
-            .lean()
-            .limit(1000)
-            .maxTimeMS(10000);
+        // Sorting is done in the database so `limit` returns the right rows. `order`
+        // is a manual ranking where 0 means "unranked", so unranked items must sort
+        // after ranked ones — hence the computed key rather than a plain sort on `order`.
+        const pipeline = [
+            { $match: filter },
+            {
+                $addFields: {
+                    _rank: {
+                        $cond: [{ $gt: [{ $ifNull: ['$order', 0] }, 0] }, '$order', Number.MAX_SAFE_INTEGER],
+                    },
+                },
+            },
+            { $sort: { _rank: 1, createdAt: -1, _id: -1 } },
+        ];
 
-        activities.sort((a, b) => {
-            const orderA = Number(a.order) || 0;
-            const orderB = Number(b.order) || 0;
-            if (orderA > 0 && orderB > 0) return orderA - orderB;
-            if (orderA > 0 && orderB === 0) return -1;
-            if (orderA === 0 && orderB > 0) return 1;
-            const dateA = new Date(a.createdAt || a._id?.getTimestamp?.() || 0).getTime();
-            const dateB = new Date(b.createdAt || b._id?.getTimestamp?.() || 0).getTime();
-            return dateB - dateA;
-        });
+        // Pagination. Callers that send no limit keep the previous behaviour (everything,
+        // capped at 1000) so existing pages are unaffected.
+        const limitRaw = parseInt(req.query.limit, 10);
+        const pageRaw = parseInt(req.query.page, 10);
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 1000;
+        const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+        if (page > 1) pipeline.push({ $skip: (page - 1) * limit });
+        pipeline.push({ $limit: limit });
+
+        // Inclusion and exclusion cannot be mixed in one $project, so `_rank` is only
+        // named in the exclusion form — the inclusion form drops it by omission.
+        const projection = wantsSummary
+            ? SUMMARY_FIELDS.split(' ').reduce((acc, f) => ({ ...acc, [f]: 1 }), {})
+            : { images: 0, description: 0, addOns: 0, coordinates: 0, _rank: 0 };
+        pipeline.push({ $project: projection });
+
+        const activities = await Activity.aggregate(pipeline).option({ maxTimeMS: 10000 });
 
         res.json(activities);
     } catch (err) {
