@@ -692,7 +692,7 @@ function normalizeTripDays(days) {
  * run into an immediate draft and silently move the request between supplier tabs.
  * Pass { persist: true } to opt back into the old write-through behaviour.
  */
-async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null } = {}) {
+async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null } = {}) {
     applyBudgetToDocument(itinerary);
 
     // ── Post-generation validation layer ────────────────────────────────────────
@@ -724,10 +724,10 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         geographyRepaired: repaired,
         geographyIssues: finalValidation.issues,
         dayReports: finalValidation.dayReports,
-    });
+    }, budget);
 }
 
-function resPayload(itinerary, source, persisted = false, geography = null) {
+function resPayload(itinerary, source, persisted = false, geography = null, budget = null) {
     const doc = itinerary.toObject ? itinerary.toObject() : itinerary;
     return {
         itinerary: doc,
@@ -736,6 +736,7 @@ function resPayload(itinerary, source, persisted = false, geography = null) {
         // Counted with breaks excluded, so the API and the UI can never disagree.
         totalActivities: countActivities(doc.days),
         ...(geography ? { geography } : {}),
+        ...(budget ? { budget } : {}),
     };
 }
 
@@ -836,6 +837,9 @@ exports.generateItinerary = async (req, res) => {
         let activityBudget = undefined;
         let activityBudgetStr = 'flexible';
         let budgetRulePrompt = '';
+        // Surfaced on the response so the supplier can see exactly how the Control Panel
+        // translated into a spending ceiling, instead of inferring it from the result.
+        let budgetBreakdown = null;
 
         if (itinerary.budget) {
             // Uplift is budget tolerance: base budget $1,000 with 15% tolerance = $1,150 max total budget
@@ -845,6 +849,19 @@ exports.generateItinerary = async (req, res) => {
             
             activityBudget = maxTotalActivitiesCost;
             activityBudgetStr = String(maxTotalActivitiesCost);
+
+            budgetBreakdown = {
+                travelerBudget: Number(itinerary.budget) || 0,
+                upliftPercent: Math.round(upliftPct * 100),
+                maxAllowedTotalBudget,
+                hotelCost,
+                customCostsTotal,
+                activityCeiling: maxTotalActivitiesCost,
+                // A ceiling of zero means accommodation and fixed costs have already
+                // consumed the whole budget. Generation will legitimately return no
+                // activities, so say so rather than handing back a blank plan.
+                exhaustedByFixedCosts: maxTotalActivitiesCost === 0,
+            };
 
             budgetRulePrompt = `\nCRITICAL BUDGET TOLERANCE RULE: Customer budget is $${itinerary.budget}. With a ${Math.round(upliftPct * 100)}% budget tolerance allowance, the maximum allowed total trip budget ceiling is $${maxAllowedTotalBudget}. After accounting for hotel accommodation ($${hotelCost}) and custom costs ($${customCostsTotal}), the sum of prices of all scheduled activities MUST NOT exceed $${maxTotalActivitiesCost}. Select high-value, iconic activities strictly under $${maxTotalActivitiesCost}.`;
         }
@@ -888,7 +905,7 @@ exports.generateItinerary = async (req, res) => {
                 : null;
 
             if (adaptedDays && countActivities(adaptedDays) > 0) {
-                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords }));
+                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown }));
             } else {
                 const templateDays = buildDefaultDays(
                     itinerary,
@@ -897,7 +914,7 @@ exports.generateItinerary = async (req, res) => {
                     activityBudget,
                     { hotelCoords }
                 );
-                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords }));
+                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown }));
             }
         }
 
@@ -912,7 +929,7 @@ exports.generateItinerary = async (req, res) => {
                 { hotelCoords }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown })),
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
@@ -1036,7 +1053,7 @@ ${day1Example},
                 { hotelCoords }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown })),
                 warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
             });
         }
@@ -1104,7 +1121,7 @@ ${day1Example},
             enforceActivityBudget(enrichedDays, activityBudget),
             [...activities, ...bookingActivities]
         );
-        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords }));
+        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown }));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });
