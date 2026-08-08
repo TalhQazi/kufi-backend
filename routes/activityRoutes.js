@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getActivities, getActivityById, createActivity, seedActivities, updateActivity, deleteActivity } = require('../controllers/activityController');
+const { getActivities, getActivityById, createActivity, seedActivities, updateActivity, deleteActivity, reorderActivities } = require('../controllers/activityController');
 const auth = require('../middleware/auth');
 const cache = require('../middleware/cache');
 
@@ -19,6 +19,11 @@ router.get('/:id', cache(600), getActivityById); // Cache for 10 minutes
 // @desc    Create an activity
 // @access  Private (Admin)
 router.post('/', auth(['admin']), createActivity);
+
+// @route   PUT api/activities/reorder
+// @desc    Bulk-update display order. Declared before '/:id' so it is not shadowed.
+// @access  Private (Admin)
+router.put('/reorder', auth(['admin']), reorderActivities);
 
 // @route   PATCH api/activities/:id
 // @desc    Update an activity (e.g. status)

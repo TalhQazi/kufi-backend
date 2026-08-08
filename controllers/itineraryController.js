@@ -171,13 +171,22 @@ function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr
     };
 }
 
+/**
+ * Drop activities once the cumulative spend would exceed the ceiling.
+ *
+ * Schedule breaks are always kept and never charged against the ceiling: a lunch
+ * placeholder is not something the traveler buys, and a nominal price left on a legacy
+ * break must not push real activities out of the plan.
+ */
 function enforceActivityBudget(days, maxActivityBudget) {
     if (maxActivityBudget === undefined || maxActivityBudget === null || typeof maxActivityBudget !== 'number') {
         return days;
     }
     let cumulative = 0;
     return (days || []).map(d => {
-        const activities = (d.activities || []).filter(act => {
+        const item = d?.toObject ? d.toObject() : d;
+        const activities = (item.activities || []).filter(act => {
+            if (isBreakEntry(act)) return true;
             const price = Number(act.price) || 0;
             if (cumulative + price <= maxActivityBudget) {
                 cumulative += price;
@@ -185,7 +194,7 @@ function enforceActivityBudget(days, maxActivityBudget) {
             }
             return false;
         });
-        return { ...d, activities };
+        return { ...item, activities };
     });
 }
 
@@ -868,8 +877,14 @@ exports.generateItinerary = async (req, res) => {
             // plan from the catalogue.
             const adaptedDays = existing?.days?.length
                 // Hydrate from the catalogue so cloned entries regain the coordinates the
-                // geographic validation layer needs.
-                ? hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), activities)
+                // geographic validation layer needs, then apply the same budget ceiling
+                // every other generation path honours. Cloning a template used to bypass
+                // the ceiling entirely, which is why the Control Panel's budget uplift had
+                // no effect whatsoever on this path.
+                ? enforceActivityBudget(
+                    hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), activities),
+                    activityBudget
+                )
                 : null;
 
             if (adaptedDays && countActivities(adaptedDays) > 0) {

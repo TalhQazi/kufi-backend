@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Activity = require('../models/Activity');
 const { clearCache } = require('../utils/cache');
 
@@ -125,6 +126,54 @@ exports.getActivities = async (req, res) => {
         console.error('Error fetching activities:', err.message);
         if (res.headersSent) return;
         res.status(500).json({ message: 'Error fetching activities', error: err.message });
+    }
+};
+
+/**
+ * Bulk-set display order.
+ *
+ * The admin list lets an activity be nudged up or down, which renumbers the whole
+ * sequence. Doing that one PUT per row would be ~128 requests and could leave the
+ * ordering half-applied, so the reordered set is written in a single bulk operation.
+ *
+ * Body: { items: [{ id, order }, ...] }
+ */
+exports.reorderActivities = async (req, res) => {
+    try {
+        const items = Array.isArray(req.body?.items) ? req.body.items : null;
+        if (!items || items.length === 0) {
+            return res.status(400).json({ msg: 'items must be a non-empty array of { id, order }' });
+        }
+        if (items.length > 2000) {
+            return res.status(400).json({ msg: 'Too many items in one reorder request' });
+        }
+
+        const operations = [];
+        for (const entry of items) {
+            const id = entry?.id ?? entry?._id;
+            const order = Number(entry?.order);
+            if (!mongoose.Types.ObjectId.isValid(id)) {
+                return res.status(400).json({ msg: `Invalid activity id: ${id}` });
+            }
+            if (!Number.isFinite(order) || order < 0) {
+                return res.status(400).json({ msg: `Invalid order for ${id}` });
+            }
+            operations.push({
+                updateOne: { filter: { _id: new mongoose.Types.ObjectId(id) }, update: { $set: { order } } },
+            });
+        }
+
+        const result = await Activity.bulkWrite(operations, { ordered: false });
+        await clearCache('cache:/api/activities*');
+
+        res.json({
+            msg: 'Order updated',
+            matched: result.matchedCount ?? 0,
+            modified: result.modifiedCount ?? 0,
+        });
+    } catch (err) {
+        console.error('reorderActivities error:', err.message);
+        res.status(500).send('Server Error');
     }
 };
 
