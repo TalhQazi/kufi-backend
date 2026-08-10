@@ -30,6 +30,9 @@ node server.js
 node tests/integration/supplier-auth-security.probe.js
 node tests/integration/itinerary-controlpanel-geography.probe.js
 node tests/integration/adjustment-request.probe.js
+node tests/integration/control-panel-dynamic.probe.js    # add --ai to test the AI path
+node tests/integration/ai-generation-live.probe.js       # makes ONE real OpenAI call
+node tests/integration/ai-token-usage.probe.js           # add --live for exact usage
 node tests/integration/overview-controlpanel.probe.js
 node tests/integration/day-boundaries.probe.js
 node tests/integration/lunch-duration.probe.js
@@ -45,6 +48,9 @@ node tests/integration/activities-sort-parity.probe.js   # read-only
 | `supplier-auth-security` | Supplier can submit/edit/delete only their own experiences; identity comes from the token; unauthenticated, invalid-token, wrong-role, duplicate and missing-field cases; booking and itinerary IDOR; change-password rules and session invalidation; reset-token hashing, expiry and single use; case-insensitive email; rate limiting |
 | `itinerary-controlpanel-geography` | Every Control Panel value survives generation (including `uplift = 0`); an unsaved control panel drives generation without being persisted; lunch breaks are marked and excluded from counts; generated days are geographically feasible |
 | `adjustment-request` | "Request Adjustment" reaches the supplier: accepted from both the booking id and the itinerary id, stored on the booking, the supplier is notified and the dashboard counts it; plus authorization and empty-card rejection |
+| `control-panel-dynamic` | Every Control Panel field, one at a time: proves the setting changes the generated itinerary rather than being ignored. The stored panel is deliberately seeded with different values, so a pass can only mean the in-flight panel won. Exits non-zero if any field is static |
+| `ai-generation-live` | One real AI generation: reports token usage and latency, and checks the plan is still correct (geography, arrival day, no duplicates, catalogue linkage, budget) |
+| `ai-token-usage` | Breaks the prompt down section by section so prompt growth is visible; `--live` reports exact usage and cost from the API |
 | `overview-controlpanel` | Settings made on the "Proceed to create itinerary" screen drive generation even when the request already has an itinerary record, and generation stays a preview (the stored copy is not overwritten) |
 | `day-boundaries` | `startOnArrival` / `endOnDeparture` actually change the plan on every generation path, and Save-as-Draft persists and lands the request in the Drafts tab |
 | `lunch-duration` | The lunch break is duration-driven, centred in the activity window, identical on every day, and absent when the duration is 0 |

@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Activity = require('../models/Activity');
 const { clearCache } = require('../utils/cache');
+const { resolveImageMime } = require('../utils/imageType');
 
 const normalizeStringArray = (value) => {
     if (!Array.isArray(value)) return [];
@@ -126,6 +127,55 @@ exports.getActivities = async (req, res) => {
         console.error('Error fetching activities:', err.message);
         if (res.headersSent) return;
         res.status(500).json({ message: 'Error fetching activities', error: err.message });
+    }
+};
+
+/**
+ * GET /api/activities/:id/image
+ *
+ * Serves the stored cover image as real binary instead of a base64 blob.
+ *
+ * Activity images average ~136KB as base64 and some exceed 4MB. Embedding them in
+ * itinerary documents made a single itinerary average 852KB (largest: 7.1MB for 13
+ * activities). Generated itineraries now store this URL instead, so the bytes are
+ * fetched once per image and cached by the browser rather than duplicated into every
+ * itinerary that uses the activity.
+ */
+exports.getActivityImage = async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).end();
+
+        const activity = await Activity.findById(req.params.id).select('image updatedAt').lean();
+        if (!activity?.image) return res.status(404).end();
+
+        const raw = String(activity.image).trim();
+        const match = /^data:([^;,]+);base64,(.*)$/s.exec(raw);
+
+        // Images stored as a plain URL are simply redirected to.
+        if (!match) {
+            if (/^https?:\/\//i.test(raw) || raw.startsWith('/')) return res.redirect(302, raw);
+            return res.status(404).end();
+        }
+
+        const [, declaredType, base64] = match;
+        const buffer = Buffer.from(base64, 'base64');
+        // Most uploads recorded 'application/octet-stream'; the bytes are authoritative.
+        const contentType = resolveImageMime(buffer, declaredType);
+        const etag = `W/"${activity._id}-${new Date(activity.updatedAt || 0).getTime()}"`;
+
+        if (req.headers['if-none-match'] === etag) return res.status(304).end();
+
+        res.set({
+            'Content-Type': contentType,
+            'Content-Length': String(buffer.length),
+            'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
+            ETag: etag,
+        });
+        res.end(buffer);
+    } catch (err) {
+        console.error('getActivityImage error:', err.message);
+        if (err.kind === 'ObjectId') return res.status(404).end();
+        res.status(500).end();
     }
 };
 
