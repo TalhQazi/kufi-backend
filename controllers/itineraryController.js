@@ -29,6 +29,8 @@ const {
     SAME_AREA_RADIUS_KM,
     FLIGHT_THRESHOLD_KM,
     resolveLunchWindow,
+    parseTimeToMinutes,
+    minutesToTime,
 } = require('../utils/geo');
 const {
     planActivitiesAcrossDays,
@@ -680,15 +682,39 @@ function applyDaySchedule(days, controlPanel = {}) {
         const activityEndTime = override.endTime || cp.activityEndTime || '19:00';
         const { lunchStart, lunchEnd, durationMinutes } = resolveLunchWindow(cp, override);
 
-        const scheduled = real.map((act, index) => {
-            const { startTime, endTime } = getActivityTimeSlot(
-                index,
-                activityStartTime,
-                activityEndTime,
-                lunchStart,
-                lunchEnd
-            );
-            return { ...act, startTime, endTime };
+        // Pack the day sequentially from its start time, stepping over the lunch window
+        // and using each activity's real duration.
+        //
+        // The previous approach indexed into a fixed list of two-hour slots and wrapped
+        // with `index % slots.length`, so a day with more activities than slots handed
+        // two of them the *same* start time (both showing 08:00). Packing forwards can
+        // never collide.
+        const dayStart = parseTimeToMinutes(activityStartTime, 9 * 60);
+        const dayEnd = parseTimeToMinutes(activityEndTime, 19 * 60);
+        const breakStart = parseTimeToMinutes(lunchStart, null);
+        const breakEnd = parseTimeToMinutes(lunchEnd, null);
+        const hasBreak = durationMinutes > 0 && breakStart !== null && breakEnd !== null;
+
+        let cursor = dayStart;
+        const scheduled = real.map((act) => {
+            const length = Math.max(15, parseDurationMinutes(act.durationMinutes ?? act.duration));
+
+            // Never start inside the break, and never straddle it.
+            if (hasBreak && cursor < breakEnd && cursor + length > breakStart) {
+                cursor = breakEnd;
+            }
+
+            const startMinutes = cursor;
+            const endMinutes = startMinutes + length;
+            cursor = endMinutes;
+
+            return {
+                ...act,
+                startTime: minutesToTime(startMinutes),
+                // Clamp the visible end to the configured day end so a long final
+                // activity does not render as finishing after hours.
+                endTime: minutesToTime(Math.min(endMinutes, Math.max(dayEnd, startMinutes + 15))),
+            };
         });
 
         // A single break, on every day that actually has activities.

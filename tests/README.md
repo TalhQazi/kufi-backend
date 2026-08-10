@@ -30,6 +30,7 @@ node server.js
 node tests/integration/supplier-auth-security.probe.js
 node tests/integration/itinerary-controlpanel-geography.probe.js
 node tests/integration/adjustment-request.probe.js
+node tests/integration/overview-controlpanel.probe.js
 node tests/integration/day-boundaries.probe.js
 node tests/integration/lunch-duration.probe.js
 node tests/integration/activity-reorder.probe.js
@@ -44,6 +45,7 @@ node tests/integration/activities-sort-parity.probe.js   # read-only
 | `supplier-auth-security` | Supplier can submit/edit/delete only their own experiences; identity comes from the token; unauthenticated, invalid-token, wrong-role, duplicate and missing-field cases; booking and itinerary IDOR; change-password rules and session invalidation; reset-token hashing, expiry and single use; case-insensitive email; rate limiting |
 | `itinerary-controlpanel-geography` | Every Control Panel value survives generation (including `uplift = 0`); an unsaved control panel drives generation without being persisted; lunch breaks are marked and excluded from counts; generated days are geographically feasible |
 | `adjustment-request` | "Request Adjustment" reaches the supplier: accepted from both the booking id and the itinerary id, stored on the booking, the supplier is notified and the dashboard counts it; plus authorization and empty-card rejection |
+| `overview-controlpanel` | Settings made on the "Proceed to create itinerary" screen drive generation even when the request already has an itinerary record, and generation stays a preview (the stored copy is not overwritten) |
 | `day-boundaries` | `startOnArrival` / `endOnDeparture` actually change the plan on every generation path, and Save-as-Draft persists and lands the request in the Drafts tab |
 | `lunch-duration` | The lunch break is duration-driven, centred in the activity window, identical on every day, and absent when the duration is 0 |
 | `activity-reorder` | The admin up/down arrows: admin-only, input validation, `/reorder` is not shadowed by `/:id`, rows swap, orders come out sequential, the public listing reflects the change. Snapshots and restores the real ordering |
