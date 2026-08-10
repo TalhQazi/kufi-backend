@@ -88,6 +88,10 @@ const ItinerarySchema = new mongoose.Schema({
     controlPanel: {
         activityStartTime: { type: String, default: '09:00' },
         activityEndTime: { type: String, default: '19:00' },
+        // Lunch is configured as a duration only; the window is derived by centring it
+        // in the day's activity hours (see utils/geo.js resolveLunchWindow). The explicit
+        // start/end remain for legacy records and are kept in sync on every save.
+        lunchDurationMinutes: { type: Number, default: 60 },
         lunchStart: { type: String, default: '13:00' },
         lunchEnd: { type: String, default: '14:00' },
         startOnArrival: { type: Boolean, default: false },

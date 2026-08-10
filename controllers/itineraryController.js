@@ -28,8 +28,14 @@ const {
     parseDurationMinutes,
     SAME_AREA_RADIUS_KM,
     FLIGHT_THRESHOLD_KM,
+    resolveLunchWindow,
 } = require('../utils/geo');
-const { planActivitiesAcrossDays, repairItineraryGeography, describeTransfer } = require('../utils/itineraryGeoPlanner');
+const {
+    planActivitiesAcrossDays,
+    repairItineraryGeography,
+    describeTransfer,
+    enforceDayBoundaries,
+} = require('../utils/itineraryGeoPlanner');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -284,8 +290,9 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
 
         const activityStartTime = dayOverride.startTime || cp.activityStartTime || '09:00';
         const activityEndTime = dayOverride.endTime || cp.activityEndTime || '19:00';
-        const lunchStart = dayOverride.lunchStart || cp.lunchStart || '13:00';
-        const lunchEnd = dayOverride.lunchEnd || cp.lunchEnd || '14:00';
+        // Centred in the day's activity window from the configured duration, so the same
+        // setting applies consistently to every day.
+        const { lunchStart, lunchEnd } = resolveLunchWindow(cp, dayOverride);
 
         const transfer = transfers.get(dayIdx);
         if (transfer) {
@@ -319,18 +326,8 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
             });
         });
 
-        // A lunch placeholder keeps the timeline readable. It carries the canonical
-        // `isBreak` marker so it is never counted as an activity anywhere.
-        if (days[dayIdx].activities.length > 0) {
-            days[dayIdx].activities.push(
-                buildBreakEntry({
-                    title: 'Lunch Break',
-                    description: 'Time set aside for lunch.',
-                    startTime: lunchStart,
-                    endTime: lunchEnd,
-                })
-            );
-        }
+        // The lunch break is added centrally by applyDaySchedule, so every generation
+        // path ends up with exactly one break at the configured window.
     });
 
     return days;
@@ -654,6 +651,60 @@ async function fetchActivitiesForDestination(country, city) {
         .lean();
 }
 
+/**
+ * Impose the Control Panel's daily schedule on a finished plan.
+ *
+ * Runs on every generation path — AI, database template and built-from-catalogue — so the
+ * supplier's settings are always what the itinerary reflects. Previously only the
+ * built-from-catalogue path consulted them: a cloned template kept whatever times and
+ * lunch break the *original* itinerary had, which is why changing the activity hours or
+ * the lunch duration appeared to do nothing.
+ *
+ * For each day it:
+ *   - re-slots the real activities into the configured activity window, and
+ *   - replaces any break entries with exactly one lunch break at the derived window
+ *     (or none at all when the duration is zero).
+ */
+function applyDaySchedule(days, controlPanel = {}) {
+    const cp = controlPanel?.toObject ? controlPanel.toObject() : (controlPanel || {});
+
+    return (Array.isArray(days) ? days : []).map((day) => {
+        const item = day?.toObject ? day.toObject() : day;
+        const entries = Array.isArray(item?.activities) ? item.activities : [];
+        const real = entries.filter((a) => !isBreakEntry(a));
+
+        if (real.length === 0) return { ...item, activities: [] };
+
+        const override = (cp.perDayOverrides || []).find((o) => o.date === item.date) || {};
+        const activityStartTime = override.startTime || cp.activityStartTime || '09:00';
+        const activityEndTime = override.endTime || cp.activityEndTime || '19:00';
+        const { lunchStart, lunchEnd, durationMinutes } = resolveLunchWindow(cp, override);
+
+        const scheduled = real.map((act, index) => {
+            const { startTime, endTime } = getActivityTimeSlot(
+                index,
+                activityStartTime,
+                activityEndTime,
+                lunchStart,
+                lunchEnd
+            );
+            return { ...act, startTime, endTime };
+        });
+
+        // A single break, on every day that actually has activities.
+        const breaks = durationMinutes > 0
+            ? [buildBreakEntry({
+                title: 'Lunch Break',
+                description: 'Time set aside for lunch.',
+                startTime: lunchStart,
+                endTime: lunchEnd,
+            })]
+            : [];
+
+        return { ...item, activities: [...scheduled, ...breaks] };
+    });
+}
+
 /** Normalize day metadata without dropping empty departure/arrival days. */
 function normalizeTripDays(days) {
     if (!Array.isArray(days) || days.length === 0) return days;
@@ -703,7 +754,16 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         ? itinerary.controlPanel.toObject()
         : (itinerary.controlPanel || {});
 
-    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(days, {
+    // The arrival/departure toggles are enforced here rather than inside one generator.
+    // The template-clone path copies days from an older itinerary and never consulted
+    // them, so flipping "Start activities on arrival day" used to change nothing.
+    const { days: boundedDays, changed: boundariesChanged } = enforceDayBoundaries(days, {
+        controlPanel,
+        origin: hotelCoords,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+    });
+
+    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(boundedDays, {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -711,7 +771,9 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
 
     const finalValidation = repaired ? repairedValidation : validation;
 
-    itinerary.days = normalizeTripDays(safeDays);
+    // Impose the Control Panel's activity hours and lunch break, whichever generator
+    // produced these days.
+    itinerary.days = normalizeTripDays(applyDaySchedule(safeDays, controlPanel));
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
@@ -722,6 +784,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     await itinerary.populate('controlPanel.hotelId');
     return resPayload(itinerary, source, persist, {
         geographyRepaired: repaired,
+        dayBoundariesEnforced: boundariesChanged,
         geographyIssues: finalValidation.issues,
         dayReports: finalValidation.dayReports,
     }, budget);
@@ -763,10 +826,10 @@ exports.generateItinerary = async (req, res) => {
                     ? incoming.hotelId
                     : null;
             }
-            itinerary.set('controlPanel', {
+            itinerary.set('controlPanel', normalizeControlPanel({
                 ...(itinerary.controlPanel?.toObject ? itinerary.controlPanel.toObject() : itinerary.controlPanel || {}),
                 ...incoming,
-            });
+            }));
         }
         if (req.body?.startDate) itinerary.startDate = req.body.startDate;
         if (req.body?.endDate) itinerary.endDate = req.body.endDate;
@@ -988,7 +1051,7 @@ Mandatory Constraints:
 2. MANDATORY ICONIC LANDMARKS RULE: You MUST unconditionally include famous landmark attractions of the destination (e.g. Pyramids of Giza, Great Sphinx, Egyptian Museum for Cairo/Egypt; Karnak Temple, Valley of the Kings for Luxor; Burj Khalifa for Dubai; etc.) in the itinerary.
 3. Activity start time each day: ${cp.activityStartTime || '09:00'}
 4. Activity end time each day: ${cp.activityEndTime || '19:00'}
-5. Lunch break: ${cp.lunchStart || '13:00'} to ${cp.lunchEnd || '14:00'}. Leave this window free. If you include a lunch/rest placeholder it MUST be marked "isBreak": true and "category": "break" — it is not an activity and must never be given a price or an activityId.
+5. Lunch break: ${resolveLunchWindow(cp).lunchStart} to ${resolveLunchWindow(cp).lunchEnd} on EVERY day. Leave this window free. If you include a lunch/rest placeholder it MUST be marked "isBreak": true and "category": "break" — it is not an activity and must never be given a price or an activityId.
 6. Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
 7. Last day (Day ${tripDays}) is departure day — always include departureNote.${overridesPrompt}
 8. You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days.${budgetRulePrompt}
@@ -1128,6 +1191,23 @@ ${day1Example},
     }
 };
 
+
+/**
+ * Normalize a control panel before it is stored.
+ *
+ * Lunch is configured as a duration; the concrete window is derived by centring it in the
+ * day's activity hours. Persisting the derived start/end keeps every existing reader
+ * (traveller itinerary view, payment totals, older records) working unchanged.
+ */
+function normalizeControlPanel(cp = {}) {
+    const next = { ...cp };
+    const { lunchStart, lunchEnd, durationMinutes } = resolveLunchWindow(next);
+    next.lunchDurationMinutes = durationMinutes;
+    next.lunchStart = lunchStart;
+    next.lunchEnd = lunchEnd;
+    return next;
+}
+
 // ─── SAVE control panel ──────────────────────────────────────────────────────
 
 exports.saveControlPanel = async (req, res) => {
@@ -1138,9 +1218,10 @@ exports.saveControlPanel = async (req, res) => {
         if (!existing) return;
 
         const { startDate, endDate, ...cpFields } = req.body || {};
+        const base = existing.controlPanel?.toObject ? existing.controlPanel.toObject() : (existing.controlPanel || {});
         const updateFields = {
             updatedAt: new Date(),
-            controlPanel: { ...((existing.controlPanel || {})), ...cpFields }
+            controlPanel: normalizeControlPanel({ ...base, ...cpFields })
         };
         if (startDate !== undefined) updateFields.startDate = startDate;
         if (endDate !== undefined) updateFields.endDate = endDate;
@@ -1179,7 +1260,7 @@ function buildBuilderStateUpdate(body, existingControlPanel) {
         const base = existingControlPanel
             ? (existingControlPanel.toObject ? existingControlPanel.toObject() : existingControlPanel)
             : {};
-        update.controlPanel = { ...base, ...cpFields };
+        update.controlPanel = normalizeControlPanel({ ...base, ...cpFields });
 
         // The control panel is the source of truth for trip dates when the caller
         // did not send them at the top level.

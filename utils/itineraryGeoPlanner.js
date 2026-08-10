@@ -228,6 +228,109 @@ function planActivitiesAcrossDays(activities, {
 }
 
 /**
+ * Which day indices are allowed to hold activities.
+ *
+ * The arrival and departure days are opt-in/opt-out via the Control Panel:
+ *   startOnArrival  false -> day 1 stays free (transfer only)
+ *   endOnDeparture  false -> the last day stays free
+ *
+ * A single-day trip is always active — blanking it would produce an empty itinerary.
+ */
+function allowedDayIndices(dayCount, controlPanel = {}) {
+    if (dayCount <= 0) return [];
+    if (dayCount === 1) return [0];
+
+    const startOnArrival = controlPanel.startOnArrival === true;
+    const endOnDeparture = controlPanel.endOnDeparture !== false; // defaults to true
+
+    const allowed = [];
+    for (let i = 0; i < dayCount; i++) {
+        if (i === 0 && !startOnArrival) continue;
+        if (i === dayCount - 1 && !endOnDeparture) continue;
+        allowed.push(i);
+    }
+    // Every day was excluded (a 2-day trip with both toggles off) — fall back to all of
+    // them rather than returning a plan with nothing in it.
+    return allowed.length > 0 ? allowed : Array.from({ length: dayCount }, (_, i) => i);
+}
+
+/**
+ * Enforce the arrival/departure rules on an already-generated plan.
+ *
+ * This has to run on the result, not just inside one generator: the template-clone path
+ * copies days wholesale from an older itinerary and never consulted these toggles, so
+ * flipping "Start activities on arrival day" changed nothing at all.
+ *
+ * When the current layout violates the rules, every real activity is pooled and
+ * redistributed across the allowed days through the same geographic planner, so the
+ * result stays grouped by area and within each day's time budget. Breaks stay on days
+ * that remain active and are dropped from days that must now be empty.
+ *
+ * @returns {{ days: Array, changed: boolean }}
+ */
+function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDay = 3 } = {}) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    if (list.length === 0) return { days: list, changed: false };
+
+    const allowed = allowedDayIndices(list.length, controlPanel);
+    const allowedSet = new Set(allowed);
+
+    const realOn = (day) => (Array.isArray(day?.activities) ? day.activities : []).filter((a) => !isBreakEntry(a));
+
+    // Violation 1: activities sitting on a day that must be free.
+    const misplaced = list.some((day, i) => !allowedSet.has(i) && realOn(day).length > 0);
+
+    // Violation 2: a day that is now allowed sits empty while another allowed day holds
+    // more than one activity — i.e. there is work that could move into it.
+    const emptyAllowed = allowed.filter((i) => realOn(list[i]).length === 0);
+    const spare = allowed.some((i) => realOn(list[i]).length > 1);
+    const underfilled = emptyAllowed.length > 0 && spare;
+
+    if (!misplaced && !underfilled) return { days: list, changed: false };
+
+    const pooled = [];
+    const breaksByDay = new Map();
+    list.forEach((day, index) => {
+        const entries = Array.isArray(day?.activities) ? day.activities : [];
+        const breaks = entries.filter(isBreakEntry);
+        if (breaks.length && allowedSet.has(index)) breaksByDay.set(index, breaks);
+        entries.filter((e) => !isBreakEntry(e)).forEach((e) => pooled.push(e));
+    });
+
+    if (pooled.length === 0) return { days: list, changed: false };
+
+    const activeDays = allowed.map((index) => ({ index, date: list[index]?.date || '' }));
+    const { assignments, transfers } = planActivitiesAcrossDays(pooled, {
+        activeDays,
+        controlPanel,
+        origin,
+        maxPerDay: Math.max(maxPerDay, Math.ceil(pooled.length / activeDays.length)),
+    });
+
+    const rebuilt = list.map((day, index) => {
+        if (!allowedSet.has(index)) {
+            // Must be free: strip activities and breaks, and explain why.
+            const isArrival = index === 0;
+            const isDeparture = index === list.length - 1;
+            return {
+                ...day,
+                activities: [],
+                ...(isArrival ? { arrivalNote: day.arrivalNote || 'Arrival Day — Free day. Airport to hotel transfer provided.' } : {}),
+                ...(isDeparture ? { departureNote: day.departureNote || 'Departure Day — Hotel to airport transfer provided.' } : {}),
+            };
+        }
+        const transfer = transfers.get(index);
+        return {
+            ...day,
+            activities: [...(assignments.get(index) || []), ...(breaksByDay.get(index) || [])],
+            ...(transfer ? { transferNote: describeTransfer(transfer), transfer } : {}),
+        };
+    });
+
+    return { days: rebuilt, changed: true };
+}
+
+/**
  * Post-generation repair. Validates the produced days and, when they are not
  * geographically feasible, redistributes the same activities into a plan that is.
  *
@@ -303,6 +406,8 @@ function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxP
 module.exports = {
     clusterName,
     describeTransfer,
+    allowedDayIndices,
+    enforceDayBoundaries,
     allocateDaysToClusters,
     planActivitiesAcrossDays,
     repairItineraryGeography,

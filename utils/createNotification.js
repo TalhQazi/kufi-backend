@@ -133,6 +133,20 @@ const NOTIFICATION_PRESETS = {
         title: 'Cancelled',
         message: 'Your trip request has been cancelled.',
     },
+    // Addressed to the SUPPLIER, not the traveller: the traveller has asked for a change
+    // to an itinerary that was already sent, and the supplier has to act on it. Without
+    // this the adjustment sat silently on the booking and was only discovered by chance.
+    adjustment_requested: {
+        type: 'adjustment_requested',
+        title: 'Adjustment Requested',
+        message: 'A traveller has requested an adjustment to their itinerary.',
+    },
+    // Confirmation back to the traveller, so they can see the request was actually sent.
+    adjustment_sent: {
+        type: 'adjustment_sent',
+        title: 'Adjustment Request Sent',
+        message: 'Your adjustment request has been sent to your travel partner.',
+    },
 };
 
 async function notifyPreset(presetKey, { userId, bookingId, itineraryId, message, destination, sendEmailNotify = true, emailTo } = {}) {

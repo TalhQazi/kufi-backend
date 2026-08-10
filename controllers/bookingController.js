@@ -449,10 +449,29 @@ exports.updateBookingAdjustment = async (req, res) => {
         const card = req.body?.card;
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({ message: 'Invalid booking id' });
+            return res.status(400).json({ message: 'Invalid id' });
         }
 
-        const existing = await Booking.findById(id).select('user supplier').lean();
+        const hasContent = card && typeof card === 'object' &&
+            [card.title, card.description, card.location, card.cost, card.imageDataUrl]
+                .some((v) => String(v || '').trim());
+        if (!hasContent) {
+            return res.status(400).json({ message: 'Describe the change you would like before sending.' });
+        }
+
+        // The traveller can reach this from two places: their request list (which knows
+        // the booking id) and their itinerary history (which only knows the itinerary
+        // id). Accept either — sending the itinerary id used to 404, and the client
+        // swallowed it, so the traveller was told the request had been sent when nothing
+        // had been saved at all.
+        let existing = await Booking.findById(id).select('user supplier tripDetails').lean();
+        if (!existing) {
+            const itinerary = await mongoose.model('Itinerary').findById(id)
+                .select('bookingId userId supplierId destination').lean();
+            if (itinerary?.bookingId) {
+                existing = await Booking.findById(itinerary.bookingId).select('user supplier tripDetails').lean();
+            }
+        }
         if (!existing) return res.status(404).json({ message: 'Booking not found' });
         if (!canAccessBooking(existing, req.user)) {
             return res.status(403).json({ message: 'Access denied' });
@@ -463,8 +482,36 @@ exports.updateBookingAdjustment = async (req, res) => {
             adjustmentRequestedAt: new Date(),
         };
 
-        const booking = await Booking.findByIdAndUpdate(id, update, { new: true }).lean();
+        const booking = await Booking.findByIdAndUpdate(existing._id, update, { new: true }).lean();
         if (!booking) return res.status(404).json({ message: 'Booking not found' });
+
+        // Tell the supplier. The card alone is invisible until they happen to open the
+        // right tab, which is why adjustment requests appeared to go nowhere.
+        try {
+            const destination = booking.tripDetails?.country || 'their trip';
+            if (booking.supplier) {
+                const supplier = await User.findById(booking.supplier).select('email').lean();
+                await notifyPreset('adjustment_requested', {
+                    userId: booking.supplier,
+                    bookingId: booking._id,
+                    destination,
+                    sendEmailNotify: Boolean(supplier?.email),
+                    emailTo: supplier?.email,
+                    message: `A traveller has requested an adjustment to their ${destination} itinerary: ${String(card.title || card.description || '').slice(0, 140)}`,
+                });
+            }
+            // Confirm back to the traveller so the request is visible in their own feed.
+            if (booking.user) {
+                await notifyPreset('adjustment_sent', {
+                    userId: booking.user,
+                    bookingId: booking._id,
+                    destination,
+                    sendEmailNotify: false,
+                });
+            }
+        } catch (notifErr) {
+            console.error('Error notifying adjustment request:', notifErr?.message || notifErr);
+        }
 
         res.json(booking);
     } catch (err) {

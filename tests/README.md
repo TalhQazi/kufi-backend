@@ -29,6 +29,9 @@ node server.js
 # terminal 2
 node tests/integration/supplier-auth-security.probe.js
 node tests/integration/itinerary-controlpanel-geography.probe.js
+node tests/integration/adjustment-request.probe.js
+node tests/integration/day-boundaries.probe.js
+node tests/integration/lunch-duration.probe.js
 node tests/integration/activity-reorder.probe.js
 node tests/integration/uplift-effect.probe.js            # add --ai for real OpenAI calls
 node tests/integration/uplift-zero-budget.probe.js
@@ -40,6 +43,9 @@ node tests/integration/activities-sort-parity.probe.js   # read-only
 | --- | --- |
 | `supplier-auth-security` | Supplier can submit/edit/delete only their own experiences; identity comes from the token; unauthenticated, invalid-token, wrong-role, duplicate and missing-field cases; booking and itinerary IDOR; change-password rules and session invalidation; reset-token hashing, expiry and single use; case-insensitive email; rate limiting |
 | `itinerary-controlpanel-geography` | Every Control Panel value survives generation (including `uplift = 0`); an unsaved control panel drives generation without being persisted; lunch breaks are marked and excluded from counts; generated days are geographically feasible |
+| `adjustment-request` | "Request Adjustment" reaches the supplier: accepted from both the booking id and the itinerary id, stored on the booking, the supplier is notified and the dashboard counts it; plus authorization and empty-card rejection |
+| `day-boundaries` | `startOnArrival` / `endOnDeparture` actually change the plan on every generation path, and Save-as-Draft persists and lands the request in the Drafts tab |
+| `lunch-duration` | The lunch break is duration-driven, centred in the activity window, identical on every day, and absent when the duration is 0 |
 | `activity-reorder` | The admin up/down arrows: admin-only, input validation, `/reorder` is not shadowed by `/:id`, rows swap, orders come out sequential, the public listing reflects the change. Snapshots and restores the real ordering |
 | `uplift-effect` | Changing the budget uplift actually changes the generated plan, on both the template and AI paths. Use `PROBE_BUDGET=100` for a budget tight enough that the ceiling binds |
 | `uplift-zero-budget` | What `uplift = 0` does to the activity ceiling, including the case where hotel and custom costs consume the whole budget and the ceiling collapses to $0 |

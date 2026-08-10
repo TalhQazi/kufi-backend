@@ -225,23 +225,78 @@ function orderClustersByRoute(clusters, origin = null) {
     return ordered;
 }
 
+const DEFAULT_LUNCH_MINUTES = Number(process.env.ITINERARY_LUNCH_MINUTES) || 60;
+
+const parseTimeToMinutes = (value, fallback = null) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+    if (!m) return fallback;
+    return Number(m[1]) * 60 + Number(m[2]);
+};
+
+const minutesToTime = (mins) => {
+    const clamped = ((Math.round(mins) % 1440) + 1440) % 1440;
+    return `${String(Math.floor(clamped / 60)).padStart(2, '0')}:${String(clamped % 60).padStart(2, '0')}`;
+};
+
+/**
+ * Where lunch falls on a given day.
+ *
+ * The supplier now configures a *duration* only — a start time was one more thing to keep
+ * consistent with the activity window, and getting it wrong silently produced days where
+ * lunch sat outside working hours. The break is instead centred in the day's activity
+ * window and applies to every day, so it always lands somewhere sensible:
+ *
+ *   09:00–19:00, 60 min  ->  13:30–14:30
+ *   08:00–18:00, 60 min  ->  12:30–13:30
+ *   09:00–19:00, 90 min  ->  13:15–14:45
+ *
+ * Legacy records that still carry explicit lunchStart/lunchEnd keep working: their stored
+ * span is used as the duration when no explicit duration is set.
+ *
+ * @returns {{ startMinutes, endMinutes, durationMinutes, lunchStart, lunchEnd }}
+ */
+function resolveLunchWindow(controlPanel = {}, override = {}) {
+    const dayStart = parseTimeToMinutes(override.startTime || controlPanel.activityStartTime, 9 * 60);
+    const dayEnd = parseTimeToMinutes(override.endTime || controlPanel.activityEndTime, 19 * 60);
+
+    // Duration: explicit setting first, then the span of any legacy start/end pair.
+    let duration = Number(
+        override.lunchDurationMinutes ?? controlPanel.lunchDurationMinutes
+    );
+    if (!Number.isFinite(duration) || duration < 0) {
+        const legacyStart = parseTimeToMinutes(override.lunchStart || controlPanel.lunchStart, null);
+        const legacyEnd = parseTimeToMinutes(override.lunchEnd || controlPanel.lunchEnd, null);
+        duration = legacyStart !== null && legacyEnd !== null && legacyEnd > legacyStart
+            ? legacyEnd - legacyStart
+            : DEFAULT_LUNCH_MINUTES;
+    }
+
+    const window = Math.max(0, dayEnd - dayStart);
+    // A break can never be longer than the working day.
+    duration = Math.max(0, Math.min(duration, window));
+
+    // Centre it, rounded down to a quarter hour so the times read cleanly.
+    const midpoint = dayStart + Math.floor(window / 2);
+    let startMinutes = Math.floor((midpoint - Math.floor(duration / 2)) / 15) * 15;
+    startMinutes = Math.max(dayStart, Math.min(startMinutes, dayEnd - duration));
+
+    return {
+        startMinutes,
+        endMinutes: startMinutes + duration,
+        durationMinutes: duration,
+        lunchStart: minutesToTime(startMinutes),
+        lunchEnd: minutesToTime(startMinutes + duration),
+    };
+}
+
 /** Maximum bookable minutes in a day, honouring the control panel window and lunch. */
 function dayCapacityMinutes(controlPanel = {}, override = {}) {
-    const toMin = (t, fallback) => {
-        const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '').trim());
-        if (!m) return fallback;
-        return Number(m[1]) * 60 + Number(m[2]);
-    };
-    const start = toMin(override.startTime || controlPanel.activityStartTime, 9 * 60);
-    const end = toMin(override.endTime || controlPanel.activityEndTime, 19 * 60);
-    const lunchStart = toMin(override.lunchStart || controlPanel.lunchStart, 13 * 60);
-    const lunchEnd = toMin(override.lunchEnd || controlPanel.lunchEnd, 14 * 60);
+    const start = parseTimeToMinutes(override.startTime || controlPanel.activityStartTime, 9 * 60);
+    const end = parseTimeToMinutes(override.endTime || controlPanel.activityEndTime, 19 * 60);
+    const { durationMinutes } = resolveLunchWindow(controlPanel, override);
 
     const window = Math.max(0, end - start);
-    const lunch = lunchEnd > lunchStart && lunchStart >= start && lunchEnd <= end
-        ? lunchEnd - lunchStart
-        : 0;
-    return Math.max(0, window - lunch);
+    return Math.max(0, window - durationMinutes);
 }
 
 /**
@@ -335,5 +390,9 @@ module.exports = {
     clusterByGeography,
     orderClustersByRoute,
     dayCapacityMinutes,
+    resolveLunchWindow,
+    parseTimeToMinutes,
+    minutesToTime,
+    DEFAULT_LUNCH_MINUTES,
     validateItineraryGeography,
 };
