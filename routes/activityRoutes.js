@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getActivities, getActivityById, createActivity, seedActivities, updateActivity, deleteActivity, reorderActivities } = require('../controllers/activityController');
+const { getActivities, getActivityById, createActivity, seedActivities, updateActivity, deleteActivity, reorderActivities, getActivityImage } = require('../controllers/activityController');
 const auth = require('../middleware/auth');
 const cache = require('../middleware/cache');
 
@@ -19,6 +19,12 @@ router.get('/:id', cache(600), getActivityById); // Cache for 10 minutes
 // @desc    Create an activity
 // @access  Private (Admin)
 router.post('/', auth(['admin']), createActivity);
+
+// @route   GET api/activities/:id/image
+// @desc    Cover image as cacheable binary. The itinerary generator stores this URL
+//          instead of embedding base64 into every day entry.
+// @access  Public
+router.get('/:id/image', getActivityImage);
 
 // @route   PUT api/activities/reorder
 // @desc    Bulk-update display order. Declared before '/:id' so it is not shadowed.

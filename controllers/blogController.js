@@ -1,4 +1,5 @@
 const Blog = require('../models/Blog');
+const { resolveImageMime } = require('../utils/imageType');
 
 const sanitizeBlogPayload = (body) => {
   const next = { ...(body || {}) };
@@ -118,8 +119,10 @@ exports.getBlogImage = async (req, res) => {
       return res.status(404).end();
     }
 
-    const [, contentType, base64] = match;
+    const [, declaredType, base64] = match;
     const buffer = Buffer.from(base64, 'base64');
+    // Uploads often recorded 'application/octet-stream'; the bytes are authoritative.
+    const contentType = resolveImageMime(buffer, declaredType);
     // Content is immutable for a given blog version; ETag lets the browser revalidate
     // with a 304 instead of re-downloading.
     const etag = `W/"${blog._id}-${new Date(blog.updatedAt || 0).getTime()}"`;

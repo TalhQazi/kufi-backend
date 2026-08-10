@@ -24,6 +24,7 @@ const {
 } = require('../utils/activityClassification');
 const {
     getCoordinates,
+    clusterByGeography,
     validateItineraryGeography,
     parseDurationMinutes,
     SAME_AREA_RADIUS_KM,
@@ -206,8 +207,112 @@ function enforceActivityBudget(days, maxActivityBudget) {
     });
 }
 
+/**
+ * Where an activity's cover image lives.
+ *
+ * Day entries store this path rather than the base64 blob. Embedding the image made a
+ * generated itinerary average 852KB (the largest was 7.1MB for 13 activities), and the
+ * same picture was duplicated into every itinerary that used the activity.
+ */
+function activityImageUrl(activityId) {
+    return activityId ? `/api/activities/${activityId}/image` : '';
+}
+
 /** Upper bound on real activities in a single day, before time budgeting narrows it further. */
 const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 3;
+
+/**
+ * How many catalogue rows are offered to the model.
+ *
+ * The catalogue was ~85% of the prompt (104 rows ≈ 5,700 of 6,749 input tokens for one
+ * Egypt trip) while a 7-day itinerary can only use ~20 of them. Offering a well-chosen
+ * shortlist costs a fraction and produces the same plan.
+ */
+const AI_CATALOGUE_LIMIT = Number(process.env.ITINERARY_AI_CATALOGUE_LIMIT) || 45;
+
+/**
+ * Pick the activities worth showing the model.
+ *
+ * Naively slicing the list would silently drop whole destinations — Cairo has far more
+ * rows than Luxor or Aswan, so the top 45 by rating would be all-Cairo and a multi-city
+ * trip could never be planned. Instead the catalogue is clustered geographically and
+ * drawn from round-robin, so every base stays represented.
+ *
+ * Activities that cannot fit the budget ceiling on their own are dropped first: the model
+ * can never legitimately use them.
+ */
+function selectCatalogueForPrompt(activities, { limit = AI_CATALOGUE_LIMIT, activityBudget, required = [] } = {}) {
+    const list = (Array.isArray(activities) ? activities : []).filter(Boolean);
+    if (list.length <= limit) return list;
+
+    const requiredIds = new Set((required || []).map((a) => String(a?._id)).filter(Boolean));
+
+    const affordable = list.filter((a) => {
+        if (requiredIds.has(String(a._id))) return true;
+        if (typeof activityBudget !== 'number') return true;
+        return (Number(a.price) || 0) <= activityBudget;
+    });
+
+    const clusters = clusterByGeography(affordable).map((c) => ({
+        ...c,
+        // Best first within each area.
+        items: [...c.items].sort((a, b) => (Number(b.rating) || 0) - (Number(a.rating) || 0)),
+    }));
+
+    // Anything the traveler explicitly asked for is never dropped.
+    const picked = affordable.filter((a) => requiredIds.has(String(a._id)));
+    const seen = new Set(picked.map((a) => String(a._id)));
+
+    let cursor = 0;
+    while (picked.length < limit) {
+        let addedThisPass = false;
+        for (const cluster of clusters) {
+            if (picked.length >= limit) break;
+            const next = cluster.items[cursor];
+            if (!next) continue;
+            const key = String(next._id);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            picked.push(next);
+            addedThisPass = true;
+        }
+        if (!addedThisPass) break;
+        cursor += 1;
+    }
+
+    return picked;
+}
+
+/**
+ * Render the shortlist for the prompt.
+ *
+ * Deliberately terse. Each row used to carry a 24-character hex ObjectId (~12 tokens on
+ * its own) plus a `location` that was identical on every row. Short `#N` handles are
+ * mapped back to real ids server-side, coordinates are rounded to 2dp (~1km, ample for a
+ * 60km grouping rule), and the redundant location is omitted.
+ */
+function buildCataloguePrompt(shortlist, { destination = '' } = {}) {
+    const indexToActivity = new Map();
+
+    const lines = shortlist.map((a, i) => {
+        const handle = i + 1;
+        indexToActivity.set(handle, a);
+
+        const c = getCoordinates(a);
+        const place = String(a.city || a.location || '').trim();
+        const parts = [`#${handle} ${a.title}`];
+        if (c) parts.push(`${c.lat.toFixed(2)},${c.lng.toFixed(2)}`);
+        // Only worth sending when it distinguishes this row from the destination itself.
+        if (place && place.toLowerCase() !== String(destination).toLowerCase()) parts.push(place);
+        parts.push(String(a.duration || '2h').replace(/\s*hours?/i, 'h').replace(/\s*mins?/i, 'm'));
+        parts.push(`$${Number(a.price) || 0}`);
+        if (a.category) parts.push(String(a.category).toLowerCase());
+
+        return parts.join(' | ');
+    });
+
+    return { text: lines.join('\n'), indexToActivity };
+}
 
 function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined, { hotelCoords = null } = {}) {
     const cp = itinerary.controlPanel || {};
@@ -322,7 +427,7 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
                 endTime,
                 price: Number(act.price) || 0,
                 category: act.category || 'general',
-                image: act.image || '',
+                image: activityImageUrl(act._id),
                 isBreak: false,
                 isSupplierOnly: true,
             });
@@ -375,6 +480,8 @@ function hydrateDayActivities(days, catalogue) {
                 return {
                     ...act,
                     activityId: linkedId || String(match._id),
+                    // Replace any inherited base64 blob with the URL form.
+                    image: activityImageUrl(linkedId || match._id),
                     coordinates: coords || act.coordinates,
                     duration: act.duration || match.duration,
                     location: act.location || match.location || match.city,
@@ -647,10 +754,103 @@ async function fetchActivitiesForDestination(country, city) {
     if (city) orClause.push({ location: new RegExp(escapeRegExp(city), 'i') });
     if (orClause.length) query.$or = orClause;
     return Activity.find(query)
-        // `coordinates` drives geographic grouping. `images` is dropped: it was never
-        // read here and is a base64 array, so selecting it pulled megabytes per request.
-        .select('_id title description duration price category location country city image coordinates rating reviews highlights')
+        // `coordinates` drives geographic grouping. `image`/`images` are deliberately NOT
+        // selected: they are base64 (86% of this query's bytes) and day entries reference
+        // the image by URL instead of embedding it.
+        .select('_id title description duration price category location country city coordinates rating reviews highlights')
         .lean();
+}
+
+/**
+ * Turn the model's reply into day objects.
+ *
+ * The compact format is `[{ day, ids:[#n], custom:[{title,...}] }]`. `response_format:
+ * json_object` means the reply is an object, so the array may be wrapped under any key.
+ *
+ * The previous verbose shape (full activity objects per day) is still accepted, so a
+ * model that ignores the instruction — or a cached/older response — does not break
+ * generation.
+ *
+ * @returns {Array} days in the shape the enrichment step expects
+ */
+function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
+    const raw = String(rawContent || '').trim();
+    const cleaned = raw.startsWith('[') || raw.startsWith('{')
+        ? raw
+        : raw.replace(/```json\n?/i, '').replace(/```\n?$/, '').trim();
+
+    const parsed = JSON.parse(cleaned);
+
+    // Unwrap. `json_object` mode forces an object reply, and the wrapper key varies, so
+    // several shapes have to be tolerated. The generic search only accepts arrays that
+    // actually look like days — otherwise a reply of `{"day":1,"ids":[]}` would have its
+    // `ids` array mistaken for the day list and produce an empty itinerary.
+    const looksLikeDayList = (v) =>
+        Array.isArray(v) && v.length > 0 && v.every(
+            (e) => e && typeof e === 'object' && !Array.isArray(e) &&
+                ('ids' in e || 'activityIds' in e || 'activities' in e || 'day' in e)
+        );
+
+    let list = null;
+    if (looksLikeDayList(parsed)) list = parsed;
+    else if (looksLikeDayList(parsed?.days)) list = parsed.days;
+    else if (looksLikeDayList(parsed?.itinerary)) list = parsed.itinerary;
+    else list = Object.values(parsed || {}).find(looksLikeDayList) || null;
+
+    // A bare single day object is a valid (if unhelpful) reply — treat it as a one-item list.
+    if (!list && parsed && typeof parsed === 'object' && ('ids' in parsed || 'activities' in parsed)) {
+        list = [parsed];
+    }
+
+    if (!Array.isArray(list) || list.length === 0) {
+        throw new Error('AI reply did not contain a usable day array');
+    }
+    if (tripDays) list = list.slice(0, tripDays);
+
+    return list.map((entry, idx) => {
+        const day = entry || {};
+
+        // Verbose shape: activities already spelled out.
+        if (Array.isArray(day.activities)) {
+            return { ...day, day: idx + 1 };
+        }
+
+        // Compact shape: resolve #numbers back to catalogue activities.
+        const ids = Array.isArray(day.ids) ? day.ids : (Array.isArray(day.activityIds) ? day.activityIds : []);
+        const fromCatalogue = ids
+            .map((n) => indexToActivity.get(Number(String(n).replace('#', ''))))
+            .filter(Boolean)
+            .map((act) => ({
+                activityId: String(act._id),
+                title: act.title,
+                description: act.description,
+                location: act.location || act.city,
+                coordinates: getCoordinates(act) || undefined,
+                duration: act.duration,
+                price: Number(act.price) || 0,
+                category: act.category || 'general',
+                image: activityImageUrl(act._id),
+                isBreak: false,
+                isSupplierOnly: true,
+            }));
+
+        const custom = (Array.isArray(day.custom) ? day.custom : [])
+            .filter((c) => String(c?.title || '').trim())
+            .map((c) => ({
+                activityId: null,
+                title: String(c.title).trim(),
+                description: String(c.description || '').trim(),
+                location: String(c.location || '').trim(),
+                duration: c.duration || undefined,
+                price: Number(c.price) || 0,
+                category: String(c.category || 'general').toLowerCase(),
+                image: '',
+                isBreak: false,
+                isSupplierOnly: true,
+            }));
+
+        return { day: idx + 1, activities: [...fromCatalogue, ...custom] };
+    });
 }
 
 /**
@@ -667,17 +867,23 @@ async function fetchActivitiesForDestination(country, city) {
  *   - replaces any break entries with exactly one lunch break at the derived window
  *     (or none at all when the duration is zero).
  */
-function applyDaySchedule(days, controlPanel = {}) {
+function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
     const cp = controlPanel?.toObject ? controlPanel.toObject() : (controlPanel || {});
+    const start = toDateString(tripStartDate);
 
-    return (Array.isArray(days) ? days : []).map((day) => {
+    return (Array.isArray(days) ? days : []).map((day, idx) => {
         const item = day?.toObject ? day.toObject() : day;
         const entries = Array.isArray(item?.activities) ? item.activities : [];
         const real = entries.filter((a) => !isBreakEntry(a));
 
         if (real.length === 0) return { ...item, activities: [] };
 
-        const override = (cp.perDayOverrides || []).find((o) => o.date === item.date) || {};
+        // The calendar date has to be derived here, not read off the day: per-day
+        // overrides are keyed by date, and dates are only stamped later by
+        // normalizeTripDays. On the AI path the day carried no date at all, so overrides
+        // silently matched nothing.
+        const date = (start ? addDays(start, idx) : '') || toDateString(item.date) || item.date || '';
+        const override = (cp.perDayOverrides || []).find((o) => o.date === date) || {};
         const activityStartTime = override.startTime || cp.activityStartTime || '09:00';
         const activityEndTime = override.endTime || cp.activityEndTime || '19:00';
         const { lunchStart, lunchEnd, durationMinutes } = resolveLunchWindow(cp, override);
@@ -731,9 +937,17 @@ function applyDaySchedule(days, controlPanel = {}) {
     });
 }
 
-/** Normalize day metadata without dropping empty departure/arrival days. */
-function normalizeTripDays(days) {
+/**
+ * Normalize day metadata without dropping empty departure/arrival days.
+ *
+ * `tripStartDate` makes the calendar deterministic: day N is always start + N-1. The AI
+ * reply no longer echoes dates back (it costs tokens and the value is derivable), so
+ * without this the AI path produced days with empty `date` and `dayName`.
+ */
+function normalizeTripDays(days, tripStartDate = null) {
     if (!Array.isArray(days) || days.length === 0) return days;
+
+    const start = toDateString(tripStartDate);
 
     // Stamp the canonical break marker so persisted data is self-describing and the
     // legacy title-matching fallback stops being needed for anything written from here on.
@@ -743,11 +957,13 @@ function normalizeTripDays(days) {
         const item = d.toObject ? d.toObject() : d;
         const isArrival = idx === 0;
         const isDeparture = idx === marked.length - 1;
+        // Prefer the trip's own calendar; fall back to whatever the day carried.
+        const derivedDate = (start ? addDays(start, idx) : '') || toDateString(item.date) || item.date || '';
         return {
             ...item,
             day: idx + 1,
-            date: toDateString(item.date) || item.date || '',
-            dayName: item.dayName || getDayName(item.date),
+            date: derivedDate,
+            dayName: getDayName(derivedDate) || item.dayName || '',
             isArrivalDay: isArrival,
             isDepartureDay: isDeparture,
             departureNote: isDeparture
@@ -799,7 +1015,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
 
     // Impose the Control Panel's activity hours and lunch break, whichever generator
     // produced these days.
-    itinerary.days = normalizeTripDays(applyDaySchedule(safeDays, controlPanel));
+    itinerary.days = normalizeTripDays(applyDaySchedule(safeDays, controlPanel, itinerary.startDate), itinerary.startDate);
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
@@ -1023,99 +1239,60 @@ exports.generateItinerary = async (req, res) => {
             });
         }
 
-        const systemPrompt = `You are an expert travel itinerary planner and geographic strategist. Create a realistic, highly engaging day-by-day travel itinerary strictly formatted as raw JSON array only. No markdown formatting outside json block, no conversational text.`;
+        // ── Shortlist + compact prompt ─────────────────────────────────────────
+        // Only the fields that survive are asked for. Everything the model used to emit
+        // for a catalogue activity (title, description, price, category, times) is
+        // overwritten from the database or recomputed by applyDaySchedule, so paying for
+        // it in completion tokens was pure waste.
+        const shortlist = selectCatalogueForPrompt(activities, {
+            activityBudget,
+            required: bookingActivities,
+        });
+        const { text: catalogueText, indexToActivity } = buildCataloguePrompt(shortlist, {
+            destination: city || country,
+        });
 
-        const requiredActivitiesPrompt = bookingActivities.length > 0
-            ? `\nREQUIRED TRAVELER ACTIVITIES (You MUST schedule these activities into the days):
-${bookingActivities.map(a => `- id:${a._id || 'custom'} | "${a.title}" | price:$${a.price || 0} | location:${a.location || a.city || city || 'local'}`).join('\n')}
-Note: Make sure to assign the corresponding "activityId" to the activity objects in the JSON response.`
-            : '';
+        const requiredHandles = bookingActivities
+            .map((a) => {
+                for (const [handle, act] of indexToActivity) {
+                    if (String(act._id) === String(a._id)) return handle;
+                }
+                return null;
+            })
+            .filter(Boolean);
 
+        const systemPrompt = 'You plan travel itineraries. Reply with raw JSON only — no markdown, no commentary.';
+
+        const lunch = resolveLunchWindow(cp);
         const overridesPrompt = Array.isArray(cp.perDayOverrides) && cp.perDayOverrides.length > 0
-            ? `\nSpecific day-by-day scheduling overrides (Use these instead of default rules for these specific dates):
-${cp.perDayOverrides.map(o => `- Date: ${o.date} | Start: ${o.startTime || 'default'} | End: ${o.endTime || 'default'} | Lunch: ${o.lunchStart || 'default'} to ${o.lunchEnd || 'default'}`).join('\n')}`
+            ? '\n- Per-day hour overrides: ' + cp.perDayOverrides
+                .filter((o) => o.startTime || o.endTime)
+                .map((o) => `${o.date} ${o.startTime || '-'}..${o.endTime || '-'}`)
+                .join('; ')
             : '';
+        const activeDayRule = cp.startOnArrival
+            ? 'Day 1 is the arrival day and MAY hold activities.'
+            : 'Day 1 is the arrival day and MUST be empty (transfer only).';
+        const lastDayRule = cp.endOnDeparture !== false
+            ? `Day ${tripDays} is the departure day and MAY hold activities.`
+            : `Day ${tripDays} is the departure day and MUST be empty.`;
 
-        const startingPointAnchor = hotel
-            ? `Hotel: ${hotel.name} (${hotel.city || city || 'City Center'}, ${hotel.country || country || ''})`
-            : `Downtown / City Center of ${city || country || 'destination'}`;
+        const userPrompt = `Plan a ${tripDays}-day trip to ${city || country} for ${itinerary.numberOfTravelers || 2} travellers.
 
-        let day1Example = `  {
-    "day": 1,
-    "date": "${startDate || 'YYYY-MM-DD'}",
-    "dayName": "Monday",
-    "isArrivalDay": true,
-    "isDepartureDay": false,
-    "arrivalNote": "${cp.startOnArrival ? 'Arrival Day — Checked in and ready for activities.' : 'Arrival Day — Free Day. Airport to Hotel transfer provided.'}",
-    "activities": ${cp.startOnArrival ? `[
-      {
-        "activityId": null,
-        "title": "Welcome Dinner & Evening Walk",
-        "description": "Relaxing first evening dinner and orientation",
-        "startTime": "19:00",
-        "endTime": "21:00",
-        "price": 30,
-        "category": "dining",
-        "image": "",
-        "isSupplierOnly": false
-      }
-    ]` : '[]'}
-  }`;
+Activities available (use the #number to reference one):
+${catalogueText}
 
-        const userPrompt = `Create a complete ${tripDays}-day travel itinerary for ${city || country}.
+Rules:
+- Same-day activities must be within ~${Math.round(SAME_AREA_RADIUS_KM)}km of each other (use the coordinates). Keep each area on consecutive days; when moving between areas, use one travel day with fewer activities. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
+- Include the destination's iconic landmarks where they appear in the list.
+- Max ${MAX_ACTIVITIES_PER_DAY} activities per day. Do not repeat an activity.
+- ${activeDayRule}
+- ${lastDayRule}
+- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Total price of chosen activities must not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}
 
-Trip details:
-- Destination: ${city || country}
-- Start date: ${startDate || 'not specified'}
-- End date: ${endDate || 'not specified'}
-- Travelers: ${itinerary.numberOfTravelers || 2}
-- Activity Budget Ceiling: $${activityBudgetStr} (DO NOT EXCEED)
-- STARTING POINT / ORIGIN (0,0 ANCHOR): ${startingPointAnchor}. The trip begins from this starting location.
-
-Mandatory Constraints:
-1. GEOGRAPHICAL CLUSTERING RULE: Activities scheduled on the same day MUST be within about ${Math.round(SAME_AREA_RADIUS_KM)}km of each other — use the coordinates given for each activity below. Never mix activities from distant bases on the same day. Group each base into consecutive days, and when the trip moves from one base to another put the move on a single travel day with fewer activities, allowing realistic travel time (road at ~70km/h, or a flight for legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km).
-2. MANDATORY ICONIC LANDMARKS RULE: You MUST unconditionally include famous landmark attractions of the destination (e.g. Pyramids of Giza, Great Sphinx, Egyptian Museum for Cairo/Egypt; Karnak Temple, Valley of the Kings for Luxor; Burj Khalifa for Dubai; etc.) in the itinerary.
-3. Activity start time each day: ${cp.activityStartTime || '09:00'}
-4. Activity end time each day: ${cp.activityEndTime || '19:00'}
-5. Lunch break: ${resolveLunchWindow(cp).lunchStart} to ${resolveLunchWindow(cp).lunchEnd} on EVERY day. Leave this window free. If you include a lunch/rest placeholder it MUST be marked "isBreak": true and "category": "break" — it is not an activity and must never be given a price or an activityId.
-6. Day 1 is arrival day — ${cp.startOnArrival ? 'you MUST schedule at least one activity today after check-in' : 'keep free (no activities), just airport/hotel transfer'}
-7. Last day (Day ${tripDays}) is departure day — always include departureNote.${overridesPrompt}
-8. You MUST schedule all activities listed under "REQUIRED TRAVELER ACTIVITIES" on appropriate days.${budgetRulePrompt}
-
-Available activities (prefer these pre-loaded activities and match activityId when assigning):
-${activities.length > 0
-    ? activities.map(a => {
-        const c = getCoordinates(a);
-        return `- id:${a._id} | "${a.title}" | location:${a.location || a.city || city || 'local'}${c ? ` | coords:${c.lat.toFixed(4)},${c.lng.toFixed(4)}` : ''} | duration:${a.duration || '2 hours'} | price:$${a.price || 0} | category:${a.category || 'general'}`;
-    }).join('\n')
-    : '(no pre-loaded activities — create realistic iconic activities with location and pricing for the destination)'
-}
-${requiredActivitiesPrompt}
-
-Return ONLY a JSON array with this exact structure:
-[
-${day1Example},
-  {
-    "day": 2,
-    "date": "YYYY-MM-DD",
-    "dayName": "Tuesday",
-    "isArrivalDay": false,
-    "isDepartureDay": false,
-    "activities": [
-      {
-        "activityId": "<id from the list above, or null (unquoted) for a custom activity>",
-        "title": "Activity title",
-        "description": "Short description",
-        "startTime": "09:00",
-        "endTime": "11:00",
-        "price": 45,
-        "category": "culture",
-        "image": "",
-        "isSupplierOnly": true
-      }
-    ]
-  }
-]`;
+Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
+"ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
+{"days":[{"day":1,"ids":[]},{"day":2,"ids":[3,7]},{"day":3,"ids":[12],"custom":[{"title":"Evening food walk","description":"Street-food tour","price":25,"category":"dining"}]}]}`;
 
         let aiDays;
         try {
@@ -1126,12 +1303,21 @@ ${day1Example},
                     { role: 'user', content: userPrompt },
                 ],
                 temperature: 0.4,
-                max_tokens: 4000,
+                // The reply is now a list of day -> activity numbers, a few hundred tokens
+                // at most. The old 4000 ceiling existed because the model was asked to
+                // echo back every field of every activity.
+                max_tokens: Number(process.env.ITINERARY_AI_MAX_TOKENS) || 1200,
+                response_format: { type: 'json_object' },
             });
 
-            const raw = completion.choices[0].message.content.trim();
-            const jsonStr = raw.startsWith('[') ? raw : raw.replace(/```json\n?/, '').replace(/```\n?$/, '').trim();
-            aiDays = JSON.parse(jsonStr);
+            if (completion.usage) {
+                console.log(`[itinerary ${itinerary._id}] AI tokens in=${completion.usage.prompt_tokens} out=${completion.usage.completion_tokens} total=${completion.usage.total_tokens} (catalogue rows=${shortlist.length})`);
+            }
+
+            aiDays = parseAiItineraryReply(completion.choices[0].message.content, {
+                indexToActivity,
+                tripDays,
+            });
         } catch (aiErr) {
             console.error('OpenAI generate failed, using template fallback:', aiErr?.message);
             const templateDays = buildDefaultDays(
@@ -1150,6 +1336,7 @@ ${day1Example},
         // Attach real activity images and details from DB where we have matches
         const actMap = {};
         activities.forEach(a => { actMap[String(a._id)] = a; });
+        shortlist.forEach(a => { actMap[String(a._id)] = a; });
 
         const bookingActMap = {};
         bookingActivities.forEach(a => {
@@ -1199,7 +1386,7 @@ ${day1Example},
                     endTime: act.endTime || '',
                     price: dbAct ? (Number(dbAct.price) || 0) : (Number(act.price) || 0),
                     category: dbAct ? dbAct.category : (act.category || 'general'),
-                    image: act.image || dbAct?.image || '',
+                    image: dbAct ? activityImageUrl(dbAct._id) : (act.image || ''),
                     isBreak: false,
                     isSupplierOnly: true,
                 };
@@ -1317,7 +1504,7 @@ exports.saveDays = async (req, res) => {
         if (!existing) return;
 
         const updateFields = {
-            days: normalizeTripDays(req.body.days),
+            days: normalizeTripDays(req.body.days, req.body.startDate ?? existing.startDate),
             updatedAt: new Date(),
             ...buildBuilderStateUpdate(req.body, existing.controlPanel)
         };
@@ -1378,7 +1565,7 @@ exports.submitItinerary = async (req, res) => {
         if (!itinerary) return;
 
         if (Array.isArray(req.body.days)) {
-            itinerary.days = normalizeTripDays(req.body.days);
+            itinerary.days = normalizeTripDays(req.body.days, req.body.startDate ?? itinerary.startDate);
         }
         if (Array.isArray(req.body.extraFields)) {
             itinerary.extraFields = req.body.extraFields;
@@ -1471,7 +1658,8 @@ exports.clearActivities = async (req, res) => {
             (itinerary.days || []).map((d) => {
                 const item = d.toObject ? d.toObject() : d;
                 return { ...item, activities: [] };
-            })
+            }),
+            itinerary.startDate
         );
         itinerary.updatedAt = new Date();
         await itinerary.save();
