@@ -331,6 +331,142 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
 }
 
 /**
+ * Put activities on days that ended up empty.
+ *
+ * Whichever generator ran can leave gaps: the model may skip days, and the
+ * database-template path clones an older, shorter itinerary and pads the remainder with
+ * blanks. The budget no longer trims anything, so an empty day now means "nothing was
+ * assigned here", not "nothing was affordable" — and a supplier expects every day of the
+ * trip to have something in it.
+ *
+ * Only empty days are touched; days the generator already filled are left exactly as
+ * they are. Candidates are drawn from the catalogue, skipping anything already used, and
+ * chosen nearest-first to the surrounding days so backfilling cannot wreck the route.
+ *
+ * @returns {{ days: Array, filled: number }}
+ */
+function backfillEmptyDays(days, catalogue, { controlPanel = {}, maxPerDay = 3 } = {}) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    if (list.length === 0) return { days: list, filled: 0 };
+
+    const allowed = allowedDayIndices(list.length, controlPanel);
+    const emptyIdx = allowed.filter((i) => countableActivities(list[i]).length === 0);
+    if (emptyIdx.length === 0) return { days: list, filled: 0 };
+
+    const used = new Set();
+    list.forEach((d) => (d.activities || []).forEach((a) => {
+        if (a?.activityId) used.add(String(a.activityId));
+    }));
+
+    // No early return when the pool is empty: that is precisely when the loop below has
+    // to rebalance instead of add.
+    const pool = (Array.isArray(catalogue) ? catalogue : []).filter((a) => a?._id && !used.has(String(a._id)));
+
+    /** Coordinates of the nearest already-populated day, searching outwards. */
+    const anchorFor = (index) => {
+        for (let offset = 1; offset < list.length; offset++) {
+            for (const i of [index - offset, index + offset]) {
+                if (i < 0 || i >= list.length) continue;
+                const coords = countableActivities(list[i]).map(getCoordinates).filter(Boolean);
+                if (coords.length) return coords[coords.length - 1];
+            }
+        }
+        return null;
+    };
+
+    const rebuilt = [...list];
+    let filled = 0;
+    let remainingDays = emptyIdx.length;
+
+    for (const index of emptyIdx) {
+        // Spread what is left evenly rather than dumping it all on the first empty day.
+        const share = pool.length === 0
+            ? 0
+            : Math.max(1, Math.min(maxPerDay, Math.ceil(pool.length / remainingDays)));
+        const anchor = anchorFor(index);
+
+        const chosen = [];
+        let cursor = anchor;
+        while (chosen.length < share && pool.length > 0) {
+            let bestIdx = 0;
+            let bestScore = Infinity;
+            pool.forEach((act, i) => {
+                const coords = getCoordinates(act);
+                const d = cursor && coords ? haversineKm(cursor, coords) : null;
+                const score = d === null ? Number.MAX_SAFE_INTEGER - i : d;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestIdx = i;
+                }
+            });
+            const [next] = pool.splice(bestIdx, 1);
+            chosen.push(next);
+            const c = getCoordinates(next);
+            if (c) cursor = c;
+        }
+
+        if (chosen.length === 0) {
+            // The catalogue is exhausted. Borrow a surplus activity from a day that has
+            // more than one — with a fixed number of activities and more days than that,
+            // the only way every day gets something is to spread what already exists.
+            const donorIdx = allowed
+                .filter((i) => countableActivities(rebuilt[i]).length > 1)
+                .sort((x, y) => countableActivities(rebuilt[y]).length - countableActivities(rebuilt[x]).length)[0];
+            if (donorIdx === undefined) continue;
+
+            const donorActs = countableActivities(rebuilt[donorIdx]);
+            // Take the one nearest this day's neighbours so the route stays sensible.
+            let pick = donorActs[donorActs.length - 1];
+            if (anchor) {
+                let best = Infinity;
+                donorActs.forEach((act) => {
+                    const c = getCoordinates(act);
+                    const d = c ? haversineKm(anchor, c) : null;
+                    const score = d === null ? Number.MAX_SAFE_INTEGER : d;
+                    if (score < best) { best = score; pick = act; }
+                });
+            }
+
+            rebuilt[donorIdx] = {
+                ...rebuilt[donorIdx],
+                activities: (rebuilt[donorIdx].activities || []).filter((a) => a !== pick),
+            };
+            rebuilt[index] = {
+                ...rebuilt[index],
+                activities: [...(rebuilt[index].activities || []), { ...pick, backfilled: true }],
+            };
+            filled += 1;
+            remainingDays -= 1;
+            continue;
+        }
+
+        rebuilt[index] = {
+            ...rebuilt[index],
+            activities: [
+                ...(rebuilt[index].activities || []),
+                ...chosen.map((act) => ({
+                    activityId: String(act._id),
+                    title: act.title,
+                    description: act.description,
+                    location: act.location || act.city,
+                    coordinates: getCoordinates(act) || undefined,
+                    duration: act.duration,
+                    price: Number(act.price) || 0,
+                    category: act.category || 'general',
+                    isBreak: false,
+                    isSupplierOnly: true,
+                    backfilled: true,
+                })),
+            ],
+        };
+        filled += 1;
+        remainingDays -= 1;
+    }
+
+    return { days: rebuilt, filled };
+}
+
+/**
  * Post-generation repair. Validates the produced days and, when they are not
  * geographically feasible, redistributes the same activities into a plan that is.
  *
@@ -408,6 +544,7 @@ module.exports = {
     describeTransfer,
     allowedDayIndices,
     enforceDayBoundaries,
+    backfillEmptyDays,
     allocateDaysToClusters,
     planActivitiesAcrossDays,
     repairItineraryGeography,

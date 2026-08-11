@@ -67,15 +67,45 @@ function placeLabel(entry) {
     return String(raw).trim().toLowerCase();
 }
 
-/** Realistic door-to-door travel time in minutes for a given distance. */
+/**
+ * Schedule granularity, in minutes.
+ *
+ * Travel estimates are rounded UP to this step and start times snap to it, so the
+ * itinerary reads in clean clock times. Without it an exact 37-minute leg produced
+ * "14:37", and a day quickly filled with times like 17:04 and 10:19.
+ */
+const TIME_ROUNDING_MINUTES = Number(process.env.ITINERARY_TIME_ROUNDING_MINUTES) || 5;
+
+/** Round up to the next scheduling step. Rounding up never under-books travel. */
+function roundUpToStep(minutes, step = TIME_ROUNDING_MINUTES) {
+    if (!isFiniteNumber(minutes) || minutes <= 0) return 0;
+    if (step <= 1) return Math.ceil(minutes);
+    return Math.ceil(minutes / step) * step;
+}
+
+/**
+ * Realistic door-to-door travel time in minutes for a given distance.
+ *
+ * Rounded up to the scheduling step so the resulting clock times are tidy: a 37-minute
+ * leg is booked as 40. Legs under a minute stay at 0 — neighbouring sites should not
+ * acquire a phantom five-minute transfer.
+ */
 function travelMinutesForKm(km) {
     if (!isFiniteNumber(km) || km <= 0) return 0;
+
+    let raw;
     if (km <= SAME_AREA_RADIUS_KM) {
         // Local hops: slower average speed, no fixed overhead.
-        return Math.round((km / 40) * 60);
+        raw = (km / 40) * 60;
+    } else if (km >= FLIGHT_THRESHOLD_KM) {
+        raw = FLIGHT_OVERHEAD_MIN;
+    } else {
+        raw = TRANSFER_OVERHEAD_MIN + (km / AVG_TRAVEL_SPEED_KMH) * 60;
     }
-    if (km >= FLIGHT_THRESHOLD_KM) return FLIGHT_OVERHEAD_MIN;
-    return Math.round(TRANSFER_OVERHEAD_MIN + (km / AVG_TRAVEL_SPEED_KMH) * 60);
+
+    // Adjacent stops (a couple of hundred metres) cost nothing worth scheduling.
+    if (raw < 1) return 0;
+    return roundUpToStep(raw);
 }
 
 /** The transport a leg of this length realistically requires. */
@@ -391,6 +421,8 @@ module.exports = {
     orderClustersByRoute,
     dayCapacityMinutes,
     resolveLunchWindow,
+    roundUpToStep,
+    TIME_ROUNDING_MINUTES,
     parseTimeToMinutes,
     minutesToTime,
     DEFAULT_LUNCH_MINUTES,

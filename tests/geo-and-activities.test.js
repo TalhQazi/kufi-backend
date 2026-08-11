@@ -15,6 +15,7 @@ const {
     markBreakEntries,
     buildBreakEntry,
     resolveActivityId,
+    countableActivities,
 } = require('../utils/activityClassification');
 
 const {
@@ -27,10 +28,11 @@ const {
     transportModeForKm,
     dayCapacityMinutes,
     validateItineraryGeography,
+    roundUpToStep,
     SAME_AREA_RADIUS_KM,
 } = require('../utils/geo');
 
-const { planActivitiesAcrossDays, repairItineraryGeography } = require('../utils/itineraryGeoPlanner');
+const { planActivitiesAcrossDays, repairItineraryGeography, backfillEmptyDays } = require('../utils/itineraryGeoPlanner');
 
 // Real coordinates from the production catalogue.
 const CAIRO = { lat: 29.979, lng: 31.134 };   // Giza pyramids complex
@@ -347,4 +349,120 @@ test('a "Leisure" category alone does not make something a break', () => {
     assert.equal(isBreakEntry({ title: 'Beach Day', category: 'Leisure', activityId: null }), false);
     assert.equal(isBreakEntry({ title: 'Relaxation Day', category: 'Leisure', activityId: null }), false);
     assert.equal(isBreakEntry({ title: 'At Leisure', category: 'Leisure', activityId: null }), true);
+});
+
+// ─── Travel time is reserved between consecutive activities ──────────────────
+
+test('travel time between two stops is charged to the day', () => {
+    // 19.7km at the local 40km/h rate is ~30 minutes.
+    const km = haversineKm({ lat: 29.979, lng: 31.134 }, { lat: 29.871, lng: 31.216 });
+    assert.ok(km > 12 && km < 16, `expected ~13km, got ${Math.round(km)}`);
+    assert.ok(travelMinutesForKm(km) >= 15, 'a 13km hop must reserve real time');
+    // Neighbouring sites cost nothing.
+    assert.equal(travelMinutesForKm(0.2), 0);
+});
+
+// ─── Budget is advisory: every day gets filled ───────────────────────────────
+
+test('backfill puts something on every schedulable day', () => {
+    const cp = { startOnArrival: false, endOnDeparture: true, activityStartTime: '09:00', activityEndTime: '19:00' };
+    const days = [
+        { day: 1, date: '2026-09-01', activities: [] },                       // arrival, must stay empty
+        { day: 2, date: '2026-09-02', activities: [act('Pyramids', CAIRO)] },
+        { day: 3, date: '2026-09-03', activities: [] },
+        { day: 4, date: '2026-09-04', activities: [] },
+    ];
+    const catalogue = [
+        act('Pyramids', CAIRO),
+        act('Egyptian Museum', GIZA_MUSEUM),
+        act('Sphinx', { lat: 29.975, lng: 31.137 }),
+    ];
+
+    const { days: filled } = backfillEmptyDays(days, catalogue, { controlPanel: cp, maxPerDay: 3 });
+    assert.equal(countableActivities(filled[0]).length, 0, 'arrival day must stay empty');
+    assert.ok(countableActivities(filled[2]).length > 0, 'day 3 filled');
+    assert.ok(countableActivities(filled[3]).length > 0, 'day 4 filled');
+});
+
+test('backfill never duplicates an activity already in the plan', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [
+        { day: 1, date: '2026-09-01', activities: [{ ...act('Pyramids', CAIRO), activityId: 'Pyramids' }] },
+        { day: 2, date: '2026-09-02', activities: [] },
+    ];
+    const catalogue = [
+        { ...act('Pyramids', CAIRO), _id: 'Pyramids' },
+        { ...act('Sphinx', { lat: 29.975, lng: 31.137 }), _id: 'Sphinx' },
+    ];
+    const { days: filled } = backfillEmptyDays(days, catalogue, { controlPanel: cp, maxPerDay: 3 });
+    const titles = filled.flatMap((d) => countableActivities(d).map((a) => a.title));
+    assert.equal(new Set(titles).size, titles.length, 'no activity may appear twice');
+});
+
+test('when the catalogue is exhausted, a surplus day donates to an empty one', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [
+        {
+            day: 1, date: '2026-09-01', activities: [
+                { ...act('Pyramids', CAIRO), activityId: 'a' },
+                { ...act('Sphinx', { lat: 29.975, lng: 31.137 }), activityId: 'b' },
+            ],
+        },
+        { day: 2, date: '2026-09-02', activities: [] },
+    ];
+    // Empty catalogue: nothing new to add, so it must rebalance.
+    const { days: filled } = backfillEmptyDays(days, [], { controlPanel: cp, maxPerDay: 3 });
+    assert.equal(countableActivities(filled[1]).length, 1, 'the empty day received one');
+    assert.equal(countableActivities(filled[0]).length, 1, 'the donor kept one');
+});
+
+test('backfill leaves an already-complete plan untouched', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [
+        { day: 1, date: '2026-09-01', activities: [{ ...act('Pyramids', CAIRO), activityId: 'a' }] },
+        { day: 2, date: '2026-09-02', activities: [{ ...act('Sphinx', { lat: 29.975, lng: 31.137 }), activityId: 'b' }] },
+    ];
+    const { days: filled, filled: n } = backfillEmptyDays(days, [], { controlPanel: cp });
+    assert.equal(n, 0);
+    assert.deepEqual(filled, days);
+});
+
+// ─── Travel time rounds to tidy clock values ─────────────────────────────────
+
+test('travel time is rounded UP to a clean 5-minute step', () => {
+    // The reported case: an exact 37-minute leg must be booked as 40.
+    const km37 = 24.6;                       // ~37 minutes at the local 40km/h rate
+    assert.equal(travelMinutesForKm(km37), 40);
+
+    assert.equal(travelMinutesForKm(13.1), 20);
+    assert.equal(travelMinutesForKm(19.7), 30);
+    // Every result lands on the grid.
+    [0.5, 1.3, 5, 8, 13.1, 19.7, 24.6, 40, 100, 500].forEach((km) => {
+        assert.equal(travelMinutesForKm(km) % 5, 0, `${km}km produced an off-grid value`);
+    });
+});
+
+test('adjacent stops get no phantom transfer', () => {
+    // Two sites a couple of hundred metres apart must not acquire a 5-minute leg.
+    assert.equal(travelMinutesForKm(0.2), 0);
+    assert.equal(travelMinutesForKm(0), 0);
+});
+
+test('rounding up never under-books the journey', () => {
+    [1.3, 5, 8, 13.1, 19.7, 24.6, 40, 120].forEach((km) => {
+        const raw = km <= SAME_AREA_RADIUS_KM ? (km / 40) * 60 : 60 + (km / 70) * 60;
+        assert.ok(
+            travelMinutesForKm(km) >= raw,
+            `${km}km booked ${travelMinutesForKm(km)}min but needs ${raw.toFixed(1)}min`
+        );
+    });
+});
+
+test('roundUpToStep behaves at the boundaries', () => {
+    assert.equal(roundUpToStep(0), 0);
+    assert.equal(roundUpToStep(1), 5);
+    assert.equal(roundUpToStep(5), 5, 'an exact multiple is left alone');
+    assert.equal(roundUpToStep(6), 10);
+    assert.equal(roundUpToStep(37), 40);
+    assert.equal(roundUpToStep(37, 15), 45, 'the step is configurable');
 });

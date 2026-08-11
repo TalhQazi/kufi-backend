@@ -24,6 +24,8 @@ const {
 } = require('../utils/activityClassification');
 const {
     getCoordinates,
+    haversineKm,
+    travelMinutesForKm,
     clusterByGeography,
     validateItineraryGeography,
     parseDurationMinutes,
@@ -32,12 +34,14 @@ const {
     resolveLunchWindow,
     parseTimeToMinutes,
     minutesToTime,
+    roundUpToStep,
 } = require('../utils/geo');
 const {
     planActivitiesAcrossDays,
     repairItineraryGeography,
     describeTransfer,
     enforceDayBoundaries,
+    backfillEmptyDays,
 } = require('../utils/itineraryGeoPlanner');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -181,30 +185,22 @@ function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr
 }
 
 /**
- * Drop activities once the cumulative spend would exceed the ceiling.
+ * Total price of the real activities in a plan.
  *
- * Schedule breaks are always kept and never charged against the ceiling: a lunch
- * placeholder is not something the traveler buys, and a nominal price left on a legacy
- * break must not push real activities out of the plan.
+ * Schedule breaks are never billable, so they are excluded.
+ *
+ * The budget is ADVISORY, not a filter. Activities used to be dropped once the cumulative
+ * price passed the ceiling, which is what left most of a long trip empty: a 10-day
+ * itinerary on a small budget produced one populated day and nine blank ones. Trip length
+ * now wins — every day is filled, and the summary flags the overrun instead.
  */
-function enforceActivityBudget(days, maxActivityBudget) {
-    if (maxActivityBudget === undefined || maxActivityBudget === null || typeof maxActivityBudget !== 'number') {
-        return days;
-    }
-    let cumulative = 0;
-    return (days || []).map(d => {
+function sumActivitySpend(days) {
+    return (Array.isArray(days) ? days : []).reduce((total, d) => {
         const item = d?.toObject ? d.toObject() : d;
-        const activities = (item.activities || []).filter(act => {
-            if (isBreakEntry(act)) return true;
-            const price = Number(act.price) || 0;
-            if (cumulative + price <= maxActivityBudget) {
-                cumulative += price;
-                return true;
-            }
-            return false;
-        });
-        return { ...item, activities };
-    });
+        return total + (item.activities || [])
+            .filter((a) => !isBreakEntry(a))
+            .reduce((s, a) => s + (Number(a.price) || 0), 0);
+    }, 0);
 }
 
 /**
@@ -247,11 +243,9 @@ function selectCatalogueForPrompt(activities, { limit = AI_CATALOGUE_LIMIT, acti
 
     const requiredIds = new Set((required || []).map((a) => String(a?._id)).filter(Boolean));
 
-    const affordable = list.filter((a) => {
-        if (requiredIds.has(String(a._id))) return true;
-        if (typeof activityBudget !== 'number') return true;
-        return (Number(a.price) || 0) <= activityBudget;
-    });
+    // Price is no longer a gate. The budget is advisory, and excluding expensive
+    // activities here starved long trips of anything to schedule.
+    const affordable = list;
 
     const clusters = clusterByGeography(affordable).map((c) => ({
         ...c,
@@ -321,11 +315,9 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
     const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
     
     // Respect the budget constraint
-    const usableActs = getActivitiesForBudget(
-        isBookingSpecific ? activities : [],
-        activities,
-        activityBudget !== undefined ? activityBudget : itinerary.budget
-    );
+    // Budget is advisory: every candidate is available so the trip can be filled.
+    // Traveller-selected activities still come first (see getActivitiesForBudget).
+    const usableActs = getActivitiesForBudget(isBookingSpecific ? activities : [], activities, undefined);
 
     // Prioritize landmark/iconic activities (e.g. Pyramids, Sphinx)
     const sortedActs = [...usableActs].sort((a, b) => {
@@ -807,6 +799,12 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
     }
     if (tripDays) list = list.slice(0, tripDays);
 
+    // The prompt forbids repeats, but the model does not always comply — and asking it to
+    // fill every day makes repetition more tempting. Deduplicate here so the same
+    // activity can never appear on two days of one itinerary.
+    const seenIds = new Set();
+    const seenTitles = new Set();
+
     return list.map((entry, idx) => {
         const day = entry || {};
 
@@ -820,6 +818,12 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
         const fromCatalogue = ids
             .map((n) => indexToActivity.get(Number(String(n).replace('#', ''))))
             .filter(Boolean)
+            .filter((act) => {
+                const key = String(act._id);
+                if (seenIds.has(key)) return false;
+                seenIds.add(key);
+                return true;
+            })
             .map((act) => ({
                 activityId: String(act._id),
                 title: act.title,
@@ -836,6 +840,13 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
 
         const custom = (Array.isArray(day.custom) ? day.custom : [])
             .filter((c) => String(c?.title || '').trim())
+            .filter((c) => {
+                // Custom entries have no id, so they are deduplicated on title.
+                const key = String(c.title).trim().toLowerCase();
+                if (seenTitles.has(key)) return false;
+                seenTitles.add(key);
+                return true;
+            })
             .map((c) => ({
                 activityId: null,
                 title: String(c.title).trim(),
@@ -902,24 +913,48 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
         const hasBreak = durationMinutes > 0 && breakStart !== null && breakEnd !== null;
 
         let cursor = dayStart;
+        let previousCoords = null;
+
         const scheduled = real.map((act) => {
             const length = Math.max(15, parseDurationMinutes(act.durationMinutes ?? act.duration));
+            const here = getCoordinates(act);
 
-            // Never start inside the break, and never straddle it.
-            if (hasBreak && cursor < breakEnd && cursor + length > breakStart) {
-                cursor = breakEnd;
+            // Getting between two places takes time. The capacity planner and the
+            // geographic validator already charged for it, but the clock did not — so a
+            // 20km hop was printed as if the traveller teleported. The gap is now real.
+            let travelMinutes = 0;
+            if (previousCoords && here) {
+                const km = haversineKm(previousCoords, here);
+                if (km !== null) travelMinutes = travelMinutesForKm(km);
+                cursor += travelMinutes;
             }
 
-            const startMinutes = cursor;
+            // Prefer not to straddle the lunch break — but only step over it when the
+            // activity genuinely fits in what is left of the day. Pushing unconditionally
+            // meant a 5-hour tour that could not finish before lunch was moved wholly
+            // after it, wasting the entire morning and ending at 22:07. A long activity
+            // simply spans lunch, which is what happens in reality.
+            if (hasBreak && cursor < breakEnd && cursor + length > breakStart) {
+                const fitsAfterBreak = breakEnd + length <= dayEnd;
+                if (fitsAfterBreak) cursor = breakEnd;
+            }
+
+            // Snap the start onto the scheduling grid so clock times stay tidy even when
+            // an activity's duration is not a round number. Snapping forward only ever
+            // adds a little slack — it can never create an overlap.
+            const startMinutes = cursor === dayStart ? cursor : roundUpToStep(cursor);
             const endMinutes = startMinutes + length;
             cursor = endMinutes;
+            if (here) previousCoords = here;
 
             return {
                 ...act,
                 startTime: minutesToTime(startMinutes),
-                // Clamp the visible end to the configured day end so a long final
-                // activity does not render as finishing after hours.
-                endTime: minutesToTime(Math.min(endMinutes, Math.max(dayEnd, startMinutes + 15))),
+                // Not clamped to the day end any more. Now that travel is accounted for,
+                // clamping would hide a genuine overrun behind a plausible-looking time.
+                endTime: minutesToTime(endMinutes),
+                // Exposed so the UI can show "30 min travel" between two stops.
+                travelFromPreviousMinutes: travelMinutes,
             };
         });
 
@@ -933,7 +968,14 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
             })]
             : [];
 
-        return { ...item, activities: [...scheduled, ...breaks] };
+        const dayEndsAt = scheduled.length ? parseTimeToMinutes(scheduled[scheduled.length - 1].endTime, dayEnd) : dayEnd;
+
+        return {
+            ...item,
+            activities: [...scheduled, ...breaks],
+            // > 0 when travel pushed the day past its configured end time.
+            overrunMinutes: Math.max(0, dayEndsAt - dayEnd),
+        };
     });
 }
 
@@ -985,7 +1027,7 @@ function normalizeTripDays(days, tripStartDate = null) {
  * run into an immediate draft and silently move the request between supplier tabs.
  * Pass { persist: true } to opt back into the old write-through behaviour.
  */
-async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null } = {}) {
+async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null, catalogue = [] } = {}) {
     applyBudgetToDocument(itinerary);
 
     // ── Post-generation validation layer ────────────────────────────────────────
@@ -1005,7 +1047,14 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
     });
 
-    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(boundedDays, {
+    // Budget no longer trims the plan, so an empty day means nothing was assigned there.
+    // Fill those from the catalogue before validating, so additions are checked too.
+    const { days: filledDays, filled: daysBackfilled } = backfillEmptyDays(boundedDays, catalogue, {
+        controlPanel,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+    });
+
+    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(filledDays, {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -1027,6 +1076,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     return resPayload(itinerary, source, persist, {
         geographyRepaired: repaired,
         dayBoundariesEnforced: boundariesChanged,
+        daysBackfilled,
         geographyIssues: finalValidation.issues,
         dayReports: finalValidation.dayReports,
     }, budget);
@@ -1168,7 +1218,7 @@ exports.generateItinerary = async (req, res) => {
                 exhaustedByFixedCosts: maxTotalActivitiesCost === 0,
             };
 
-            budgetRulePrompt = `\nCRITICAL BUDGET TOLERANCE RULE: Customer budget is $${itinerary.budget}. With a ${Math.round(upliftPct * 100)}% budget tolerance allowance, the maximum allowed total trip budget ceiling is $${maxAllowedTotalBudget}. After accounting for hotel accommodation ($${hotelCost}) and custom costs ($${customCostsTotal}), the sum of prices of all scheduled activities MUST NOT exceed $${maxTotalActivitiesCost}. Select high-value, iconic activities strictly under $${maxTotalActivitiesCost}.`;
+            budgetRulePrompt = `\nCRITICAL BUDGET TOLERANCE RULE: Customer budget is $${itinerary.budget}. With a ${Math.round(upliftPct * 100)}% budget tolerance allowance, the maximum allowed total trip budget ceiling is $${maxAllowedTotalBudget}. After accounting for hotel accommodation ($${hotelCost}) and custom costs ($${customCostsTotal}), the activity budget guideline is $${maxTotalActivitiesCost}. Prefer options that keep the total near that figure, but filling every day of the trip takes priority over the guideline.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -1197,20 +1247,15 @@ exports.generateItinerary = async (req, res) => {
             // Adapting can trim days off the end, so re-check that the result still holds
             // activities before returning it — otherwise fall through to building a fresh
             // plan from the catalogue.
+            // Hydrate from the catalogue so cloned entries regain the coordinates the
+            // geographic validation layer needs. The budget is advisory, so nothing is
+            // trimmed here — filling the trip takes priority over the ceiling.
             const adaptedDays = existing?.days?.length
-                // Hydrate from the catalogue so cloned entries regain the coordinates the
-                // geographic validation layer needs, then apply the same budget ceiling
-                // every other generation path honours. Cloning a template used to bypass
-                // the ceiling entirely, which is why the Control Panel's budget uplift had
-                // no effect whatsoever on this path.
-                ? enforceActivityBudget(
-                    hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), activities),
-                    activityBudget
-                )
+                ? hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), activities)
                 : null;
 
             if (adaptedDays && countActivities(adaptedDays) > 0) {
-                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown }));
+                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities }));
             } else {
                 const templateDays = buildDefaultDays(
                     itinerary,
@@ -1219,7 +1264,7 @@ exports.generateItinerary = async (req, res) => {
                     activityBudget,
                     { hotelCoords }
                 );
-                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown }));
+                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities }));
             }
         }
 
@@ -1234,7 +1279,7 @@ exports.generateItinerary = async (req, res) => {
                 { hotelCoords }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities })),
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
@@ -1285,10 +1330,11 @@ ${catalogueText}
 Rules:
 - Same-day activities must be within ~${Math.round(SAME_AREA_RADIUS_KM)}km of each other (use the coordinates). Keep each area on consecutive days; when moving between areas, use one travel day with fewer activities. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
 - Include the destination's iconic landmarks where they appear in the list.
+- Fill EVERY day that may hold activities — no day may be left empty while unused activities remain.
 - Max ${MAX_ACTIVITIES_PER_DAY} activities per day. Do not repeat an activity.
 - ${activeDayRule}
 - ${lastDayRule}
-- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Total price of chosen activities must not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}
+- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Aim to keep the total price of chosen activities near $${activityBudget}, preferring cheaper options — but filling every day matters more than the budget.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}
 
 Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
 "ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
@@ -1328,7 +1374,7 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
                 { hotelCoords }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities })),
                 warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
             });
         }
@@ -1393,11 +1439,8 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
             }),
         }));
 
-        const finalDays = hydrateDayActivities(
-            enforceActivityBudget(enrichedDays, activityBudget),
-            [...activities, ...bookingActivities]
-        );
-        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown }));
+        const finalDays = hydrateDayActivities(enrichedDays, [...activities, ...bookingActivities]);
+        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities }));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });

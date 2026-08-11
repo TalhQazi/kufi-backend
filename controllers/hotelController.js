@@ -1,14 +1,32 @@
 const Hotel = require('../models/Hotel');
 
+const escapeRegExp = (value) => String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Active hotels for a destination.
+ *
+ * The city filter is a narrowing hint, not a hard requirement. A trip is often described
+ * only by its country, and hotels are filed under specific city names ("Beirut City",
+ * "Nile River"), so an exact city match frequently eliminated every hotel and left the
+ * supplier's dropdown empty. When a city yields nothing, the country result is returned
+ * instead — an imprecise city should widen the search, never blank it.
+ */
 exports.getHotels = async (req, res) => {
     try {
         const { country, city } = req.query;
-        const filter = { status: 'active' };
-        if (country) filter.country = new RegExp(`^${country.trim()}$`, 'i');
-        if (city) filter.city = new RegExp(`^${city.trim()}$`, 'i');
+        const base = { status: 'active' };
+        if (country) base.country = new RegExp(`^${escapeRegExp(country.trim())}$`, 'i');
 
-        const hotels = await Hotel.find(filter).sort({ sortOrder: 1, name: 1 }).lean();
-        res.json(hotels);
+        const sorted = (q) => Hotel.find(q).sort({ sortOrder: 1, name: 1 }).lean();
+
+        if (city) {
+            // Substring rather than exact: "Beirut" should find "Beirut City".
+            const narrowed = { ...base, city: new RegExp(escapeRegExp(city.trim()), 'i') };
+            const matches = await sorted(narrowed);
+            if (matches.length > 0) return res.json(matches);
+        }
+
+        res.json(await sorted(base));
     } catch (err) {
         res.status(500).json({ msg: 'Server error', error: err.message });
     }
