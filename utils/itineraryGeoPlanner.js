@@ -467,6 +467,136 @@ function backfillEmptyDays(days, catalogue, { controlPanel = {}, maxPerDay = 3 }
 }
 
 /**
+ * Choose which activities to schedule.
+ *
+ * Two goals that pull against each other:
+ *   - every day of the trip must get something (the budget is advisory, not a filter);
+ *   - the total should still track the traveller's budget.
+ *
+ * Doing only the first made the budget inert — a 6-day Lebanon trip cost $1,960 whether
+ * the traveller asked for $500 or $5,000. Doing only the second emptied most of a long
+ * trip. So: fill the days with the cheapest options first, which guarantees a complete
+ * itinerary at the lowest possible cost, then spend whatever budget is left on
+ * better-rated additions.
+ *
+ * @param {Array}  activities   candidates
+ * @param {object} options
+ * @param {Array}  options.required   traveller-selected; always included, never priced out
+ * @param {number} options.budget     advisory ceiling for activity spend
+ * @param {number} options.activeDays days that may hold activities
+ * @param {number} options.maxPerDay
+ */
+/** How many days of this trip may actually hold activities. */
+function countActiveDays(itinerary, tripDays) {
+    const cp = itinerary?.controlPanel?.toObject ? itinerary.controlPanel.toObject() : (itinerary?.controlPanel || {});
+    if (tripDays <= 1) return 1;
+    let active = tripDays;
+    if (!cp.startOnArrival) active -= 1;
+    if (cp.endOnDeparture === false) active -= 1;
+    return Math.max(1, active);
+}
+
+function selectActivitiesForTrip(activities, { required = [], budget, activeDays = 1, maxPerDay = 3 } = {}) {
+    const all = (Array.isArray(activities) ? activities : []).filter(Boolean);
+    const requiredIds = new Set((required || []).map((a) => String(a?._id)).filter(Boolean));
+
+    const selected = [...(required || [])];
+    let total = selected.reduce((sum, a) => sum + (Number(a.price) || 0), 0);
+
+    const rest = all.filter((a) => !requiredIds.has(String(a._id)));
+    const price = (a) => Number(a.price) || 0;
+    const byPrice = [...rest].sort((a, b) => price(a) - price(b));
+
+    // Stage 1 — guarantee a full trip as cheaply as possible: one activity per day.
+    const minNeeded = Math.max(0, activeDays - selected.length);
+    const cheapest = byPrice.slice(0, minNeeded);
+    cheapest.forEach((a) => { selected.push(a); total += price(a); });
+
+    // Stage 2 — spend what is left on the best of the remainder, never exceeding the
+    // per-day cap. With no budget set, quality ordering alone applies.
+    const maxWanted = Math.max(activeDays, activeDays * maxPerDay);
+    const chosenIds = new Set(selected.map((a) => String(a._id)));
+    const remaining = rest
+        .filter((a) => !chosenIds.has(String(a._id)))
+        .sort((a, b) => {
+            const landmark = (x) => /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum/i.test(String(x.title || ''));
+            if (landmark(a) !== landmark(b)) return landmark(a) ? -1 : 1;
+            return (Number(b.rating) || 0) - (Number(a.rating) || 0);
+        });
+
+    for (const act of remaining) {
+        if (selected.length >= maxWanted) break;
+        const next = total + price(act);
+        if (typeof budget === 'number' && next > budget) continue;
+        selected.push(act);
+        total = next;
+    }
+
+    return selected;
+}
+
+/**
+ * Bring the plan's cost back toward the traveller's budget without emptying any day.
+ *
+ * Runs on every generation path, which is the point: selection logic inside one generator
+ * is bypassed by the others. The database-template path clones an older itinerary
+ * wholesale, so a 6-day Lebanon trip cost $1,960 whether the traveller asked for $500 or
+ * $5,000 — the budget was completely inert.
+ *
+ * Surplus activities are dropped most-expensive-first, and only from days holding more
+ * than one. Every day therefore keeps at least one activity: filling the trip still wins,
+ * but within that constraint the total tracks the budget. When even one activity per day
+ * exceeds the budget, the plan stops there and the overrun is reported rather than hidden.
+ *
+ * @returns {{ days: Array, removed: number, spend: number }}
+ */
+function trimToBudget(days, { budget, controlPanel = {} } = {}) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    const priceOf = (a) => Number(a?.price) || 0;
+    const spendOf = (ds) => ds.reduce((t, d) => t + countableActivities(d).reduce((s, a) => s + priceOf(a), 0), 0);
+
+    if (typeof budget !== 'number' || budget < 0 || list.length === 0) {
+        return { days: list, removed: 0, spend: spendOf(list) };
+    }
+
+    const allowed = new Set(allowedDayIndices(list.length, controlPanel));
+    const rebuilt = [...list];
+    let spend = spendOf(rebuilt);
+    let removed = 0;
+
+    // Bounded by the number of activities present, so it always terminates.
+    for (let guard = 0; guard < 500 && spend > budget; guard++) {
+        let bestDay = -1;
+        let bestAct = null;
+        let bestPrice = -1;
+
+        rebuilt.forEach((day, i) => {
+            if (!allowed.has(i)) return;
+            const real = countableActivities(day);
+            if (real.length <= 1) return; // never empty a day
+            real.forEach((act) => {
+                if (priceOf(act) > bestPrice) {
+                    bestPrice = priceOf(act);
+                    bestAct = act;
+                    bestDay = i;
+                }
+            });
+        });
+
+        if (bestDay === -1 || !bestAct || bestPrice <= 0) break;
+
+        rebuilt[bestDay] = {
+            ...rebuilt[bestDay],
+            activities: (rebuilt[bestDay].activities || []).filter((a) => a !== bestAct),
+        };
+        spend -= bestPrice;
+        removed += 1;
+    }
+
+    return { days: rebuilt, removed, spend };
+}
+
+/**
  * Post-generation repair. Validates the produced days and, when they are not
  * geographically feasible, redistributes the same activities into a plan that is.
  *
@@ -545,6 +675,8 @@ module.exports = {
     allowedDayIndices,
     enforceDayBoundaries,
     backfillEmptyDays,
+    trimToBudget,
+    selectActivitiesForTrip,
     allocateDaysToClusters,
     planActivitiesAcrossDays,
     repairItineraryGeography,

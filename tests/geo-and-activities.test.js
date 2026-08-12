@@ -32,7 +32,13 @@ const {
     SAME_AREA_RADIUS_KM,
 } = require('../utils/geo');
 
-const { planActivitiesAcrossDays, repairItineraryGeography, backfillEmptyDays } = require('../utils/itineraryGeoPlanner');
+const {
+    planActivitiesAcrossDays,
+    repairItineraryGeography,
+    backfillEmptyDays,
+    trimToBudget,
+    selectActivitiesForTrip,
+} = require('../utils/itineraryGeoPlanner');
 
 // Real coordinates from the production catalogue.
 const CAIRO = { lat: 29.979, lng: 31.134 };   // Giza pyramids complex
@@ -465,4 +471,70 @@ test('roundUpToStep behaves at the boundaries', () => {
     assert.equal(roundUpToStep(6), 10);
     assert.equal(roundUpToStep(37), 40);
     assert.equal(roundUpToStep(37, 15), 45, 'the step is configurable');
+});
+
+// ─── Budget tracks the plan without emptying days ────────────────────────────
+
+const priced = (title, coords, price) => ({ ...act(title, coords, { price }), activityId: title });
+
+test('trimToBudget drops the most expensive surplus first', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [
+        { day: 1, activities: [priced('Cheap', CAIRO, 50), priced('Expensive', CAIRO, 500)] },
+        { day: 2, activities: [priced('Mid', GIZA_MUSEUM, 100)] },
+    ];
+    const { days: out, removed, spend } = trimToBudget(days, { budget: 200, controlPanel: cp });
+    assert.equal(removed, 1);
+    assert.equal(spend, 150, 'the $500 activity was the one dropped');
+    const titles = out.flatMap((d) => countableActivities(d).map((a) => a.title));
+    assert.ok(!titles.includes('Expensive'));
+    assert.ok(titles.includes('Cheap') && titles.includes('Mid'));
+});
+
+test('trimToBudget never empties a day, even far over budget', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [
+        { day: 1, activities: [priced('A', CAIRO, 500)] },
+        { day: 2, activities: [priced('B', GIZA_MUSEUM, 500)] },
+    ];
+    const { days: out, spend } = trimToBudget(days, { budget: 10, controlPanel: cp });
+    assert.equal(countableActivities(out[0]).length, 1);
+    assert.equal(countableActivities(out[1]).length, 1);
+    assert.equal(spend, 1000, 'the overrun is reported, not hidden by emptying days');
+});
+
+test('trimToBudget leaves a plan within budget untouched', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [{ day: 1, activities: [priced('A', CAIRO, 50), priced('B', CAIRO, 60)] }];
+    const { days: out, removed } = trimToBudget(days, { budget: 500, controlPanel: cp });
+    assert.equal(removed, 0);
+    assert.deepEqual(out, days);
+});
+
+test('trimToBudget is a no-op when no budget is set', () => {
+    const days = [{ day: 1, activities: [priced('A', CAIRO, 9999)] }];
+    const { removed } = trimToBudget(days, { budget: undefined });
+    assert.equal(removed, 0);
+});
+
+test('selectActivitiesForTrip fills every day cheaply, then upgrades', () => {
+    const pool = [
+        priced('Cheap1', CAIRO, 10), priced('Cheap2', CAIRO, 20),
+        priced('Cheap3', CAIRO, 30), priced('Pricey', CAIRO, 900),
+    ];
+    // Tight budget: enough for one per day from the cheap end, never the $900 one.
+    const tight = selectActivitiesForTrip(pool, { budget: 100, activeDays: 3, maxPerDay: 3 });
+    assert.equal(tight.length >= 3, true, 'every day still gets an activity');
+    assert.ok(!tight.some((a) => a.title === 'Pricey'), 'the unaffordable one is skipped');
+
+    // Generous budget: the expensive one becomes reachable.
+    const roomy = selectActivitiesForTrip(pool, { budget: 5000, activeDays: 3, maxPerDay: 3 });
+    assert.ok(roomy.some((a) => a.title === 'Pricey'));
+});
+
+test('selectActivitiesForTrip never prices out a traveller-selected activity', () => {
+    const required = [priced('Traveller pick', CAIRO, 900)];
+    const pool = [...required, priced('Cheap', CAIRO, 10)];
+    const out = selectActivitiesForTrip(pool, { required, budget: 50, activeDays: 2, maxPerDay: 3 });
+    assert.ok(out.some((a) => a.title === 'Traveller pick'), 'a required activity survives any budget');
 });

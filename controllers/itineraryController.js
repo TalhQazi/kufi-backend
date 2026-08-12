@@ -42,6 +42,8 @@ const {
     describeTransfer,
     enforceDayBoundaries,
     backfillEmptyDays,
+    trimToBudget,
+    selectActivitiesForTrip,
 } = require('../utils/itineraryGeoPlanner');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -315,9 +317,14 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
     const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
     
     // Respect the budget constraint
-    // Budget is advisory: every candidate is available so the trip can be filled.
-    // Traveller-selected activities still come first (see getActivitiesForBudget).
-    const usableActs = getActivitiesForBudget(isBookingSpecific ? activities : [], activities, undefined);
+    // Cheapest-first to guarantee a full trip, then the best of what the budget allows.
+    const activeDayCount = countActiveDays(itinerary, tripDays);
+    const usableActs = selectActivitiesForTrip(activities, {
+        required: isBookingSpecific ? activities : [],
+        budget: activityBudget !== undefined ? activityBudget : itinerary.budget,
+        activeDays: activeDayCount,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+    });
 
     // Prioritize landmark/iconic activities (e.g. Pyramids, Sphinx)
     const sortedActs = [...usableActs].sort((a, b) => {
@@ -1054,7 +1061,14 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
     });
 
-    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(filledDays, {
+    // Bring the cost back toward the budget — without emptying any day. This runs on every
+    // path, including the template clone that bypasses the generators' own selection.
+    const { days: budgetedDays, removed: budgetRemovals, spend: activitySpend } = trimToBudget(filledDays, {
+        budget: budget?.activityCeiling,
+        controlPanel,
+    });
+
+    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(budgetedDays, {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -1079,7 +1093,12 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         daysBackfilled,
         geographyIssues: finalValidation.issues,
         dayReports: finalValidation.dayReports,
-    }, budget);
+    }, budget ? {
+        ...budget,
+        activitySpend,
+        overBudget: activitySpend > budget.activityCeiling,
+        trimmedForBudget: budgetRemovals,
+    } : budget);
 }
 
 function resPayload(itinerary, source, persisted = false, geography = null, budget = null) {
