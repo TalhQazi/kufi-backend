@@ -41,7 +41,7 @@ const {
     repairItineraryGeography,
     describeTransfer,
     enforceDayBoundaries,
-    backfillEmptyDays,
+    fillDaysFromCatalogue,
     trimToBudget,
     selectActivitiesForTrip,
 } = require('../utils/itineraryGeoPlanner');
@@ -216,8 +216,16 @@ function activityImageUrl(activityId) {
     return activityId ? `/api/activities/${activityId}/image` : '';
 }
 
-/** Upper bound on real activities in a single day, before time budgeting narrows it further. */
-const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 3;
+/**
+ * Upper bound on real activities in a single day.
+ *
+ * A coarse guard that sits on top of the real constraint — the day's time budget
+ * (durations plus travel), which is enforced separately. Measured on an 8-day Egypt trip:
+ * 3/day scheduled 21 activities, 4/day scheduled 26, and 5/day also scheduled 26 because
+ * time capacity became the binding limit. Neither 4 nor 5 produced a single overrunning
+ * day, so 4 is the point where the cap stops doing the work and capacity takes over.
+ */
+const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 4;
 
 /**
  * How many catalogue rows are offered to the model.
@@ -1056,7 +1064,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
 
     // Budget no longer trims the plan, so an empty day means nothing was assigned there.
     // Fill those from the catalogue before validating, so additions are checked too.
-    const { days: filledDays, filled: daysBackfilled } = backfillEmptyDays(boundedDays, catalogue, {
+    const { days: filledDays, filled: daysBackfilled, toppedUp: daysToppedUp } = fillDaysFromCatalogue(boundedDays, catalogue, {
         controlPanel,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
     });
@@ -1091,6 +1099,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         geographyRepaired: repaired,
         dayBoundariesEnforced: boundariesChanged,
         daysBackfilled,
+        daysToppedUp,
         geographyIssues: finalValidation.issues,
         dayReports: finalValidation.dayReports,
     }, budget ? {

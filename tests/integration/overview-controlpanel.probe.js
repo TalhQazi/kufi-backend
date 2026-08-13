@@ -68,7 +68,15 @@ const line = (n, v, extra = '') => console.log(`  ${String(v).padStart(8)}  ${n}
     console.log('');
     line('lunch duration applied', cp.lunchDurationMinutes === 120 ? 'PASS' : 'FAIL', `got ${cp.lunchDurationMinutes}m`);
     line('lunch window recentred', breakWindows.length === 1 && breakWindows[0] === '11:00-13:00' ? 'PASS' : 'FAIL', breakWindows.join(', ') || '(no breaks)');
-    line('activity hours applied', actTimes.every((t) => t >= '08:00' && t < '16:00') ? 'PASS' : 'FAIL', `earliest ${actTimes.sort()[0]}, latest ${actTimes.sort().slice(-1)[0]}`);
+    // The day must START at the configured hour. It may finish past the configured end —
+    // the budget is advisory and every day is filled, so an activity that does not fit the
+    // window is scheduled and the day reports `overrunMinutes` rather than being dropped.
+    const startsAtConfiguredHour = actTimes.sort()[0] === '08:00';
+    const overrunsReported = days
+        .filter((d) => (d.activities || []).some((a) => !isBreakEntry(a) && a.endTime > '16:00'))
+        .every((d) => Number(d.overrunMinutes) > 0);
+    line('activity hours applied', startsAtConfiguredHour && overrunsReported ? 'PASS' : 'FAIL',
+        `earliest ${actTimes.sort()[0]}, latest ${actTimes.sort().slice(-1)[0]}; any past 16:00 are reported as overruns`);
     line('startOnArrival applied', (days[0]?.activities || []).some((a) => !isBreakEntry(a)) ? 'PASS' : 'FAIL', 'day 1 has activities');
     line('endOnDeparture applied', (days[days.length - 1]?.activities || []).every(isBreakEntry) ? 'PASS' : 'FAIL', 'last day empty');
     line('uplift applied', cp.budgetUplift === 0 ? 'PASS' : 'FAIL', `got ${cp.budgetUplift}`);

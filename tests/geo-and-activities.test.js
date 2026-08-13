@@ -35,7 +35,7 @@ const {
 const {
     planActivitiesAcrossDays,
     repairItineraryGeography,
-    backfillEmptyDays,
+    fillDaysFromCatalogue,
     trimToBudget,
     selectActivitiesForTrip,
 } = require('../utils/itineraryGeoPlanner');
@@ -384,7 +384,7 @@ test('backfill puts something on every schedulable day', () => {
         act('Sphinx', { lat: 29.975, lng: 31.137 }),
     ];
 
-    const { days: filled } = backfillEmptyDays(days, catalogue, { controlPanel: cp, maxPerDay: 3 });
+    const { days: filled } = fillDaysFromCatalogue(days, catalogue, { controlPanel: cp, maxPerDay: 3 });
     assert.equal(countableActivities(filled[0]).length, 0, 'arrival day must stay empty');
     assert.ok(countableActivities(filled[2]).length > 0, 'day 3 filled');
     assert.ok(countableActivities(filled[3]).length > 0, 'day 4 filled');
@@ -400,7 +400,7 @@ test('backfill never duplicates an activity already in the plan', () => {
         { ...act('Pyramids', CAIRO), _id: 'Pyramids' },
         { ...act('Sphinx', { lat: 29.975, lng: 31.137 }), _id: 'Sphinx' },
     ];
-    const { days: filled } = backfillEmptyDays(days, catalogue, { controlPanel: cp, maxPerDay: 3 });
+    const { days: filled } = fillDaysFromCatalogue(days, catalogue, { controlPanel: cp, maxPerDay: 3 });
     const titles = filled.flatMap((d) => countableActivities(d).map((a) => a.title));
     assert.equal(new Set(titles).size, titles.length, 'no activity may appear twice');
 });
@@ -417,7 +417,7 @@ test('when the catalogue is exhausted, a surplus day donates to an empty one', (
         { day: 2, date: '2026-09-02', activities: [] },
     ];
     // Empty catalogue: nothing new to add, so it must rebalance.
-    const { days: filled } = backfillEmptyDays(days, [], { controlPanel: cp, maxPerDay: 3 });
+    const { days: filled } = fillDaysFromCatalogue(days, [], { controlPanel: cp, maxPerDay: 3 });
     assert.equal(countableActivities(filled[1]).length, 1, 'the empty day received one');
     assert.equal(countableActivities(filled[0]).length, 1, 'the donor kept one');
 });
@@ -428,7 +428,7 @@ test('backfill leaves an already-complete plan untouched', () => {
         { day: 1, date: '2026-09-01', activities: [{ ...act('Pyramids', CAIRO), activityId: 'a' }] },
         { day: 2, date: '2026-09-02', activities: [{ ...act('Sphinx', { lat: 29.975, lng: 31.137 }), activityId: 'b' }] },
     ];
-    const { days: filled, filled: n } = backfillEmptyDays(days, [], { controlPanel: cp });
+    const { days: filled, filled: n } = fillDaysFromCatalogue(days, [], { controlPanel: cp });
     assert.equal(n, 0);
     assert.deepEqual(filled, days);
 });

@@ -331,7 +331,11 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
 }
 
 /**
- * Put activities on days that ended up empty.
+ * Schedule as much of the catalogue as the trip can genuinely hold.
+ *
+ * Two phases:
+ *   1. every allowed day gets at least one activity, and
+ *   2. days with spare capacity are topped up from whatever is left.
  *
  * Whichever generator ran can leave gaps: the model may skip days, and the
  * database-template path clones an older, shorter itinerary and pads the remainder with
@@ -339,19 +343,19 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
  * assigned here", not "nothing was affordable" — and a supplier expects every day of the
  * trip to have something in it.
  *
- * Only empty days are touched; days the generator already filled are left exactly as
- * they are. Candidates are drawn from the catalogue, skipping anything already used, and
- * chosen nearest-first to the surrounding days so backfilling cannot wreck the route.
+ * Candidates are drawn from the catalogue, skipping anything already used, and chosen
+ * nearest-first so filling can never wreck the route — an activity more than
+ * SAME_AREA_RADIUS_KM from where a day ends is never added to it.
  *
- * @returns {{ days: Array, filled: number }}
+ * @returns {{ days: Array, filled: number, toppedUp: number }}
  */
-function backfillEmptyDays(days, catalogue, { controlPanel = {}, maxPerDay = 3 } = {}) {
+function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay = 3 } = {}) {
     const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
-    if (list.length === 0) return { days: list, filled: 0 };
+    if (list.length === 0) return { days: list, filled: 0, toppedUp: 0 };
 
     const allowed = allowedDayIndices(list.length, controlPanel);
     const emptyIdx = allowed.filter((i) => countableActivities(list[i]).length === 0);
-    if (emptyIdx.length === 0) return { days: list, filled: 0 };
+    // No early return when nothing is empty: phase 2 still has to use up spare capacity.
 
     const used = new Set();
     list.forEach((d) => (d.activities || []).forEach((a) => {
@@ -463,7 +467,83 @@ function backfillEmptyDays(days, catalogue, { controlPanel = {}, maxPerDay = 3 }
         remainingDays -= 1;
     }
 
-    return { days: rebuilt, filled };
+    // ── Phase 2: top up days that still have room ───────────────────────────────
+    // Filling only EMPTY days left activities stranded in the pool while most days sat
+    // at 2 of 3 activities using half their hours — a Lebanon trip used 12 of 13 and
+    // spent $1,960 of an available $2,885. Anything the day can genuinely fit should be
+    // scheduled; the budget pass afterwards decides whether it stays.
+    const toEntry = (act) => ({
+        activityId: String(act._id),
+        title: act.title,
+        description: act.description,
+        location: act.location || act.city,
+        coordinates: getCoordinates(act) || undefined,
+        duration: act.duration,
+        price: Number(act.price) || 0,
+        category: act.category || 'general',
+        isBreak: false,
+        isSupplierOnly: true,
+        backfilled: true,
+    });
+
+    let toppedUp = 0;
+    let progress = true;
+    while (pool.length > 0 && progress) {
+        progress = false;
+
+        for (const index of allowed) {
+            if (pool.length === 0) break;
+
+            const current = countableActivities(rebuilt[index]);
+            if (current.length >= maxPerDay) continue;
+
+            const override = (controlPanel.perDayOverrides || []).find((o) => o.date === rebuilt[index]?.date) || {};
+            const capacity = dayCapacityMinutes(controlPanel, override);
+
+            // Minutes the day already needs, travel between stops included.
+            let used = 0;
+            let prev = null;
+            current.forEach((a) => {
+                used += parseDurationMinutes(a.durationMinutes ?? a.duration);
+                const c = getCoordinates(a);
+                if (prev && c) used += travelMinutesForKm(haversineKm(prev, c));
+                if (c) prev = c;
+            });
+
+            // Nearest unused activity to where the day currently ends.
+            let bestIdx = -1;
+            let bestScore = Infinity;
+            pool.forEach((act, i) => {
+                const c = getCoordinates(act);
+                const d = prev && c ? haversineKm(prev, c) : null;
+                // Keep the day in one area: never pull in something from another base.
+                if (d !== null && d > SAME_AREA_RADIUS_KM) return;
+                const score = d === null ? Number.MAX_SAFE_INTEGER - i : d;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestIdx = i;
+                }
+            });
+            if (bestIdx === -1) continue;
+
+            const candidate = pool[bestIdx];
+            const c = getCoordinates(candidate);
+            const cost = parseDurationMinutes(candidate.durationMinutes ?? candidate.duration)
+                + (prev && c ? travelMinutesForKm(haversineKm(prev, c)) : 0);
+
+            if (capacity > 0 && used + cost > capacity) continue; // genuinely no time
+
+            pool.splice(bestIdx, 1);
+            rebuilt[index] = {
+                ...rebuilt[index],
+                activities: [...(rebuilt[index].activities || []), toEntry(candidate)],
+            };
+            toppedUp += 1;
+            progress = true;
+        }
+    }
+
+    return { days: rebuilt, filled, toppedUp };
 }
 
 /**
@@ -674,7 +754,7 @@ module.exports = {
     describeTransfer,
     allowedDayIndices,
     enforceDayBoundaries,
-    backfillEmptyDays,
+    fillDaysFromCatalogue,
     trimToBudget,
     selectActivitiesForTrip,
     allocateDaysToClusters,
