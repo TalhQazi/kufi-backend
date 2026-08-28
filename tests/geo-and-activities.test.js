@@ -25,6 +25,7 @@ const {
     orderClustersByRoute,
     parseDurationMinutes,
     travelMinutesForKm,
+    travelMinutesBetween,
     transportModeForKm,
     dayCapacityMinutes,
     validateItineraryGeography,
@@ -37,6 +38,7 @@ const {
     repairItineraryGeography,
     fillDaysFromCatalogue,
     trimToBudget,
+    spendUpToBudget,
     selectActivitiesForTrip,
 } = require('../utils/itineraryGeoPlanner');
 
@@ -433,6 +435,28 @@ test('backfill leaves an already-complete plan untouched', () => {
     assert.deepEqual(filled, days);
 });
 
+test('fillDaysFromCatalogue does not dump the catalogue past the budget', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true, activityStartTime: '09:00', activityEndTime: '19:00' };
+    const days = [
+        { day: 1, date: '2026-09-01', activities: [] },
+        { day: 2, date: '2026-09-02', activities: [] },
+        { day: 3, date: '2026-09-03', activities: [] },
+    ];
+    const catalogue = [
+        act('A', CAIRO, { price: 40 }),
+        act('B', CAIRO, { price: 40 }),
+        act('C', CAIRO, { price: 40 }),
+        act('D', CAIRO, { price: 40 }),
+        act('E', CAIRO, { price: 40 }),
+        act('F', CAIRO, { price: 40 }),
+    ];
+    const { days: filled } = fillDaysFromCatalogue(days, catalogue, { controlPanel: cp, maxPerDay: 4, budget: 80 });
+    const spend = filled.reduce((t, d) => t + countableActivities(d).reduce((s, a) => s + (Number(a.price) || 0), 0), 0);
+    assert.ok(spend <= 80, `spend $${spend} must stay within $80`);
+    const count = filled.reduce((t, d) => t + countableActivities(d).length, 0);
+    assert.ok(count <= 2, `at most two $40 activities fit a $80 cap, got ${count}`);
+});
+
 // ─── Travel time rounds to tidy clock values ─────────────────────────────────
 
 test('travel time is rounded UP to a clean 5-minute step', () => {
@@ -491,16 +515,15 @@ test('trimToBudget drops the most expensive surplus first', () => {
     assert.ok(titles.includes('Cheap') && titles.includes('Mid'));
 });
 
-test('trimToBudget never empties a day, even far over budget', () => {
+test('trimToBudget empties a day when that is the only way to honour the ceiling', () => {
     const cp = { startOnArrival: true, endOnDeparture: true };
     const days = [
         { day: 1, activities: [priced('A', CAIRO, 500)] },
         { day: 2, activities: [priced('B', GIZA_MUSEUM, 500)] },
     ];
     const { days: out, spend } = trimToBudget(days, { budget: 10, controlPanel: cp });
-    assert.equal(countableActivities(out[0]).length, 1);
-    assert.equal(countableActivities(out[1]).length, 1);
-    assert.equal(spend, 1000, 'the overrun is reported, not hidden by emptying days');
+    assert.equal(spend, 0, 'both activities exceed a $10 cap, so both are dropped');
+    assert.equal(countableActivities(out[0]).length + countableActivities(out[1]).length, 0);
 });
 
 test('trimToBudget leaves a plan within budget untouched', () => {
@@ -537,4 +560,84 @@ test('selectActivitiesForTrip never prices out a traveller-selected activity', (
     const pool = [...required, priced('Cheap', CAIRO, 10)];
     const out = selectActivitiesForTrip(pool, { required, budget: 50, activeDays: 2, maxPerDay: 3 });
     assert.ok(out.some((a) => a.title === 'Traveller pick'), 'a required activity survives any budget');
+});
+
+test('spendUpToBudget upgrades a cheap Egypt-style plan toward a $1500 budget', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [
+        { day: 1, activities: [priced('Cheap walk', CAIRO, 20)] },
+        { day: 2, activities: [priced('Cheap cafe', GIZA_MUSEUM, 25)] },
+        { day: 3, activities: [priced('Cheap market', CAIRO, 30)] },
+    ];
+    const catalogue = [
+        act('Cheap walk', CAIRO, { price: 20 }),
+        act('Cheap cafe', GIZA_MUSEUM, { price: 25 }),
+        act('Cheap market', CAIRO, { price: 30 }),
+        act('Pyramids Tour', CAIRO, { price: 400 }),
+        act('Museum Day', GIZA_MUSEUM, { price: 350 }),
+        act('Nile Dinner', CAIRO, { price: 280 }),
+        act('Desert Safari', CAIRO, { price: 450 }),
+    ];
+    const { days: out, added, swapped, spend } = spendUpToBudget(days, catalogue, {
+        budget: 1500,
+        controlPanel: cp,
+        maxPerDay: 4,
+    });
+    assert.ok(added + swapped > 0, 'the cheap plan must be upgraded');
+    assert.ok(spend >= 1200, `spend should approach the $1500 target, got $${spend}`);
+    assert.ok(spend <= 1500, `must not exceed the ceiling, got $${spend}`);
+    assert.equal(countableActivities(out[0]).length >= 1, true);
+    assert.equal(countableActivities(out[1]).length >= 1, true);
+    assert.equal(countableActivities(out[2]).length >= 1, true);
+});
+
+test('spendUpToBudget does not pull a Luxor activity onto a Cairo day', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [{ day: 1, activities: [priced('Cairo walk', CAIRO, 20)] }];
+    const catalogue = [
+        act('Cairo walk', CAIRO, { price: 20 }),
+        act('Karnak Temple', LUXOR, { price: 900 }),
+    ];
+    const { days: out, spend } = spendUpToBudget(days, catalogue, {
+        budget: 1500,
+        controlPanel: cp,
+        maxPerDay: 4,
+    });
+    const titles = out.flatMap((d) => countableActivities(d).map((a) => a.title));
+    assert.ok(!titles.includes('Karnak Temple'), 'a different base must not be merged into the Cairo day');
+    assert.equal(spend, 20);
+});
+
+test('spendUpToBudget is a no-op when the plan is already near the budget', () => {
+    const cp = { startOnArrival: true, endOnDeparture: true };
+    const days = [{ day: 1, activities: [priced('A', CAIRO, 700), priced('B', CAIRO, 600)] }];
+    const { added, swapped } = spendUpToBudget(days, [act('Extra', CAIRO, { price: 50 })], {
+        budget: 1500,
+        controlPanel: cp,
+        maxPerDay: 4,
+    });
+    assert.equal(added, 0);
+    assert.equal(swapped, 0);
+});
+
+test('Google Distance Matrix minutes are used for intercity legs', () => {
+    const cairo = { name: 'Cairo', lat: 30.04, lng: 31.24 };
+    const luxor = { name: 'Luxor', lat: 25.69, lng: 32.64 };
+    const matrix = {
+        points: [cairo, luxor],
+        byPair: new Map([
+            ['Cairo|||Luxor', { durationSeconds: 6 * 3600, distanceMeters: 660000, source: 'google-live' }],
+        ]),
+    };
+    assert.equal(travelMinutesBetween(cairo, luxor, matrix), 360);
+    const local = travelMinutesBetween(CAIRO, GIZA_MUSEUM, matrix);
+    assert.ok(local < 60, 'same-area hops stay on the local model');
+});
+
+test('arrival time shrinks day-1 capacity like v148', () => {
+    const cp = { activityStartTime: '09:00', activityEndTime: '17:00', lunchDurationMinutes: 0, arrivalTime: '13:00' };
+    const full = dayCapacityMinutes(cp, {});
+    const arrival = dayCapacityMinutes(cp, {}, { isArrival: true });
+    assert.equal(full, 8 * 60);
+    assert.equal(arrival, 4 * 60);
 });

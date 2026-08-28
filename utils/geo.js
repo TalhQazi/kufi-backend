@@ -108,6 +108,28 @@ function travelMinutesForKm(km) {
     return roundUpToStep(raw);
 }
 
+/**
+ * Door-to-door minutes between two coordinates or activity-like objects.
+ *
+ * Intercity legs use the Google Distance Matrix when one was primed for this run
+ * (same as Kufi v148). Local hops and missing cells fall back to haversine.
+ */
+function travelMinutesBetween(from, to, routeMatrix) {
+    const a = getCoordinates(from);
+    const b = getCoordinates(to);
+    if (!a || !b) return 0;
+    if (routeMatrix) {
+        try {
+            const { matrixTravelMinutes } = require('./routeMatrix');
+            const live = matrixTravelMinutes(a, b, routeMatrix);
+            if (live != null) return live;
+        } catch {
+            // The matrix module is optional at boot; haversine still works.
+        }
+    }
+    return travelMinutesForKm(haversineKm(a, b));
+}
+
 /** The transport a leg of this length realistically requires. */
 function transportModeForKm(km) {
     if (!isFiniteNumber(km) || km <= SAME_AREA_RADIUS_KM) return 'local';
@@ -320,9 +342,20 @@ function resolveLunchWindow(controlPanel = {}, override = {}) {
 }
 
 /** Maximum bookable minutes in a day, honouring the control panel window and lunch. */
-function dayCapacityMinutes(controlPanel = {}, override = {}) {
-    const start = parseTimeToMinutes(override.startTime || controlPanel.activityStartTime, 9 * 60);
-    const end = parseTimeToMinutes(override.endTime || controlPanel.activityEndTime, 19 * 60);
+function dayCapacityMinutes(controlPanel = {}, override = {}, dayFlags = {}) {
+    let start = parseTimeToMinutes(override.startTime || controlPanel.activityStartTime, 9 * 60);
+    let end = parseTimeToMinutes(override.endTime || controlPanel.activityEndTime, 19 * 60);
+
+    // Optional clock times from the v148-style control panel shrink the first/last day.
+    if (dayFlags.isArrival && controlPanel.arrivalTime) {
+        const arrival = parseTimeToMinutes(controlPanel.arrivalTime, null);
+        if (arrival != null) start = Math.max(start, arrival);
+    }
+    if (dayFlags.isDeparture && controlPanel.departureTime) {
+        const departure = parseTimeToMinutes(controlPanel.departureTime, null);
+        if (departure != null) end = Math.min(end, departure);
+    }
+
     const { durationMinutes } = resolveLunchWindow(controlPanel, override);
 
     const window = Math.max(0, end - start);
@@ -334,7 +367,7 @@ function dayCapacityMinutes(controlPanel = {}, override = {}) {
  *
  * @returns {{ ok: boolean, issues: Array, dayReports: Array }}
  */
-function validateItineraryGeography(days, { controlPanel = {}, isBreakEntry = () => false } = {}) {
+function validateItineraryGeography(days, { controlPanel = {}, isBreakEntry = () => false, routeMatrix = null } = {}) {
     const issues = [];
     const dayReports = [];
     const list = Array.isArray(days) ? days : [];
@@ -344,7 +377,10 @@ function validateItineraryGeography(days, { controlPanel = {}, isBreakEntry = ()
             (a) => !isBreakEntry(a)
         );
         const override = (controlPanel.perDayOverrides || []).find((o) => o.date === day?.date) || {};
-        const capacity = dayCapacityMinutes(controlPanel, override);
+        const capacity = dayCapacityMinutes(controlPanel, override, {
+            isArrival: idx === 0,
+            isDeparture: idx === list.length - 1,
+        });
 
         // Widest separation between any two activities scheduled on this day.
         let maxSpreadKm = 0;
@@ -369,7 +405,7 @@ function validateItineraryGeography(days, { controlPanel = {}, isBreakEntry = ()
         entries.forEach((entry) => {
             requiredMinutes += parseDurationMinutes(entry.durationMinutes ?? entry.duration);
             const here = getCoordinates(entry);
-            if (previous && here) requiredMinutes += travelMinutesForKm(haversineKm(previous, here));
+            if (previous && here) requiredMinutes += travelMinutesBetween(previous, here, routeMatrix);
             if (here) previous = here;
         });
 
@@ -415,6 +451,7 @@ module.exports = {
     haversineKm,
     placeLabel,
     travelMinutesForKm,
+    travelMinutesBetween,
     transportModeForKm,
     parseDurationMinutes,
     clusterByGeography,

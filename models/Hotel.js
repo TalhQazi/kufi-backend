@@ -12,6 +12,12 @@ const HotelSchema = new mongoose.Schema({
     amenities: [{ type: String }],
     status: { type: String, enum: ['active', 'inactive'], default: 'active' },
     sortOrder: { type: Number, default: 0 },
+    latitude: { type: Number },
+    longitude: { type: Number },
+    coordinates: {
+        lat: { type: Number },
+        lng: { type: Number },
+    },
 }, { timestamps: true });
 
 HotelSchema.index({ country: 1, city: 1, status: 1 });

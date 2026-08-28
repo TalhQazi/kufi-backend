@@ -33,7 +33,7 @@ const ItinerarySchema = new mongoose.Schema({
     },
     imageUrl: {
         type: String,
-        default: '/assets/dest-1.jpeg'
+        default: ''
     },
     image: {
         type: String
@@ -104,7 +104,17 @@ const ItinerarySchema = new mongoose.Schema({
             lunchEnd: String
         }],
         hotelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Hotel' },
+        hotelStays: [{
+            id: { type: String },
+            hotelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Hotel' },
+            area: { type: String, default: '' },
+            nights: { type: Number, default: 0 },
+        }],
         numberOfRooms: { type: Number, default: 1 },
+        guestsPerRoom: { type: Number, default: 2 },
+        arrivalTime: { type: String, default: '' },
+        departureTime: { type: String, default: '' },
+        hotelBaseArea: { type: String, default: '' },
         budgetUplift: { type: Number, default: 15 },
         customCosts: [{
             id: String,

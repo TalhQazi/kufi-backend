@@ -9,22 +9,12 @@ const cache = require('../middleware/cache');
 // @access  Public
 router.get('/', cache(60), getActivities);
 
-// @route   GET api/activities/:id
-// @desc    Get activity by ID
-// @access  Public
-//comment added now 
-router.get('/:id', cache(600), getActivityById); // Cache for 10 minutes
-
-// @route   POST api/activities
-// @desc    Create an activity
-// @access  Private (Admin)
-router.post('/', auth(['admin']), createActivity);
-
-// @route   GET api/activities/:id/image
-// @desc    Cover image as cacheable binary. The itinerary generator stores this URL
-//          instead of embedding base64 into every day entry.
-// @access  Public
+// Cover image must be declared before `/:id` so it is not captured as an id.
 router.get('/:id/image', getActivityImage);
+
+router.get('/:id', cache(600), getActivityById);
+
+router.post('/', auth(['admin']), createActivity);
 
 // @route   PUT api/activities/reorder
 // @desc    Bulk-update display order. Declared before '/:id' so it is not shadowed.

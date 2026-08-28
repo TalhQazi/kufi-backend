@@ -22,7 +22,7 @@ const {
     getCoordinates,
     haversineKm,
     placeLabel,
-    travelMinutesForKm,
+    travelMinutesBetween,
     transportModeForKm,
     parseDurationMinutes,
     clusterByGeography,
@@ -129,6 +129,7 @@ function planActivitiesAcrossDays(activities, {
     controlPanel = {},
     origin = null,
     maxPerDay = 3,
+    routeMatrix = null,
 } = {}) {
     const assignments = new Map();
     const transfers = new Map();
@@ -157,7 +158,7 @@ function planActivitiesAcrossDays(activities, {
                     fromLabel: clusterIdx > 0 ? clusterName(allocation[clusterIdx - 1].cluster, clusterIdx - 1) : '',
                     toLabel: clusterName(cluster, clusterIdx),
                     distanceKm: Math.round(distanceKm),
-                    travelMinutes: travelMinutesForKm(distanceKm),
+                    travelMinutes: travelMinutesBetween(previousCentroid, cluster.centroid, routeMatrix),
                     mode: transportModeForKm(distanceKm),
                 });
             }
@@ -195,7 +196,9 @@ function planActivitiesAcrossDays(activities, {
                 if (bucket.length >= maxPerDay) continue;
 
                 const override = (controlPanel.perDayOverrides || []).find((o) => o.date === target.date) || {};
-                let capacity = dayCapacityMinutes(controlPanel, override);
+                let capacity = dayCapacityMinutes(controlPanel, override, {
+                    isArrival: target.index === 0,
+                });
                 const transfer = transfers.get(target.index);
                 if (transfer) capacity -= transfer.travelMinutes;
 
@@ -204,14 +207,17 @@ function planActivitiesAcrossDays(activities, {
                 bucket.forEach((existing) => {
                     used += parseDurationMinutes(existing.durationMinutes ?? existing.duration);
                     const c = getCoordinates(existing);
-                    if (prev && c) used += travelMinutesForKm(haversineKm(prev, c));
+                    if (prev && c) used += travelMinutesBetween(prev, c, routeMatrix);
                     if (c) prev = c;
                 });
                 const here = getCoordinates(act);
                 let cost = parseDurationMinutes(act.durationMinutes ?? act.duration);
-                if (prev && here) cost += travelMinutesForKm(haversineKm(prev, here));
+                if (prev && here) cost += travelMinutesBetween(prev, here, routeMatrix);
 
-                if (capacity <= 0 || used + cost <= capacity) {
+                // Skip days with no remaining time (e.g. an Egypt Cairo→Luxor flight
+                // ate the window). Previously `capacity <= 0` was treated as "always
+                // accept", which dumped every leftover activity onto that one day.
+                if (capacity > 0 && used + cost <= capacity) {
                     bucket.push(act);
                     di = (di + attempts) % clusterDays.length;
                     return;
@@ -268,7 +274,7 @@ function allowedDayIndices(dayCount, controlPanel = {}) {
  *
  * @returns {{ days: Array, changed: boolean }}
  */
-function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDay = 3 } = {}) {
+function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDay = 3, routeMatrix = null } = {}) {
     const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
     if (list.length === 0) return { days: list, changed: false };
 
@@ -305,6 +311,7 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
         controlPanel,
         origin,
         maxPerDay: Math.max(maxPerDay, Math.ceil(pooled.length / activeDays.length)),
+        routeMatrix,
     });
 
     const rebuilt = list.map((day, index) => {
@@ -330,18 +337,77 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
     return { days: rebuilt, changed: true };
 }
 
+function priceOf(activity) {
+    return Number(activity?.price) || 0;
+}
+
+function spendOfDays(days) {
+    return (Array.isArray(days) ? days : []).reduce(
+        (total, day) => total + countableActivities(day).reduce((sum, act) => sum + priceOf(act), 0),
+        0
+    );
+}
+
+function markUsedIds(used, activity) {
+    [activity?.activityId, activity?._id, activity?.title].forEach((value) => {
+        const key = String(value || '').trim();
+        if (key && key !== 'null' && key !== 'undefined') used.add(key);
+    });
+}
+
+function catalogueEntryFrom(act) {
+    return {
+        activityId: String(act._id),
+        title: act.title,
+        description: act.description,
+        location: act.location || act.city,
+        coordinates: getCoordinates(act) || undefined,
+        duration: act.duration,
+        durationMinutes: act.durationMinutes,
+        price: Number(act.price) || 0,
+        category: act.category || 'general',
+        image: act._id ? `/api/activities/${act._id}/image` : (act.image || ''),
+        isBreak: false,
+        isSupplierOnly: true,
+        backfilled: true,
+    };
+}
+
+/**
+ * Whether a proposed activity list still fits one day's hours and stays in one area.
+ */
+function dayWouldFit(day, activities, controlPanel = {}, routeMatrix = null, dayFlags = {}) {
+    const real = (Array.isArray(activities) ? activities : []).filter((a) => a && !isBreakEntry(a));
+    const override = (controlPanel.perDayOverrides || []).find((o) => o.date === day?.date) || {};
+    const capacity = dayCapacityMinutes(controlPanel, override, dayFlags);
+    let used = 0;
+    let prev = null;
+    for (const act of real) {
+        used += parseDurationMinutes(act.durationMinutes ?? act.duration);
+        const coords = getCoordinates(act);
+        if (prev && coords) {
+            const km = haversineKm(prev, coords);
+            if (km > SAME_AREA_RADIUS_KM) return false;
+            used += travelMinutesBetween(prev, coords, routeMatrix);
+        }
+        if (coords) prev = coords;
+    }
+    if (capacity > 0 && used > capacity) return false;
+    return true;
+}
+
 /**
  * Schedule as much of the catalogue as the trip can genuinely hold.
  *
  * Two phases:
- *   1. every allowed day gets at least one activity, and
- *   2. days with spare capacity are topped up from whatever is left.
+ *   1. every allowed empty day gets at most one activity that still fits the budget, and
+ *   2. days with spare capacity and remaining budget are topped up from whatever is left.
  *
  * Whichever generator ran can leave gaps: the model may skip days, and the
  * database-template path clones an older, shorter itinerary and pads the remainder with
- * blanks. The budget no longer trims anything, so an empty day now means "nothing was
- * assigned here", not "nothing was affordable" — and a supplier expects every day of the
- * trip to have something in it.
+ * blanks. Spreading the whole remaining catalogue onto those blanks is what produced a
+ * "maximum itinerary" when budget tolerance was 0%. One-per-empty-day respects the
+ * ceiling; leftover catalogue is only added in phase 2 if spend still has headroom.
  *
  * Candidates are drawn from the catalogue, skipping anything already used, and chosen
  * nearest-first so filling can never wreck the route — an activity more than
@@ -349,7 +415,7 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
  *
  * @returns {{ days: Array, filled: number, toppedUp: number }}
  */
-function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay = 3 } = {}) {
+function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay = 3, budget, routeMatrix = null } = {}) {
     const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
     if (list.length === 0) return { days: list, filled: 0, toppedUp: 0 };
 
@@ -382,19 +448,23 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
     let filled = 0;
     let remainingDays = emptyIdx.length;
 
+    const toEntry = catalogueEntryFrom;
+
     for (const index of emptyIdx) {
-        // Spread what is left evenly rather than dumping it all on the first empty day.
-        const share = pool.length === 0
-            ? 0
-            : Math.max(1, Math.min(maxPerDay, Math.ceil(pool.length / remainingDays)));
         const anchor = anchorFor(index);
 
         const chosen = [];
         let cursor = anchor;
-        while (chosen.length < share && pool.length > 0) {
-            let bestIdx = 0;
+        // One activity per empty day. Using ceil(pool / emptyDays) dumped the whole
+        // catalogue onto the trip, which ignored the supplier's budget ceiling.
+        while (chosen.length < 1 && pool.length > 0) {
+            let bestIdx = -1;
             let bestScore = Infinity;
             pool.forEach((act, i) => {
+                if (typeof budget === 'number') {
+                    const spent = spendOfDays(rebuilt) + chosen.reduce((sum, a) => sum + priceOf(a), 0);
+                    if (spent + priceOf(act) > budget) return;
+                }
                 const coords = getCoordinates(act);
                 const d = cursor && coords ? haversineKm(cursor, coords) : null;
                 const score = d === null ? Number.MAX_SAFE_INTEGER - i : d;
@@ -403,6 +473,7 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
                     bestIdx = i;
                 }
             });
+            if (bestIdx === -1) break;
             const [next] = pool.splice(bestIdx, 1);
             chosen.push(next);
             const c = getCoordinates(next);
@@ -448,19 +519,7 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
             ...rebuilt[index],
             activities: [
                 ...(rebuilt[index].activities || []),
-                ...chosen.map((act) => ({
-                    activityId: String(act._id),
-                    title: act.title,
-                    description: act.description,
-                    location: act.location || act.city,
-                    coordinates: getCoordinates(act) || undefined,
-                    duration: act.duration,
-                    price: Number(act.price) || 0,
-                    category: act.category || 'general',
-                    isBreak: false,
-                    isSupplierOnly: true,
-                    backfilled: true,
-                })),
+                ...chosen.map((act) => toEntry(act)),
             ],
         };
         filled += 1;
@@ -472,20 +531,6 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
     // at 2 of 3 activities using half their hours — a Lebanon trip used 12 of 13 and
     // spent $1,960 of an available $2,885. Anything the day can genuinely fit should be
     // scheduled; the budget pass afterwards decides whether it stays.
-    const toEntry = (act) => ({
-        activityId: String(act._id),
-        title: act.title,
-        description: act.description,
-        location: act.location || act.city,
-        coordinates: getCoordinates(act) || undefined,
-        duration: act.duration,
-        price: Number(act.price) || 0,
-        category: act.category || 'general',
-        isBreak: false,
-        isSupplierOnly: true,
-        backfilled: true,
-    });
-
     let toppedUp = 0;
     let progress = true;
     while (pool.length > 0 && progress) {
@@ -498,7 +543,10 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
             if (current.length >= maxPerDay) continue;
 
             const override = (controlPanel.perDayOverrides || []).find((o) => o.date === rebuilt[index]?.date) || {};
-            const capacity = dayCapacityMinutes(controlPanel, override);
+            const capacity = dayCapacityMinutes(controlPanel, override, {
+                isArrival: index === 0,
+                isDeparture: index === rebuilt.length - 1,
+            });
 
             // Minutes the day already needs, travel between stops included.
             let used = 0;
@@ -506,11 +554,13 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
             current.forEach((a) => {
                 used += parseDurationMinutes(a.durationMinutes ?? a.duration);
                 const c = getCoordinates(a);
-                if (prev && c) used += travelMinutesForKm(haversineKm(prev, c));
+                if (prev && c) used += travelMinutesBetween(prev, c, routeMatrix);
                 if (c) prev = c;
             });
 
-            // Nearest unused activity to where the day currently ends.
+            // Unused activity in the same area. When a budget remains, prefer the
+            // option that closes the gap rather than the cheapest nearby filler.
+            const remainingBudget = typeof budget === 'number' ? budget - spendOfDays(rebuilt) : null;
             let bestIdx = -1;
             let bestScore = Infinity;
             pool.forEach((act, i) => {
@@ -518,7 +568,11 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
                 const d = prev && c ? haversineKm(prev, c) : null;
                 // Keep the day in one area: never pull in something from another base.
                 if (d !== null && d > SAME_AREA_RADIUS_KM) return;
-                const score = d === null ? Number.MAX_SAFE_INTEGER - i : d;
+                const p = priceOf(act);
+                if (remainingBudget != null && p > remainingBudget) return;
+                const geoScore = d === null ? 10_000 : d;
+                const budgetScore = remainingBudget == null ? 0 : (remainingBudget - p);
+                const score = budgetScore * 1000 + geoScore;
                 if (score < bestScore) {
                     bestScore = score;
                     bestIdx = i;
@@ -529,7 +583,7 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
             const candidate = pool[bestIdx];
             const c = getCoordinates(candidate);
             const cost = parseDurationMinutes(candidate.durationMinutes ?? candidate.duration)
-                + (prev && c ? travelMinutesForKm(haversineKm(prev, c)) : 0);
+                + (prev && c ? travelMinutesBetween(prev, c, routeMatrix) : 0);
 
             if (capacity > 0 && used + cost > capacity) continue; // genuinely no time
 
@@ -587,10 +641,14 @@ function selectActivitiesForTrip(activities, { required = [], budget, activeDays
     const price = (a) => Number(a.price) || 0;
     const byPrice = [...rest].sort((a, b) => price(a) - price(b));
 
-    // Stage 1 — guarantee a full trip as cheaply as possible: one activity per day.
-    const minNeeded = Math.max(0, activeDays - selected.length);
-    const cheapest = byPrice.slice(0, minNeeded);
-    cheapest.forEach((a) => { selected.push(a); total += price(a); });
+    // Stage 1 — one cheap activity per day, skipping anything that would breach the ceiling.
+    const targetCount = Math.max(selected.length, activeDays);
+    for (const a of byPrice) {
+        if (selected.length >= targetCount) break;
+        if (typeof budget === 'number' && total + price(a) > budget) continue;
+        selected.push(a);
+        total += price(a);
+    }
 
     // Stage 2 — spend what is left on the best of the remainder, never exceeding the
     // per-day cap. With no budget set, quality ordering alone applies.
@@ -599,6 +657,12 @@ function selectActivitiesForTrip(activities, { required = [], budget, activeDays
     const remaining = rest
         .filter((a) => !chosenIds.has(String(a._id)))
         .sort((a, b) => {
+            // With a budget, spend toward it: take the best-priced fit first.
+            // Without one, keep landmarks and rating as the quality signal.
+            if (typeof budget === 'number') {
+                const priceGap = price(b) - price(a);
+                if (priceGap !== 0) return priceGap;
+            }
             const landmark = (x) => /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum/i.test(String(x.title || ''));
             if (landmark(a) !== landmark(b)) return landmark(a) ? -1 : 1;
             return (Number(b.rating) || 0) - (Number(a.rating) || 0);
@@ -623,10 +687,10 @@ function selectActivitiesForTrip(activities, { required = [], budget, activeDays
  * wholesale, so a 6-day Lebanon trip cost $1,960 whether the traveller asked for $500 or
  * $5,000 — the budget was completely inert.
  *
- * Surplus activities are dropped most-expensive-first, and only from days holding more
- * than one. Every day therefore keeps at least one activity: filling the trip still wins,
- * but within that constraint the total tracks the budget. When even one activity per day
- * exceeds the budget, the plan stops there and the overrun is reported rather than hidden.
+ * Surplus activities are dropped most-expensive-first. Days may go empty when that is
+ * the only way to honour the supplier's ceiling (0% tolerance = the traveller's budget;
+ * N% = budget × (1 + N/100)). Keeping one activity on every day was what left 0%
+ * tolerance generating a maximum itinerary.
  *
  * @returns {{ days: Array, removed: number, spend: number }}
  */
@@ -653,7 +717,7 @@ function trimToBudget(days, { budget, controlPanel = {} } = {}) {
         rebuilt.forEach((day, i) => {
             if (!allowed.has(i)) return;
             const real = countableActivities(day);
-            if (real.length <= 1) return; // never empty a day
+            if (real.length === 0) return;
             real.forEach((act) => {
                 if (priceOf(act) > bestPrice) {
                     bestPrice = priceOf(act);
@@ -677,6 +741,132 @@ function trimToBudget(days, { budget, controlPanel = {} } = {}) {
 }
 
 /**
+ * Raise a cheap plan toward the traveller's activity budget.
+ *
+ * `trimToBudget` only cuts overspend. The AI prompt used to say "prefer cheaper
+ * options", so a $1,500 Egypt request routinely came back at ~$200 — every day
+ * filled, budget unused. This pass adds unused catalogue items, then swaps cheap
+ * scheduled ones for better in-area options, until spend is close to the ceiling
+ * without going over it.
+ *
+ * @returns {{ days: Array, added: number, swapped: number, spend: number }}
+ */
+function spendUpToBudget(days, catalogue, { budget, controlPanel = {}, maxPerDay = 3, routeMatrix = null } = {}) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    let spend = spendOfDays(list);
+    if (typeof budget !== 'number' || budget <= 0 || list.length === 0) {
+        return { days: list, added: 0, swapped: 0, spend };
+    }
+
+    const floor = Math.floor(budget * 0.8);
+    if (spend >= floor) {
+        return { days: list, added: 0, swapped: 0, spend };
+    }
+
+    const allowed = allowedDayIndices(list.length, controlPanel);
+    const used = new Set();
+    list.forEach((day) => (day.activities || []).forEach((act) => markUsedIds(used, act)));
+
+    const pool = (Array.isArray(catalogue) ? catalogue : []).filter((a) => {
+        if (!a?._id) return false;
+        if (used.has(String(a._id)) || used.has(String(a.title || '').trim())) return false;
+        return true;
+    });
+    const rebuilt = [...list];
+    let added = 0;
+    let swapped = 0;
+
+    const proposedList = (day, extra) => [...countableActivities(day), extra];
+    const proposedSwap = (day, oldAct, newAct) => countableActivities(day).map((act) => (act === oldAct ? newAct : act));
+
+    // Phase 1 — add unused activities that raise spend without exceeding the ceiling.
+    let progress = true;
+    while (progress && spend < floor && pool.length > 0) {
+        progress = false;
+        let best = null;
+        allowed.forEach((index) => {
+            const day = rebuilt[index];
+            if (countableActivities(day).length >= maxPerDay) return;
+            pool.forEach((act, poolIdx) => {
+                const price = priceOf(act);
+                if (price <= 0 || spend + price > budget) return;
+                const entry = catalogueEntryFrom(act);
+                if (!dayWouldFit(day, proposedList(day, entry), controlPanel, routeMatrix, {
+                    isArrival: index === 0,
+                    isDeparture: index === rebuilt.length - 1,
+                })) return;
+                if (!best || price > best.price) {
+                    best = { index, poolIdx, price, entry };
+                }
+            });
+        });
+        if (!best) break;
+        const [picked] = pool.splice(best.poolIdx, 1);
+        markUsedIds(used, picked);
+        rebuilt[best.index] = {
+            ...rebuilt[best.index],
+            activities: [...(rebuilt[best.index].activities || []), best.entry],
+        };
+        spend += best.price;
+        added += 1;
+        progress = true;
+    }
+
+    // Phase 2 — swap a cheap scheduled stop for a better unused one in the same area.
+    progress = true;
+    while (progress && spend < floor && pool.length > 0) {
+        progress = false;
+        let bestSwap = null;
+        allowed.forEach((index) => {
+            const day = rebuilt[index];
+            countableActivities(day).forEach((oldAct) => {
+                const oldPrice = priceOf(oldAct);
+                pool.forEach((cand, poolIdx) => {
+                    const newPrice = priceOf(cand);
+                    const delta = newPrice - oldPrice;
+                    if (delta <= 0 || spend + delta > budget) return;
+                    const entry = catalogueEntryFrom(cand);
+                    if (!dayWouldFit(day, proposedSwap(day, oldAct, entry), controlPanel, routeMatrix, {
+                        isArrival: index === 0,
+                        isDeparture: index === rebuilt.length - 1,
+                    })) return;
+                    const oldCoords = getCoordinates(oldAct);
+                    const newCoords = getCoordinates(cand);
+                    if (oldCoords && newCoords && haversineKm(oldCoords, newCoords) > SAME_AREA_RADIUS_KM) return;
+                    if (!bestSwap || delta > bestSwap.delta) {
+                        bestSwap = { index, oldAct, poolIdx, delta, entry, cand };
+                    }
+                });
+            });
+        });
+        if (!bestSwap) break;
+        const [picked] = pool.splice(bestSwap.poolIdx, 1);
+        const oldId = String(bestSwap.oldAct?.activityId || bestSwap.oldAct?._id || '').trim();
+        rebuilt[bestSwap.index] = {
+            ...rebuilt[bestSwap.index],
+            activities: (rebuilt[bestSwap.index].activities || []).map((act) => (
+                act === bestSwap.oldAct ? bestSwap.entry : act
+            )),
+        };
+        if (oldId) {
+            used.delete(oldId);
+            used.delete(String(bestSwap.oldAct?.title || '').trim());
+            used.delete(String(bestSwap.oldAct?._id || '').trim());
+            const original = (Array.isArray(catalogue) ? catalogue : []).find((a) => (
+                String(a._id) === oldId || String(a.title || '').trim() === String(bestSwap.oldAct?.title || '').trim()
+            ));
+            if (original) pool.push(original);
+        }
+        markUsedIds(used, picked);
+        spend += bestSwap.delta;
+        swapped += 1;
+        progress = true;
+    }
+
+    return { days: rebuilt, added, swapped, spend };
+}
+
+/**
  * Post-generation repair. Validates the produced days and, when they are not
  * geographically feasible, redistributes the same activities into a plan that is.
  *
@@ -685,9 +875,9 @@ function trimToBudget(days, { budget, controlPanel = {} } = {}) {
  *
  * @returns {{ days, validation, repaired: boolean, repairedValidation: object|null }}
  */
-function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxPerDay = 3 } = {}) {
+function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxPerDay = 3, routeMatrix = null } = {}) {
     const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
-    const validation = validateItineraryGeography(list, { controlPanel, isBreakEntry });
+    const validation = validateItineraryGeography(list, { controlPanel, isBreakEntry, routeMatrix });
 
     if (validation.ok || list.length === 0) {
         return { days: list, validation, repaired: false, repairedValidation: null };
@@ -725,6 +915,7 @@ function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxP
         controlPanel,
         origin,
         maxPerDay: Math.max(maxPerDay, Math.ceil(pooled.length / activeDays.length)),
+        routeMatrix,
     });
 
     const rebuilt = list.map((day, index) => {
@@ -739,7 +930,7 @@ function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxP
         };
     });
 
-    const repairedValidation = validateItineraryGeography(rebuilt, { controlPanel, isBreakEntry });
+    const repairedValidation = validateItineraryGeography(rebuilt, { controlPanel, isBreakEntry, routeMatrix });
 
     // Only accept the repair if it genuinely improved things.
     if (repairedValidation.issues.length >= validation.issues.length) {
@@ -756,6 +947,7 @@ module.exports = {
     enforceDayBoundaries,
     fillDaysFromCatalogue,
     trimToBudget,
+    spendUpToBudget,
     selectActivitiesForTrip,
     allocateDaysToClusters,
     planActivitiesAcrossDays,

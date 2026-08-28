@@ -49,8 +49,8 @@ const sanitizeActivityPayload = (body) => {
  * biggest cost in this endpoint. Callers that only render a handful of cards should ask
  * for a `limit`; callers that do not need pictures at all can pass `fields=summary`.
  */
-const LIST_EXCLUDED_FIELDS = '-images -description -addOns -coordinates';
-const SUMMARY_FIELDS = '_id title location country price duration category rating reviews status order createdAt';
+const LIST_EXCLUDED_FIELDS = '-image -images -description -addOns -coordinates';
+const SUMMARY_FIELDS = '_id title location country price duration category rating reviews status order createdAt imageUrl';
 
 // Get all activities
 exports.getActivities = async (req, res) => {
@@ -83,9 +83,8 @@ exports.getActivities = async (req, res) => {
         // Exclude every heavy field from the list payload.
         // `image` and `images` are stored as base64 strings (some docs >5MB),
         // so streaming them from Atlas → backend → client made this endpoint
-        // take 30+ seconds. The frontend list views render a placeholder
-        // when image is null and load the full image only on the detail
-        // endpoint (`GET /api/activities/:id`) when the user opens an item.
+        // take 30+ seconds. Cards load the photo from `imageUrl`
+        // (`GET /api/activities/:id/image`) instead of embedding the blob.
         const wantsSummary = String(req.query.fields || '').toLowerCase() === 'summary';
         const selectFields = wantsSummary ? SUMMARY_FIELDS : LIST_EXCLUDED_FIELDS;
 
@@ -113,11 +112,22 @@ exports.getActivities = async (req, res) => {
         if (page > 1) pipeline.push({ $skip: (page - 1) * limit });
         pipeline.push({ $limit: limit });
 
+        // Point every row at the binary image route so list UIs can show the stored
+        // photo without shipping the base64 field. The route itself falls back from
+        // `image` to `images[0]`.
+        pipeline.push({
+            $addFields: {
+                imageUrl: {
+                    $concat: ['/api/activities/', { $toString: '$_id' }, '/image'],
+                },
+            },
+        });
+
         // Inclusion and exclusion cannot be mixed in one $project, so `_rank` is only
         // named in the exclusion form — the inclusion form drops it by omission.
         const projection = wantsSummary
             ? SUMMARY_FIELDS.split(' ').reduce((acc, f) => ({ ...acc, [f]: 1 }), {})
-            : { images: 0, description: 0, addOns: 0, coordinates: 0, _rank: 0 };
+            : { image: 0, images: 0, description: 0, addOns: 0, coordinates: 0, _rank: 0 };
         pipeline.push({ $project: projection });
 
         const activities = await Activity.aggregate(pipeline).option({ maxTimeMS: 10000 });
@@ -145,10 +155,11 @@ exports.getActivityImage = async (req, res) => {
     try {
         if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).end();
 
-        const activity = await Activity.findById(req.params.id).select('image updatedAt').lean();
-        if (!activity?.image) return res.status(404).end();
+        const activity = await Activity.findById(req.params.id).select('image images updatedAt').lean();
+        if (!activity) return res.status(404).end();
 
-        const raw = String(activity.image).trim();
+        const raw = String(activity.image || (Array.isArray(activity.images) && activity.images[0]) || '').trim();
+        if (!raw) return res.status(404).end();
         const match = /^data:([^;,]+);base64,(.*)$/s.exec(raw);
 
         // Images stored as a plain URL are simply redirected to.

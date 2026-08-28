@@ -13,8 +13,16 @@ const {
     toDateString,
     addDays,
     daysBetween,
+    nightsBetween,
     getDayName,
 } = require('../utils/calendarDate');
+const {
+    normalizeHotelStays,
+    sanitizeHotelStays,
+    hotelCostFromStays,
+    hotelsByIdFromDocs,
+    hotelIdOf,
+} = require('../utils/hotelStays');
 const {
     isBreakEntry,
     countActivities,
@@ -26,6 +34,7 @@ const {
     getCoordinates,
     haversineKm,
     travelMinutesForKm,
+    travelMinutesBetween,
     clusterByGeography,
     validateItineraryGeography,
     parseDurationMinutes,
@@ -43,8 +52,11 @@ const {
     enforceDayBoundaries,
     fillDaysFromCatalogue,
     trimToBudget,
+    spendUpToBudget,
     selectActivitiesForTrip,
+    clusterName,
 } = require('../utils/itineraryGeoPlanner');
+const { resolveRouteMatrix } = require('../utils/routeMatrix');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -52,11 +64,33 @@ function escapeRegExp(value) {
     return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+async function primeRouteMatrix(catalogue, hotelCoords) {
+    const clusters = clusterByGeography(catalogue);
+    const points = [];
+    if (hotelCoords?.lat != null && hotelCoords?.lng != null) {
+        points.push({ name: 'Hotel', lat: hotelCoords.lat, lng: hotelCoords.lng });
+    }
+    clusters.forEach((cluster, i) => {
+        if (!cluster?.centroid) return;
+        points.push({
+            name: clusterName(cluster, i),
+            lat: cluster.centroid.lat,
+            lng: cluster.centroid.lng,
+        });
+    });
+    return resolveRouteMatrix(points);
+}
+
 function getOpenAIClient() {
     const key = process.env.OPENAI_API_KEY;
     if (!key) return null;
     return new OpenAI({ apiKey: key });
 }
+
+const HOTEL_POPULATE = [
+    { path: 'controlPanel.hotelId' },
+    { path: 'controlPanel.hotelStays.hotelId' },
+];
 
 /**
  * Who may see an itinerary: the traveler it belongs to, the supplier building it, or an
@@ -213,7 +247,65 @@ function sumActivitySpend(days) {
  * same picture was duplicated into every itinerary that used the activity.
  */
 function activityImageUrl(activityId) {
-    return activityId ? `/api/activities/${activityId}/image` : '';
+    const id = String(activityId || '').trim();
+    if (!id || id === 'null' || id === 'undefined' || !/^[a-f0-9]{24}$/i.test(id)) return '';
+    return `/api/activities/${id}/image`;
+}
+
+function mergeActivityLists(...lists) {
+    const map = new Map();
+    lists.flat().forEach((a) => {
+        if (!a) return;
+        const id = a._id ? String(a._id) : '';
+        const key = id && id !== 'null' ? id : `title:${String(a.title || '').trim().toLowerCase()}`;
+        if (!map.has(key)) map.set(key, a);
+    });
+    return [...map.values()];
+}
+
+function firstActivityImage(day) {
+    const acts = Array.isArray(day?.activities) ? day.activities : [];
+    for (const a of acts) {
+        if (a?.image && !isStaticPlaceholder(a.image)) return a.image;
+        if (a?.activityId) return activityImageUrl(a.activityId);
+    }
+    return '';
+}
+
+function isStaticPlaceholder(url) {
+    return /\/assets\/|unsplash\.com/i.test(String(url || ''));
+}
+
+/**
+ * Stamp `/api/activities/:id/image` onto stored days so older itineraries that
+ * never wrote an image (or still point at `/assets/dest-1.jpeg`) still show the
+ * activity photo without requiring a regenerate.
+ */
+function attachActivityImageUrls(doc) {
+    const obj = doc?.toObject ? doc.toObject() : { ...(doc || {}) };
+    obj.days = (Array.isArray(obj.days) ? obj.days : []).map((day) => {
+        const activities = (Array.isArray(day.activities) ? day.activities : []).map((act) => ({
+            ...act,
+            image: (!isStaticPlaceholder(act.image) && act.image) || activityImageUrl(act.activityId) || act.image || '',
+        }));
+        const next = { ...day, activities };
+        next.image = (!isStaticPlaceholder(next.image) && next.image) || firstActivityImage(next) || '';
+        return next;
+    });
+    const cover = firstActivityImage(obj.days[0]);
+    if (!obj.imageUrl || isStaticPlaceholder(obj.imageUrl)) {
+        obj.imageUrl = cover || '';
+    }
+    return obj;
+}
+
+function padDaysToTripLength(days, tripDays) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    const target = Math.max(1, Number(tripDays) || list.length);
+    while (list.length < target) {
+        list.push({ day: list.length + 1, activities: [] });
+    }
+    return list.slice(0, target);
 }
 
 /**
@@ -318,7 +410,7 @@ function buildCataloguePrompt(shortlist, { destination = '' } = {}) {
     return { text: lines.join('\n'), indexToActivity };
 }
 
-function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined, { hotelCoords = null } = {}) {
+function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false, activityBudget = undefined, { hotelCoords = null, required = [], routeMatrix = null } = {}) {
     const cp = itinerary.controlPanel || {};
     const startDate = toDateString(itinerary.startDate);
     const endDate = toDateString(itinerary.endDate);
@@ -327,8 +419,11 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
     // Respect the budget constraint
     // Cheapest-first to guarantee a full trip, then the best of what the budget allows.
     const activeDayCount = countActiveDays(itinerary, tripDays);
+    const requiredActs = Array.isArray(required) && required.length
+        ? required
+        : (isBookingSpecific ? activities : []);
     const usableActs = selectActivitiesForTrip(activities, {
-        required: isBookingSpecific ? activities : [],
+        required: requiredActs,
         budget: activityBudget !== undefined ? activityBudget : itinerary.budget,
         activeDays: activeDayCount,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -396,6 +491,7 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
         controlPanel: cp,
         origin: hotelCoords || null,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
     });
 
     activeDayIndices.forEach((dayIdx) => {
@@ -481,7 +577,13 @@ function hydrateDayActivities(days, catalogue) {
                     (linkedId && byId.get(linkedId)) ||
                     byTitle.get(String(act.title || '').trim().toLowerCase());
 
-                if (!match) return { ...act, activityId: linkedId };
+                if (!match) {
+                    return {
+                        ...act,
+                        activityId: linkedId,
+                        image: act.image || activityImageUrl(linkedId),
+                    };
+                }
 
                 const coords = getCoordinates(act) || getCoordinates(match);
                 return {
@@ -660,7 +762,7 @@ exports.createItinerary = async (req, res) => {
             if (existingForBooking) {
                 applyBudgetToDocument(existingForBooking);
                 await existingForBooking.save();
-                await existingForBooking.populate('controlPanel.hotelId');
+                await existingForBooking.populate(HOTEL_POPULATE);
                 return res.json(existingForBooking);
             }
         }
@@ -697,7 +799,7 @@ exports.createItinerary = async (req, res) => {
         const itinerary = new Itinerary(itineraryData);
 
         await itinerary.save();
-        await itinerary.populate('controlPanel.hotelId');
+        await itinerary.populate(HOTEL_POPULATE);
 
         try {
             if (itinerary.userId) {
@@ -726,8 +828,8 @@ exports.getItineraryById = async (req, res) => {
     try {
         const itinerary = await loadItineraryFor(req, res, 'read');
         if (!itinerary) return;
-        await itinerary.populate('controlPanel.hotelId');
-        res.json(itinerary.toObject());
+        await itinerary.populate(HOTEL_POPULATE);
+        res.json(attachActivityImageUrls(itinerary));
     } catch (err) {
         console.error(err.message);
         res.status(500).json({ msg: 'Server error', error: err?.message });
@@ -741,13 +843,13 @@ exports.getItineraryByBookingId = async (req, res) => {
             return res.status(400).json({ msg: 'Invalid bookingId format' });
         }
 
-        const itinerary = await Itinerary.findOne({ bookingId }).populate('controlPanel.hotelId').lean();
+        const itinerary = await Itinerary.findOne({ bookingId }).populate(HOTEL_POPULATE).lean();
 
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found for this booking' });
         if (!canAccessItinerary(itinerary, req.user)) {
             return res.status(404).json({ msg: 'Itinerary not found for this booking' });
         }
-        res.json(itinerary);
+        res.json(attachActivityImageUrls(itinerary));
     } catch (err) {
         console.error('getItineraryByBookingId error:', err?.message);
         res.status(500).json({ msg: 'Server error', error: err?.message });
@@ -812,7 +914,13 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
     if (!Array.isArray(list) || list.length === 0) {
         throw new Error('AI reply did not contain a usable day array');
     }
-    if (tripDays) list = list.slice(0, tripDays);
+
+    // The model often returns a single packed day for a multi-day Egypt trip. Pad
+    // (don't just slice) so fillDaysFromCatalogue has empty days to spread into.
+    if (tripDays && list.length > tripDays) list = list.slice(0, tripDays);
+    while (tripDays && list.length < tripDays) {
+        list.push({ day: list.length + 1, ids: [], activities: [] });
+    }
 
     // The prompt forbids repeats, but the model does not always comply — and asking it to
     // fill every day makes repetition more tempting. Deduplicate here so the same
@@ -893,7 +1001,7 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
  *   - replaces any break entries with exactly one lunch break at the derived window
  *     (or none at all when the duration is zero).
  */
-function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
+function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMatrix = null) {
     const cp = controlPanel?.toObject ? controlPanel.toObject() : (controlPanel || {});
     const start = toDateString(tripStartDate);
 
@@ -921,8 +1029,17 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
         // with `index % slots.length`, so a day with more activities than slots handed
         // two of them the *same* start time (both showing 08:00). Packing forwards can
         // never collide.
-        const dayStart = parseTimeToMinutes(activityStartTime, 9 * 60);
+        let dayStart = parseTimeToMinutes(activityStartTime, 9 * 60);
         const dayEnd = parseTimeToMinutes(activityEndTime, 19 * 60);
+        if (idx === 0 && cp.arrivalTime) {
+            const arrival = parseTimeToMinutes(cp.arrivalTime, null);
+            if (arrival != null) dayStart = Math.max(dayStart, arrival);
+        }
+        let effectiveEnd = dayEnd;
+        if (idx === marked.length - 1 && cp.departureTime) {
+            const departure = parseTimeToMinutes(cp.departureTime, null);
+            if (departure != null) effectiveEnd = Math.min(dayEnd, departure);
+        }
         const breakStart = parseTimeToMinutes(lunchStart, null);
         const breakEnd = parseTimeToMinutes(lunchEnd, null);
         const hasBreak = durationMinutes > 0 && breakStart !== null && breakEnd !== null;
@@ -939,8 +1056,7 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
             // 20km hop was printed as if the traveller teleported. The gap is now real.
             let travelMinutes = 0;
             if (previousCoords && here) {
-                const km = haversineKm(previousCoords, here);
-                if (km !== null) travelMinutes = travelMinutesForKm(km);
+                travelMinutes = travelMinutesBetween(previousCoords, here, routeMatrix);
                 cursor += travelMinutes;
             }
 
@@ -950,7 +1066,7 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null) {
             // after it, wasting the entire morning and ending at 22:07. A long activity
             // simply spans lunch, which is what happens in reality.
             if (hasBreak && cursor < breakEnd && cursor + length > breakStart) {
-                const fitsAfterBreak = breakEnd + length <= dayEnd;
+                const fitsAfterBreak = breakEnd + length <= effectiveEnd;
                 if (fitsAfterBreak) cursor = breakEnd;
             }
 
@@ -1021,6 +1137,11 @@ function normalizeTripDays(days, tripStartDate = null) {
             day: idx + 1,
             date: derivedDate,
             dayName: getDayName(derivedDate) || item.dayName || '',
+            image: item.image || firstActivityImage(item) || '',
+            title: item.title
+                || item.dayName
+                || (Array.isArray(item.activities) && item.activities.find((a) => a?.title && !a.isBreak)?.title)
+                || `Day ${idx + 1}`,
             isArrivalDay: isArrival,
             isDepartureDay: isDeparture,
             departureNote: isDeparture
@@ -1042,7 +1163,7 @@ function normalizeTripDays(days, tripStartDate = null) {
  * run into an immediate draft and silently move the request between supplier tabs.
  * Pass { persist: true } to opt back into the old write-through behaviour.
  */
-async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null, catalogue = [] } = {}) {
+async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null, catalogue = [], routeMatrix = null } = {}) {
     applyBudgetToDocument(itinerary);
 
     // ── Post-generation validation layer ────────────────────────────────────────
@@ -1053,13 +1174,18 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         ? itinerary.controlPanel.toObject()
         : (itinerary.controlPanel || {});
 
+    const tripDayCount = (toDateString(itinerary.startDate) && toDateString(itinerary.endDate))
+        ? daysBetween(itinerary.startDate, itinerary.endDate)
+        : (Array.isArray(days) ? days.length : 1);
+
     // The arrival/departure toggles are enforced here rather than inside one generator.
     // The template-clone path copies days from an older itinerary and never consulted
     // them, so flipping "Start activities on arrival day" used to change nothing.
-    const { days: boundedDays, changed: boundariesChanged } = enforceDayBoundaries(days, {
+    const { days: boundedDays, changed: boundariesChanged } = enforceDayBoundaries(padDaysToTripLength(days, tripDayCount), {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
     });
 
     // Budget no longer trims the plan, so an empty day means nothing was assigned there.
@@ -1067,11 +1193,24 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     const { days: filledDays, filled: daysBackfilled, toppedUp: daysToppedUp } = fillDaysFromCatalogue(boundedDays, catalogue, {
         controlPanel,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        budget: budget?.activityCeiling,
+        routeMatrix,
     });
 
-    // Bring the cost back toward the budget — without emptying any day. This runs on every
-    // path, including the template clone that bypasses the generators' own selection.
-    const { days: budgetedDays, removed: budgetRemovals, spend: activitySpend } = trimToBudget(filledDays, {
+    // Backfilled rows are built from a lean catalogue (no image blob). Re-hydrate so
+    // every day entry carries `/api/activities/:id/image` before we persist.
+    const hydratedDays = hydrateDayActivities(filledDays, catalogue);
+
+    // Spend up toward the traveller's budget first, then trim any overshoot. The old
+    // pipeline only trimmed, so a $1,500 request could come back as a $200 cheap plan.
+    const { days: spentDays, added: budgetAdds, swapped: budgetSwaps } = spendUpToBudget(hydratedDays, catalogue, {
+        budget: budget?.activityCeiling,
+        controlPanel,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
+    });
+
+    const { days: budgetedDays, removed: budgetRemovals, spend: activitySpend } = trimToBudget(spentDays, {
         budget: budget?.activityCeiling,
         controlPanel,
     });
@@ -1080,13 +1219,19 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
     });
 
     const finalValidation = repaired ? repairedValidation : validation;
 
     // Impose the Control Panel's activity hours and lunch break, whichever generator
     // produced these days.
-    itinerary.days = normalizeTripDays(applyDaySchedule(safeDays, controlPanel, itinerary.startDate), itinerary.startDate);
+    itinerary.days = normalizeTripDays(
+        hydrateDayActivities(applyDaySchedule(safeDays, controlPanel, itinerary.startDate, routeMatrix), catalogue),
+        itinerary.startDate
+    );
+    const cover = firstActivityImage(itinerary.days?.[0]);
+    if (cover) itinerary.imageUrl = cover;
     itinerary.aiGenerated = true;
     itinerary.aiGeneratedAt = new Date();
     itinerary.generationSource = source === 'database' || source === 'template' ? 'template' : 'ai';
@@ -1094,7 +1239,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     if (persist) {
         await itinerary.save();
     }
-    await itinerary.populate('controlPanel.hotelId');
+    await itinerary.populate(HOTEL_POPULATE);
     return resPayload(itinerary, source, persist, {
         geographyRepaired: repaired,
         dayBoundariesEnforced: boundariesChanged,
@@ -1102,11 +1247,14 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         daysToppedUp,
         geographyIssues: finalValidation.issues,
         dayReports: finalValidation.dayReports,
+        routeMatrixSource: routeMatrix?.source || 'none',
     }, budget ? {
         ...budget,
         activitySpend,
         overBudget: activitySpend > budget.activityCeiling,
         trimmedForBudget: budgetRemovals,
+        spentUpAdds: budgetAdds,
+        spentUpSwaps: budgetSwaps,
     } : budget);
 }
 
@@ -1145,6 +1293,9 @@ exports.generateItinerary = async (req, res) => {
                 incoming.hotelId = incoming.hotelId && mongoose.Types.ObjectId.isValid(incoming.hotelId)
                     ? incoming.hotelId
                     : null;
+            }
+            if (Array.isArray(incoming.hotelStays)) {
+                incoming.hotelStays = sanitizeHotelStays(incoming.hotelStays);
             }
             itinerary.set('controlPanel', normalizeControlPanel({
                 ...(itinerary.controlPanel?.toObject ? itinerary.controlPanel.toObject() : itinerary.controlPanel || {}),
@@ -1186,25 +1337,47 @@ exports.generateItinerary = async (req, res) => {
             }
         }
 
+        // Traveler-selected activities are required inclusions, not the entire pool.
+        // Using only the selection is what packed a multi-activity Egypt request onto
+        // a single day and left the rest of the trip empty.
+        const catalogue = mergeActivityLists(activities, bookingActivities);
+
         // LOAD HOTEL AND CALCULATE ACTIVITY BUDGET EARLY
+        const cp = itinerary.controlPanel || {};
         let hotel = null;
-        if (itinerary.controlPanel?.hotelId && mongoose.Types.ObjectId.isValid(itinerary.controlPanel.hotelId)) {
-            hotel = await Hotel.findById(itinerary.controlPanel.hotelId).lean();
+        const stays = normalizeHotelStays(cp);
+        const stayIds = stays.map((s) => s.hotelId).filter((id) => mongoose.Types.ObjectId.isValid(id));
+        const stayHotels = stayIds.length
+            ? await Hotel.find({ _id: { $in: stayIds } }).lean()
+            : [];
+        const stayHotelMap = hotelsByIdFromDocs(stayHotels);
+        if (stays[0]?.hotelId) {
+            hotel = stayHotelMap[stays[0].hotelId] || stayHotels[0] || null;
+        } else if (cp.hotelId && mongoose.Types.ObjectId.isValid(hotelIdOf(cp.hotelId))) {
+            hotel = await Hotel.findById(hotelIdOf(cp.hotelId)).lean();
         }
 
-        const cp = itinerary.controlPanel || {};
         // The trip starts from the hotel when one is selected, so it anchors the route.
         const hotelCoords = getCoordinates(hotel);
+        const routeMatrix = await primeRouteMatrix(catalogue, hotelCoords);
         const startDate = toDateString(itinerary.startDate);
         const endDate = toDateString(itinerary.endDate);
         const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
 
         // Calculate available budget for activities using uplift as TOLERANCE (not surcharge reduction)
         // `??` not `||`: an uplift of 0 is a deliberate "no tolerance", not a missing value.
-        let upliftRaw = cp.budgetUplift ?? 15;
-        let upliftPct = Math.min(Math.max((upliftRaw > 0 && upliftRaw < 1) ? upliftRaw : (Number(upliftRaw) / 100), 0), 1);
+        const travelerBudget = parseBudget(itinerary.budget);
+        let upliftRaw = Object.prototype.hasOwnProperty.call(cp, 'budgetUplift') && cp.budgetUplift !== '' && cp.budgetUplift != null
+            ? Number(cp.budgetUplift)
+            : 15;
+        if (!Number.isFinite(upliftRaw)) upliftRaw = 15;
+        let upliftPct = Math.min(Math.max((upliftRaw > 0 && upliftRaw < 1) ? upliftRaw : (upliftRaw / 100), 0), 1);
         let hotelCost = 0;
-        if (hotel) {
+        if (stays.length) {
+            const nights = startDate && endDate ? nightsBetween(startDate, endDate) : Math.max(0, tripDays - 1);
+            const rooms = cp.numberOfRooms || 1;
+            hotelCost = hotelCostFromStays(stays, stayHotelMap, rooms, nights);
+        } else if (hotel) {
             const nights = Math.max(1, tripDays - 1);
             const rooms = cp.numberOfRooms || 1;
             hotelCost = (hotel.pricePerNight || 0) * nights * rooms;
@@ -1224,9 +1397,9 @@ exports.generateItinerary = async (req, res) => {
         // translated into a spending ceiling, instead of inferring it from the result.
         let budgetBreakdown = null;
 
-        if (itinerary.budget) {
-            // Uplift is budget tolerance: base budget $1,000 with 15% tolerance = $1,150 max total budget
-            const maxAllowedTotalBudget = Math.floor((Number(itinerary.budget) || 0) * (1 + upliftPct));
+        if (travelerBudget !== undefined) {
+            // 0% tolerance = stay at the customer's budget. N% = spend up to budget × (1 + N/100).
+            const maxAllowedTotalBudget = Math.floor(travelerBudget * (1 + upliftPct));
             let maxTotalActivitiesCost = maxAllowedTotalBudget - hotelCost - customCostsTotal;
             maxTotalActivitiesCost = Math.max(0, Math.floor(maxTotalActivitiesCost));
             
@@ -1234,7 +1407,7 @@ exports.generateItinerary = async (req, res) => {
             activityBudgetStr = String(maxTotalActivitiesCost);
 
             budgetBreakdown = {
-                travelerBudget: Number(itinerary.budget) || 0,
+                travelerBudget,
                 upliftPercent: Math.round(upliftPct * 100),
                 maxAllowedTotalBudget,
                 hotelCost,
@@ -1246,7 +1419,7 @@ exports.generateItinerary = async (req, res) => {
                 exhaustedByFixedCosts: maxTotalActivitiesCost === 0,
             };
 
-            budgetRulePrompt = `\nCRITICAL BUDGET TOLERANCE RULE: Customer budget is $${itinerary.budget}. With a ${Math.round(upliftPct * 100)}% budget tolerance allowance, the maximum allowed total trip budget ceiling is $${maxAllowedTotalBudget}. After accounting for hotel accommodation ($${hotelCost}) and custom costs ($${customCostsTotal}), the activity budget guideline is $${maxTotalActivitiesCost}. Prefer options that keep the total near that figure, but filling every day of the trip takes priority over the guideline.`;
+            budgetRulePrompt = `\nCRITICAL BUDGET RULE: Customer budget is $${travelerBudget}. With a ${Math.round(upliftPct * 100)}% tolerance, the maximum trip ceiling is $${maxAllowedTotalBudget}. After hotel ($${hotelCost}) and custom costs ($${customCostsTotal}), the activity spend target is $${maxTotalActivitiesCost}. Build a plan whose activity prices SUM close to that target (at least ~80% of it when the catalogue allows) and do not exceed it. Empty days are allowed if another activity would break the ceiling.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -1279,20 +1452,20 @@ exports.generateItinerary = async (req, res) => {
             // geographic validation layer needs. The budget is advisory, so nothing is
             // trimmed here — filling the trip takes priority over the ceiling.
             const adaptedDays = existing?.days?.length
-                ? hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), activities)
+                ? hydrateDayActivities(adaptDaysToItinerary(existing.days, itinerary), catalogue)
                 : null;
 
             if (adaptedDays && countActivities(adaptedDays) > 0) {
-                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities }));
+                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix }));
             } else {
                 const templateDays = buildDefaultDays(
                     itinerary,
-                    bookingActivities.length > 0 ? bookingActivities : activities,
-                    bookingActivities.length > 0,
+                    catalogue,
+                    false,
                     activityBudget,
-                    { hotelCoords }
+                    { hotelCoords, required: bookingActivities, routeMatrix }
                 );
-                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities }));
+                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix }));
             }
         }
 
@@ -1301,13 +1474,13 @@ exports.generateItinerary = async (req, res) => {
         if (!openai) {
             const templateDays = buildDefaultDays(
                 itinerary,
-                bookingActivities.length > 0 ? bookingActivities : activities,
-                bookingActivities.length > 0,
+                catalogue,
+                false,
                 activityBudget,
-                { hotelCoords }
+                { hotelCoords, required: bookingActivities, routeMatrix }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix })),
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
@@ -1317,7 +1490,7 @@ exports.generateItinerary = async (req, res) => {
         // for a catalogue activity (title, description, price, category, times) is
         // overwritten from the database or recomputed by applyDaySchedule, so paying for
         // it in completion tokens was pure waste.
-        const shortlist = selectCatalogueForPrompt(activities, {
+        const shortlist = selectCatalogueForPrompt(catalogue, {
             activityBudget,
             required: bookingActivities,
         });
@@ -1358,11 +1531,11 @@ ${catalogueText}
 Rules:
 - Same-day activities must be within ~${Math.round(SAME_AREA_RADIUS_KM)}km of each other (use the coordinates). Keep each area on consecutive days; when moving between areas, use one travel day with fewer activities. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
 - Include the destination's iconic landmarks where they appear in the list.
-- Fill EVERY day that may hold activities — no day may be left empty while unused activities remain.
+- Fill days that may hold activities when the remaining spend target allows. Empty days are OK once another activity would exceed the ceiling.
 - Max ${MAX_ACTIVITIES_PER_DAY} activities per day. Do not repeat an activity.
 - ${activeDayRule}
 - ${lastDayRule}
-- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Aim to keep the total price of chosen activities near $${activityBudget}, preferring cheaper options — but filling every day matters more than the budget.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}
+- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget}. Choose a mix whose prices SUM close to that figure (at least ~80% of it when the list allows). Do not pick only the cheapest options when better-priced experiences fit. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
 
 Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
 "ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
@@ -1396,20 +1569,20 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
             console.error('OpenAI generate failed, using template fallback:', aiErr?.message);
             const templateDays = buildDefaultDays(
                 itinerary,
-                bookingActivities.length > 0 ? bookingActivities : activities,
-                bookingActivities.length > 0,
+                catalogue,
+                false,
                 activityBudget,
-                { hotelCoords }
+                { hotelCoords, required: bookingActivities, routeMatrix }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix })),
                 warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
             });
         }
 
         // Attach real activity images and details from DB where we have matches
         const actMap = {};
-        activities.forEach(a => { actMap[String(a._id)] = a; });
+        catalogue.forEach(a => { actMap[String(a._id)] = a; });
         shortlist.forEach(a => { actMap[String(a._id)] = a; });
 
         const bookingActMap = {};
@@ -1430,7 +1603,7 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
                 // Title fallback matching
                 if (!dbAct && act.title) {
                     const cleanTitle = act.title.trim().toLowerCase();
-                    dbAct = activities.find(a => a.title.trim().toLowerCase() === cleanTitle) ||
+                    dbAct = catalogue.find(a => a.title.trim().toLowerCase() === cleanTitle) ||
                             bookingActivities.find(a => a.title.trim().toLowerCase() === cleanTitle);
                 }
 
@@ -1467,8 +1640,8 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
             }),
         }));
 
-        const finalDays = hydrateDayActivities(enrichedDays, [...activities, ...bookingActivities]);
-        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown, catalogue: activities }));
+        const finalDays = hydrateDayActivities(enrichedDays, catalogue);
+        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix }));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });
@@ -1489,6 +1662,14 @@ function normalizeControlPanel(cp = {}) {
     next.lunchDurationMinutes = durationMinutes;
     next.lunchStart = lunchStart;
     next.lunchEnd = lunchEnd;
+    if (Array.isArray(next.hotelStays)) {
+        next.hotelStays = sanitizeHotelStays(next.hotelStays);
+        if (next.hotelStays[0]?.hotelId) next.hotelId = next.hotelStays[0].hotelId;
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'hotelId')) {
+        const id = hotelIdOf(next.hotelId);
+        next.hotelId = id && mongoose.Types.ObjectId.isValid(id) ? id : null;
+    }
     return next;
 }
 
@@ -1514,7 +1695,7 @@ exports.saveControlPanel = async (req, res) => {
             req.params.id,
             { $set: updateFields },
             { new: true }
-        ).populate('controlPanel.hotelId');
+        ).populate(HOTEL_POPULATE);
 
         res.json(itinerary);
     } catch (err) {
@@ -1540,6 +1721,9 @@ function buildBuilderStateUpdate(body, existingControlPanel) {
             cpFields.hotelId = cpFields.hotelId && mongoose.Types.ObjectId.isValid(cpFields.hotelId)
                 ? cpFields.hotelId
                 : null;
+        }
+        if (Array.isArray(cpFields.hotelStays)) {
+            cpFields.hotelStays = sanitizeHotelStays(cpFields.hotelStays);
         }
         const base = existingControlPanel
             ? (existingControlPanel.toObject ? existingControlPanel.toObject() : existingControlPanel)
@@ -1587,7 +1771,7 @@ exports.saveDays = async (req, res) => {
             req.params.id,
             { $set: updateFields },
             { new: true }
-        ).populate('controlPanel.hotelId');
+        ).populate(HOTEL_POPULATE);
 
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
 
@@ -1670,7 +1854,7 @@ exports.submitItinerary = async (req, res) => {
         itinerary.status = 'Supplier Replied Back';
         itinerary.updatedAt = new Date();
         await itinerary.save();
-        await itinerary.populate('controlPanel.hotelId');
+        await itinerary.populate(HOTEL_POPULATE);
 
         if (wasDraft || req.body.forceNotify) {
             await sendItineraryReadyEmail(itinerary);
@@ -1734,7 +1918,7 @@ exports.clearActivities = async (req, res) => {
         );
         itinerary.updatedAt = new Date();
         await itinerary.save();
-        await itinerary.populate('controlPanel.hotelId');
+        await itinerary.populate(HOTEL_POPULATE);
         res.json(itinerary);
     } catch (err) {
         console.error('clearActivities error:', err?.message);
