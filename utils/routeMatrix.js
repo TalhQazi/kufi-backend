@@ -57,7 +57,9 @@ async function fetchGoogleMatrix(points, travelMode, apiKey) {
         mode: travelMode || 'driving',
         key: apiKey,
     });
-    const upstream = await fetch(`https://maps.googleapis.com/maps/api/distancematrix/json?${params}`);
+    const upstream = await fetch(`https://maps.googleapis.com/maps/api/distancematrix/json?${params}`, {
+        signal: AbortSignal.timeout(Number(process.env.GOOGLE_MATRIX_TIMEOUT_MS) || 20000),
+    });
     const data = await upstream.json();
     if (!upstream.ok || data.status !== 'OK') {
         throw new Error(data.error_message || data.status || `HTTP_${upstream.status}`);

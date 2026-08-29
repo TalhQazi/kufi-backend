@@ -540,12 +540,12 @@ test('trimToBudget is a no-op when no budget is set', () => {
     assert.equal(removed, 0);
 });
 
-test('selectActivitiesForTrip fills every day cheaply, then upgrades', () => {
+test('selectActivitiesForTrip fills every day with quality picks within budget', () => {
     const pool = [
         priced('Cheap1', CAIRO, 10), priced('Cheap2', CAIRO, 20),
         priced('Cheap3', CAIRO, 30), priced('Pricey', CAIRO, 900),
     ];
-    // Tight budget: enough for one per day from the cheap end, never the $900 one.
+    // Tight budget: enough for one per day, never the unaffordable one.
     const tight = selectActivitiesForTrip(pool, { budget: 100, activeDays: 3, maxPerDay: 3 });
     assert.equal(tight.length >= 3, true, 'every day still gets an activity');
     assert.ok(!tight.some((a) => a.title === 'Pricey'), 'the unaffordable one is skipped');
@@ -553,6 +553,16 @@ test('selectActivitiesForTrip fills every day cheaply, then upgrades', () => {
     // Generous budget: the expensive one becomes reachable.
     const roomy = selectActivitiesForTrip(pool, { budget: 5000, activeDays: 3, maxPerDay: 3 });
     assert.ok(roomy.some((a) => a.title === 'Pricey'));
+});
+
+test('selectActivitiesForTrip prefers famous landmarks over cheap filler', () => {
+    const pool = [
+        act('Cheap perfume shop', CAIRO, { price: 12, rating: 3 }),
+        act('Giza Pyramids & Sphinx Tour', CAIRO, { price: 300, rating: 4.9 }),
+        act('Local cafe visit', CAIRO, { price: 10, rating: 3.5 }),
+    ];
+    const out = selectActivitiesForTrip(pool, { budget: 5000, activeDays: 2, maxPerDay: 3 });
+    assert.ok(out.some((a) => /pyramid/i.test(a.title)), 'famous landmark is selected');
 });
 
 test('selectActivitiesForTrip never prices out a traveller-selected activity', () => {
@@ -577,6 +587,7 @@ test('spendUpToBudget upgrades a cheap Egypt-style plan toward a $1500 budget', 
         act('Museum Day', GIZA_MUSEUM, { price: 350 }),
         act('Nile Dinner', CAIRO, { price: 280 }),
         act('Desert Safari', CAIRO, { price: 450 }),
+        act('Royal Tombs', CAIRO, { price: 365 }),
     ];
     const { days: out, added, swapped, spend } = spendUpToBudget(days, catalogue, {
         budget: 1500,
@@ -584,7 +595,7 @@ test('spendUpToBudget upgrades a cheap Egypt-style plan toward a $1500 budget', 
         maxPerDay: 4,
     });
     assert.ok(added + swapped > 0, 'the cheap plan must be upgraded');
-    assert.ok(spend >= 1200, `spend should approach the $1500 target, got $${spend}`);
+    assert.ok(spend >= 1280, `spend should reach most of the $1500 target, got $${spend}`);
     assert.ok(spend <= 1500, `must not exceed the ceiling, got $${spend}`);
     assert.equal(countableActivities(out[0]).length >= 1, true);
     assert.equal(countableActivities(out[1]).length >= 1, true);
@@ -610,7 +621,7 @@ test('spendUpToBudget does not pull a Luxor activity onto a Cairo day', () => {
 
 test('spendUpToBudget is a no-op when the plan is already near the budget', () => {
     const cp = { startOnArrival: true, endOnDeparture: true };
-    const days = [{ day: 1, activities: [priced('A', CAIRO, 700), priced('B', CAIRO, 600)] }];
+    const days = [{ day: 1, activities: [priced('A', CAIRO, 730), priced('B', CAIRO, 700)] }];
     const { added, swapped } = spendUpToBudget(days, [act('Extra', CAIRO, { price: 50 })], {
         budget: 1500,
         controlPanel: cp,

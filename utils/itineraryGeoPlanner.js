@@ -341,6 +341,43 @@ function priceOf(activity) {
     return Number(activity?.price) || 0;
 }
 
+/** Famous / iconic title signals — used to prefer must-see experiences over filler. */
+const FAMOUS_TITLE_RE = /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum|valley of the kings|abu simbel|temple|citadel|bazaar|nile cruise|snorkel|great wall|petra|angkor/i;
+
+/** Activity spend should reach at least this fraction of the computed ceiling. */
+const BUDGET_UTILIZATION_TARGET = 0.95;
+
+function isFamousActivity(act) {
+    const title = String(act?.title || '').toLowerCase();
+    const category = String(act?.category || '').toLowerCase();
+    if (FAMOUS_TITLE_RE.test(title)) return true;
+    if (/landmark|iconic|famous|must.?see|heritage|historic/i.test(category)) return true;
+    return (Number(act?.rating) || 0) >= 4.7 && (Number(act?.reviews) || 0) >= 20;
+}
+
+/**
+ * Higher = more desirable for itinerary generation.
+ * Blends landmark status, rating, review volume, and a light price signal so premium
+ * experiences beat $12 filler without optimising purely for cost.
+ */
+function activityQualityScore(act) {
+    let score = 0;
+    const title = String(act?.title || '').toLowerCase();
+    if (FAMOUS_TITLE_RE.test(title)) score += 1000;
+    const category = String(act?.category || '').toLowerCase();
+    if (/landmark|iconic|famous|tour|heritage|culture/i.test(category)) score += 200;
+    score += (Number(act?.rating) || 0) * 80;
+    score += Math.min(Number(act?.reviews) || 0, 150);
+    score += Math.min(priceOf(act), 250) * 0.4;
+    return score;
+}
+
+function compareActivitiesByQuality(a, b) {
+    const diff = activityQualityScore(b) - activityQualityScore(a);
+    if (diff !== 0) return diff;
+    return (Number(b.rating) || 0) - (Number(a.rating) || 0);
+}
+
 function spendOfDays(days) {
     return (Array.isArray(days) ? days : []).reduce(
         (total, day) => total + countableActivities(day).reduce((sum, act) => sum + priceOf(act), 0),
@@ -467,7 +504,9 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
                 }
                 const coords = getCoordinates(act);
                 const d = cursor && coords ? haversineKm(cursor, coords) : null;
-                const score = d === null ? Number.MAX_SAFE_INTEGER - i : d;
+                // Prefer top-rated / famous activities nearby, not the closest cheap filler.
+                const geo = d === null ? 50_000 : d;
+                const score = geo - activityQualityScore(act) * 20;
                 if (score < bestScore) {
                     bestScore = score;
                     bestIdx = i;
@@ -558,21 +597,24 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
                 if (c) prev = c;
             });
 
-            // Unused activity in the same area. When a budget remains, prefer the
-            // option that closes the gap rather than the cheapest nearby filler.
+            // Unused activity in the same area — prefer famous / top-rated, and lean on
+            // higher prices when there is still a large budget gap to close.
             const remainingBudget = typeof budget === 'number' ? budget - spendOfDays(rebuilt) : null;
+            const budgetPressure = remainingBudget != null && budget > 0
+                ? Math.min(1, remainingBudget / budget)
+                : 0;
             let bestIdx = -1;
             let bestScore = Infinity;
             pool.forEach((act, i) => {
                 const c = getCoordinates(act);
                 const d = prev && c ? haversineKm(prev, c) : null;
-                // Keep the day in one area: never pull in something from another base.
                 if (d !== null && d > SAME_AREA_RADIUS_KM) return;
                 const p = priceOf(act);
                 if (remainingBudget != null && p > remainingBudget) return;
                 const geoScore = d === null ? 10_000 : d;
-                const budgetScore = remainingBudget == null ? 0 : (remainingBudget - p);
-                const score = budgetScore * 1000 + geoScore;
+                const score = geoScore
+                    - activityQualityScore(act) * (12 + budgetPressure * 8)
+                    - p * budgetPressure * 25;
                 if (score < bestScore) {
                     bestScore = score;
                     bestIdx = i;
@@ -609,9 +651,8 @@ function fillDaysFromCatalogue(days, catalogue, { controlPanel = {}, maxPerDay =
  *
  * Doing only the first made the budget inert — a 6-day Lebanon trip cost $1,960 whether
  * the traveller asked for $500 or $5,000. Doing only the second emptied most of a long
- * trip. So: fill the days with the cheapest options first, which guarantees a complete
- * itinerary at the lowest possible cost, then spend whatever budget is left on
- * better-rated additions.
+ * trip. The days are filled with a mix of famous / top-rated activities first, then
+ * topped up with more quality picks until the budget ceiling is reached.
  *
  * @param {Array}  activities   candidates
  * @param {object} options
@@ -639,34 +680,23 @@ function selectActivitiesForTrip(activities, { required = [], budget, activeDays
 
     const rest = all.filter((a) => !requiredIds.has(String(a._id)));
     const price = (a) => Number(a.price) || 0;
-    const byPrice = [...rest].sort((a, b) => price(a) - price(b));
+    const byQuality = [...rest].sort(compareActivitiesByQuality);
 
-    // Stage 1 — one cheap activity per day, skipping anything that would breach the ceiling.
+    // Stage 1 — one famous / top-rated activity per day within the budget ceiling.
     const targetCount = Math.max(selected.length, activeDays);
-    for (const a of byPrice) {
+    for (const a of byQuality) {
         if (selected.length >= targetCount) break;
         if (typeof budget === 'number' && total + price(a) > budget) continue;
         selected.push(a);
         total += price(a);
     }
 
-    // Stage 2 — spend what is left on the best of the remainder, never exceeding the
-    // per-day cap. With no budget set, quality ordering alone applies.
+    // Stage 2 — fill remaining slots with more quality picks, never exceeding the ceiling.
     const maxWanted = Math.max(activeDays, activeDays * maxPerDay);
     const chosenIds = new Set(selected.map((a) => String(a._id)));
     const remaining = rest
         .filter((a) => !chosenIds.has(String(a._id)))
-        .sort((a, b) => {
-            // With a budget, spend toward it: take the best-priced fit first.
-            // Without one, keep landmarks and rating as the quality signal.
-            if (typeof budget === 'number') {
-                const priceGap = price(b) - price(a);
-                if (priceGap !== 0) return priceGap;
-            }
-            const landmark = (x) => /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum/i.test(String(x.title || ''));
-            if (landmark(a) !== landmark(b)) return landmark(a) ? -1 : 1;
-            return (Number(b.rating) || 0) - (Number(a.rating) || 0);
-        });
+        .sort(compareActivitiesByQuality);
 
     for (const act of remaining) {
         if (selected.length >= maxWanted) break;
@@ -741,13 +771,11 @@ function trimToBudget(days, { budget, controlPanel = {} } = {}) {
 }
 
 /**
- * Raise a cheap plan toward the traveller's activity budget.
+ * Raise a plan toward the traveller's activity budget using famous / top-rated picks.
  *
- * `trimToBudget` only cuts overspend. The AI prompt used to say "prefer cheaper
- * options", so a $1,500 Egypt request routinely came back at ~$200 — every day
- * filled, budget unused. This pass adds unused catalogue items, then swaps cheap
- * scheduled ones for better in-area options, until spend is close to the ceiling
- * without going over it.
+ * `trimToBudget` only cuts overspend. This pass adds unused catalogue items, then swaps
+ * weak filler for better in-area options, until spend is close to the ceiling without
+ * going over it. Quality (landmarks, rating, reviews) leads; price is a tie-breaker.
  *
  * @returns {{ days: Array, added: number, swapped: number, spend: number }}
  */
@@ -758,8 +786,9 @@ function spendUpToBudget(days, catalogue, { budget, controlPanel = {}, maxPerDay
         return { days: list, added: 0, swapped: 0, spend };
     }
 
-    const floor = Math.floor(budget * 0.8);
-    if (spend >= floor) {
+    const targetSpend = budget;
+    const minSpend = Math.floor(budget * BUDGET_UTILIZATION_TARGET);
+    if (spend >= minSpend) {
         return { days: list, added: 0, swapped: 0, spend };
     }
 
@@ -779,9 +808,114 @@ function spendUpToBudget(days, catalogue, { budget, controlPanel = {}, maxPerDay
     const proposedList = (day, extra) => [...countableActivities(day), extra];
     const proposedSwap = (day, oldAct, newAct) => countableActivities(day).map((act) => (act === oldAct ? newAct : act));
 
-    // Phase 1 — add unused activities that raise spend without exceeding the ceiling.
+    const pickScore = (act, price) => {
+        const quality = activityQualityScore(act);
+        const headroom = Math.max(0, targetSpend - spend);
+        const gapAfter = headroom - price;
+        const budgetFit = gapAfter >= 0 ? price : -1_000_000;
+        return quality * 1000 + budgetFit * 5 + price;
+    };
+
+    // Phase 1 — add famous / top-rated unused activities that still fit the day.
     let progress = true;
-    while (progress && spend < floor && pool.length > 0) {
+    let addGuard = 0;
+    const maxAddPasses = Math.max(100, pool.length * allowed.length * maxPerDay);
+    while (progress && spend < minSpend && pool.length > 0 && addGuard < maxAddPasses) {
+        addGuard += 1;
+        progress = false;
+        let best = null;
+        allowed.forEach((index) => {
+            const day = rebuilt[index];
+            if (countableActivities(day).length >= maxPerDay) return;
+            pool.forEach((act, poolIdx) => {
+                const price = priceOf(act);
+                if (price <= 0 || spend + price > budget) return;
+                const entry = catalogueEntryFrom(act);
+                if (!dayWouldFit(day, proposedList(day, entry), controlPanel, routeMatrix, {
+                    isArrival: index === 0,
+                    isDeparture: index === rebuilt.length - 1,
+                })) return;
+                const score = pickScore(act, price);
+                if (!best || score > best.score) {
+                    best = { index, poolIdx, price, entry, score };
+                }
+            });
+        });
+        if (!best) break;
+        const [picked] = pool.splice(best.poolIdx, 1);
+        markUsedIds(used, picked);
+        rebuilt[best.index] = {
+            ...rebuilt[best.index],
+            activities: [...(rebuilt[best.index].activities || []), best.entry],
+        };
+        spend += best.price;
+        added += 1;
+        progress = true;
+    }
+
+    // Phase 2 — swap weak filler for a better in-area option that also raises spend.
+    progress = true;
+    let swapGuard = 0;
+    const maxSwapPasses = Math.max(100, pool.length * allowed.length * maxPerDay);
+    while (progress && spend < minSpend && pool.length > 0 && swapGuard < maxSwapPasses) {
+        swapGuard += 1;
+        progress = false;
+        let bestSwap = null;
+        allowed.forEach((index) => {
+            const day = rebuilt[index];
+            countableActivities(day).forEach((oldAct) => {
+                const oldPrice = priceOf(oldAct);
+                const oldQuality = activityQualityScore(oldAct);
+                pool.forEach((cand, poolIdx) => {
+                    const newPrice = priceOf(cand);
+                    const newQuality = activityQualityScore(cand);
+                    const delta = newPrice - oldPrice;
+                    if (delta <= 0 || spend + delta > budget) return;
+                    const entry = catalogueEntryFrom(cand);
+                    if (!dayWouldFit(day, proposedSwap(day, oldAct, entry), controlPanel, routeMatrix, {
+                        isArrival: index === 0,
+                        isDeparture: index === rebuilt.length - 1,
+                    })) return;
+                    const oldCoords = getCoordinates(oldAct);
+                    const newCoords = getCoordinates(cand);
+                    if (oldCoords && newCoords && haversineKm(oldCoords, newCoords) > SAME_AREA_RADIUS_KM) return;
+                    const swapScore = (newQuality - oldQuality) * 1000 + delta;
+                    if (!bestSwap || swapScore > bestSwap.swapScore) {
+                        bestSwap = { index, oldAct, poolIdx, delta, entry, cand, swapScore };
+                    }
+                });
+            });
+        });
+        if (!bestSwap) break;
+        const [picked] = pool.splice(bestSwap.poolIdx, 1);
+        const oldId = String(bestSwap.oldAct?.activityId || bestSwap.oldAct?._id || '').trim();
+        rebuilt[bestSwap.index] = {
+            ...rebuilt[bestSwap.index],
+            activities: (rebuilt[bestSwap.index].activities || []).map((act) => (
+                act === bestSwap.oldAct ? bestSwap.entry : act
+            )),
+        };
+        if (oldId) {
+            used.delete(oldId);
+            used.delete(String(bestSwap.oldAct?.title || '').trim());
+            used.delete(String(bestSwap.oldAct?._id || '').trim());
+            const original = (Array.isArray(catalogue) ? catalogue : []).find((a) => (
+                String(a._id) === oldId || String(a.title || '').trim() === String(bestSwap.oldAct?.title || '').trim()
+            ));
+            if (original) pool.push(original);
+        }
+        markUsedIds(used, picked);
+        spend += bestSwap.delta;
+        swapped += 1;
+        progress = true;
+    }
+
+    // Phase 3 — pack any remaining day capacity with the priciest fits to reach the ceiling.
+    progress = true;
+    let packGuard = 0;
+    const maxPackPasses = Math.max(100, pool.length * allowed.length * maxPerDay);
+    while (progress && spend < targetSpend && pool.length > 0 && packGuard < maxPackPasses) {
+        packGuard += 1;
         progress = false;
         let best = null;
         allowed.forEach((index) => {
@@ -812,9 +946,12 @@ function spendUpToBudget(days, catalogue, { budget, controlPanel = {}, maxPerDay
         progress = true;
     }
 
-    // Phase 2 — swap a cheap scheduled stop for a better unused one in the same area.
+    // Phase 4 — last pass: swap for the largest price increase in-area until the ceiling.
     progress = true;
-    while (progress && spend < floor && pool.length > 0) {
+    let boostGuard = 0;
+    const maxBoostPasses = Math.max(100, pool.length * allowed.length * maxPerDay);
+    while (progress && spend < targetSpend && pool.length > 0 && boostGuard < maxBoostPasses) {
+        boostGuard += 1;
         progress = false;
         let bestSwap = null;
         allowed.forEach((index) => {
@@ -949,6 +1086,9 @@ module.exports = {
     trimToBudget,
     spendUpToBudget,
     selectActivitiesForTrip,
+    activityQualityScore,
+    isFamousActivity,
+    compareActivitiesByQuality,
     allocateDaysToClusters,
     planActivitiesAcrossDays,
     repairItineraryGeography,

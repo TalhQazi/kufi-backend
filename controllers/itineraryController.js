@@ -161,8 +161,14 @@ function getActivitiesForBudget(bookingActivities, activities, budget) {
     const requiredIds = new Set(required.map(r => String(r._id)));
     const remainingAvailable = available.filter(a => !requiredIds.has(String(a._id)));
 
-    // Sort remaining available activities by price ascending to fit as many as possible
-    const sortedAvailable = [...remainingAvailable].sort((a, b) => (Number(a.price) || 0) - (Number(b.price) || 0));
+    // Sort remaining available activities by quality (famous / top-rated first)
+    const sortedAvailable = [...remainingAvailable].sort((a, b) => {
+        const landmark = (x) => /pyramid|sphinx|museum|karnak|burj|eiffel|colosseum/i.test(String(x.title || ''));
+        if (landmark(a) !== landmark(b)) return landmark(a) ? -1 : 1;
+        const ratingDiff = (Number(b.rating) || 0) - (Number(a.rating) || 0);
+        if (ratingDiff !== 0) return ratingDiff;
+        return (Number(b.price) || 0) - (Number(a.price) || 0);
+    });
 
     for (const act of sortedAvailable) {
         const price = Number(act.price) || 0;
@@ -402,6 +408,7 @@ function buildCataloguePrompt(shortlist, { destination = '' } = {}) {
         if (place && place.toLowerCase() !== String(destination).toLowerCase()) parts.push(place);
         parts.push(String(a.duration || '2h').replace(/\s*hours?/i, 'h').replace(/\s*mins?/i, 'm'));
         parts.push(`$${Number(a.price) || 0}`);
+        if (Number(a.rating) > 0) parts.push(`★${Number(a.rating).toFixed(1)}`);
         if (a.category) parts.push(String(a.category).toLowerCase());
 
         return parts.join(' | ');
@@ -416,8 +423,7 @@ function buildDefaultDays(itinerary, activities = [], isBookingSpecific = false,
     const endDate = toDateString(itinerary.endDate);
     const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : 3;
     
-    // Respect the budget constraint
-    // Cheapest-first to guarantee a full trip, then the best of what the budget allows.
+    // Respect the budget constraint — famous / top-rated activities first, not cheap filler.
     const activeDayCount = countActiveDays(itinerary, tripDays);
     const requiredActs = Array.isArray(required) && required.length
         ? required
@@ -589,6 +595,12 @@ function hydrateDayActivities(days, catalogue) {
                 return {
                     ...act,
                     activityId: linkedId || String(match._id),
+                    title: act.title || match.title,
+                    description: act.description || match.description,
+                    // Catalogue price is authoritative — AI replies and intermediate passes
+                    // can carry stale or missing prices, which made a $1,400 plan look like $112.
+                    price: Number(match.price) || Number(act.price) || 0,
+                    category: act.category || match.category || 'general',
                     // Replace any inherited base64 blob with the URL form.
                     image: activityImageUrl(linkedId || match._id),
                     coordinates: coords || act.coordinates,
@@ -1004,8 +1016,9 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
 function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMatrix = null) {
     const cp = controlPanel?.toObject ? controlPanel.toObject() : (controlPanel || {});
     const start = toDateString(tripStartDate);
+    const list = Array.isArray(days) ? days : [];
 
-    return (Array.isArray(days) ? days : []).map((day, idx) => {
+    return list.map((day, idx) => {
         const item = day?.toObject ? day.toObject() : day;
         const entries = Array.isArray(item?.activities) ? item.activities : [];
         const real = entries.filter((a) => !isBreakEntry(a));
@@ -1036,7 +1049,7 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             if (arrival != null) dayStart = Math.max(dayStart, arrival);
         }
         let effectiveEnd = dayEnd;
-        if (idx === marked.length - 1 && cp.departureTime) {
+        if (idx === list.length - 1 && cp.departureTime) {
             const departure = parseTimeToMinutes(cp.departureTime, null);
             if (departure != null) effectiveEnd = Math.min(dayEnd, departure);
         }
@@ -1201,21 +1214,10 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     // every day entry carries `/api/activities/:id/image` before we persist.
     const hydratedDays = hydrateDayActivities(filledDays, catalogue);
 
-    // Spend up toward the traveller's budget first, then trim any overshoot. The old
-    // pipeline only trimmed, so a $1,500 request could come back as a $200 cheap plan.
-    const { days: spentDays, added: budgetAdds, swapped: budgetSwaps } = spendUpToBudget(hydratedDays, catalogue, {
-        budget: budget?.activityCeiling,
-        controlPanel,
-        maxPerDay: MAX_ACTIVITIES_PER_DAY,
-        routeMatrix,
-    });
-
-    const { days: budgetedDays, removed: budgetRemovals, spend: activitySpend } = trimToBudget(spentDays, {
-        budget: budget?.activityCeiling,
-        controlPanel,
-    });
-
-    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(budgetedDays, {
+    // Geography must be fixed before the budget pass. spendUpToBudget was running first,
+    // then repairItineraryGeography redistributed the plan and dropped the expensive
+    // upgrades — a $2,000 Egypt request routinely came back at ~$112 activity spend.
+    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(hydratedDays, {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -1224,12 +1226,26 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
 
     const finalValidation = repaired ? repairedValidation : validation;
 
+    // Spend up toward the traveller's budget, then trim any overshoot.
+    const { days: spentDays, added: budgetAdds, swapped: budgetSwaps } = spendUpToBudget(safeDays, catalogue, {
+        budget: budget?.activityCeiling,
+        controlPanel,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
+    });
+
+    const { days: budgetedDays, removed: budgetRemovals } = trimToBudget(spentDays, {
+        budget: budget?.activityCeiling,
+        controlPanel,
+    });
+
     // Impose the Control Panel's activity hours and lunch break, whichever generator
     // produced these days.
     itinerary.days = normalizeTripDays(
-        hydrateDayActivities(applyDaySchedule(safeDays, controlPanel, itinerary.startDate, routeMatrix), catalogue),
+        hydrateDayActivities(applyDaySchedule(budgetedDays, controlPanel, itinerary.startDate, routeMatrix), catalogue),
         itinerary.startDate
     );
+    const activitySpend = sumActivitySpend(itinerary.days);
     const cover = firstActivityImage(itinerary.days?.[0]);
     if (cover) itinerary.imageUrl = cover;
     itinerary.aiGenerated = true;
@@ -1251,6 +1267,9 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     }, budget ? {
         ...budget,
         activitySpend,
+        activityUtilizationPercent: budget.activityCeiling > 0
+            ? Math.round((activitySpend / budget.activityCeiling) * 100)
+            : null,
         overBudget: activitySpend > budget.activityCeiling,
         trimmedForBudget: budgetRemovals,
         spentUpAdds: budgetAdds,
@@ -1419,7 +1438,7 @@ exports.generateItinerary = async (req, res) => {
                 exhaustedByFixedCosts: maxTotalActivitiesCost === 0,
             };
 
-            budgetRulePrompt = `\nCRITICAL BUDGET RULE: Customer budget is $${travelerBudget}. With a ${Math.round(upliftPct * 100)}% tolerance, the maximum trip ceiling is $${maxAllowedTotalBudget}. After hotel ($${hotelCost}) and custom costs ($${customCostsTotal}), the activity spend target is $${maxTotalActivitiesCost}. Build a plan whose activity prices SUM close to that target (at least ~80% of it when the catalogue allows) and do not exceed it. Empty days are allowed if another activity would break the ceiling.`;
+            budgetRulePrompt = `\nCRITICAL BUDGET RULE: Customer budget is $${travelerBudget}. With a ${Math.round(upliftPct * 100)}% tolerance, the maximum trip ceiling is $${maxAllowedTotalBudget}. After hotel ($${hotelCost}) and custom costs ($${customCostsTotal}), the activity spend target is $${maxTotalActivitiesCost}. Build a mix of famous and top-rated activities whose prices SUM as close as possible to that target (aim for at least 95% — use the full tolerance when the catalogue allows). Prefer iconic / ★-rated experiences over cheap filler. Do not exceed the ceiling.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -1530,12 +1549,13 @@ ${catalogueText}
 
 Rules:
 - Same-day activities must be within ~${Math.round(SAME_AREA_RADIUS_KM)}km of each other (use the coordinates). Keep each area on consecutive days; when moving between areas, use one travel day with fewer activities. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
+- Prioritize a mix of famous landmarks and top-rated (★) experiences. Do NOT fill the trip with cheap filler when iconic options are in the list.
 - Include the destination's iconic landmarks where they appear in the list.
 - Fill days that may hold activities when the remaining spend target allows. Empty days are OK once another activity would exceed the ceiling.
 - Max ${MAX_ACTIVITIES_PER_DAY} activities per day. Do not repeat an activity.
 - ${activeDayRule}
 - ${lastDayRule}
-- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget}. Choose a mix whose prices SUM close to that figure (at least ~80% of it when the list allows). Do not pick only the cheapest options when better-priced experiences fit. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
+- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget}. Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
 
 Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
 "ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
