@@ -129,8 +129,11 @@ const BASE_CP = {
     report('budgetUplift (ceiling)', f1.budget?.activityCeiling !== f2.budget?.activityCeiling,
         `0% -> $${f1.budget?.activityCeiling} | 100% -> $${f2.budget?.activityCeiling}`);
 
-    const f3 = await gen({ budgetUplift: 0, hotelId: String(hotel._id) });
-    const f4 = await gen({ budgetUplift: 100, hotelId: String(hotel._id) });
+    // The hotel alone no longer squeezes hard enough at this budget, so add a fixed cost
+    // to make money — not the length of the day — the binding constraint for this check.
+    const squeeze = [{ id: 'squeeze', label: 'Squeeze', amount: 450, unit: 'flat' }];
+    const f3 = await gen({ budgetUplift: 0, hotelId: String(hotel._id), customCosts: squeeze });
+    const f4 = await gen({ budgetUplift: 100, hotelId: String(hotel._id), customCosts: squeeze });
     report('budgetUplift (plan)', f3.count !== f4.count,
         `0% -> ceiling $${f3.budget?.activityCeiling}, ${f3.count} acts | 100% -> $${f4.budget?.activityCeiling}, ${f4.count} acts` +
         (f3.count === f4.count ? '  (budget not the binding constraint)' : ''));

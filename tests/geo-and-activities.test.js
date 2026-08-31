@@ -31,6 +31,7 @@ const {
     validateItineraryGeography,
     roundUpToStep,
     SAME_AREA_RADIUS_KM,
+    MIN_TRANSFER_MINUTES,
 } = require('../utils/geo');
 
 const {
@@ -366,8 +367,8 @@ test('travel time between two stops is charged to the day', () => {
     const km = haversineKm({ lat: 29.979, lng: 31.134 }, { lat: 29.871, lng: 31.216 });
     assert.ok(km > 12 && km < 16, `expected ~13km, got ${Math.round(km)}`);
     assert.ok(travelMinutesForKm(km) >= 15, 'a 13km hop must reserve real time');
-    // Neighbouring sites cost nothing.
-    assert.equal(travelMinutesForKm(0.2), 0);
+    // Neighbouring-but-distinct sites still cost the minimum hop.
+    assert.equal(travelMinutesForKm(0.2), MIN_TRANSFER_MINUTES);
 });
 
 // ─── Budget is advisory: every day gets filled ───────────────────────────────
@@ -472,9 +473,14 @@ test('travel time is rounded UP to a clean 5-minute step', () => {
     });
 });
 
-test('adjacent stops get no phantom transfer', () => {
-    // Two sites a couple of hundred metres apart must not acquire a 5-minute leg.
-    assert.equal(travelMinutesForKm(0.2), 0);
+test('only the same place costs no travel at all', () => {
+    // Two DISTINCT sites always cost something, however close. They used to cost zero,
+    // which printed an itinerary where the traveller left one venue and arrived at the
+    // next in the same instant — and the UI, which hides a zero leg, showed no travel
+    // time at all for those stops.
+    assert.equal(travelMinutesForKm(0.2), MIN_TRANSFER_MINUTES);
+    assert.equal(travelMinutesForKm(0.05), MIN_TRANSFER_MINUTES);
+    // Identical coordinates are one venue, not two: still free.
     assert.equal(travelMinutesForKm(0), 0);
 });
 

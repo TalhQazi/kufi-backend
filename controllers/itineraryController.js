@@ -330,6 +330,11 @@ function padDaysToTripLength(days, tripDays) {
  * time capacity became the binding limit. Neither 4 nor 5 produced a single overrunning
  * day, so 4 is the point where the cap stops doing the work and capacity takes over.
  */
+// When fixed costs already exceed the trip ceiling, activities still get this share of
+// the ceiling so the traveller receives a usable itinerary rather than empty days.
+// Mirrors v148's `softActivityCap`.
+const FIXED_OVER_BUDGET_ACTIVITY_SHARE = 0.35;
+
 const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 4;
 
 /**
@@ -1020,7 +1025,7 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
  *   - replaces any break entries with exactly one lunch break at the derived window
  *     (or none at all when the duration is zero).
  */
-function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMatrix = null) {
+function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMatrix = null, originCoords = null, originConfigured = false) {
     const cp = controlPanel?.toObject ? controlPanel.toObject() : (controlPanel || {});
     const start = toDateString(tripStartDate);
     const list = Array.isArray(days) ? days : [];
@@ -1065,7 +1070,13 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
         const hasBreak = durationMinutes > 0 && breakStart !== null && breakEnd !== null;
 
         let cursor = dayStart;
-        let previousCoords = null;
+        // The day begins at the hotel. When its position is known, getting to the first
+        // stop is a real leg like any other; when it is not, the first stop simply has
+        // no measurable leg rather than a fabricated one.
+        let previousCoords = getCoordinates(originCoords);
+        // True while the "previous point" is still the hotel rather than an earlier stop,
+        // so an unmeasurable first leg can name the hotel instead of blaming the activity.
+        let atDayStart = true;
 
         const scheduled = real.map((act) => {
             const length = Math.max(15, parseDurationMinutes(act.durationMinutes ?? act.duration));
@@ -1074,11 +1085,26 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             // Getting between two places takes time. The capacity planner and the
             // geographic validator already charged for it, but the clock did not — so a
             // 20km hop was printed as if the traveller teleported. The gap is now real.
-            let travelMinutes = 0;
+            // null, not 0, when a position is missing: "we do not know" and "no distance
+            // to cover" are different facts, and printing the second for the first hid
+            // activities that simply have no coordinates on record.
+            let travelMinutes = null;
+            // Which record is missing a position. Reporting this instead of a bare
+            // "unavailable" is the difference between a message the supplier can act on
+            // and one that accuses the wrong row.
+            let travelUnknownReason = null;
             if (previousCoords && here) {
                 travelMinutes = travelMinutesBetween(previousCoords, here, routeMatrix);
                 cursor += travelMinutes;
+            } else if (!here) {
+                travelUnknownReason = 'self';
+            } else if (atDayStart) {
+                // The stop is fine; we just do not know where the day started from.
+                travelUnknownReason = originConfigured ? 'origin' : null;
+            } else {
+                travelUnknownReason = 'previous';
             }
+            const isFirstLegFromOrigin = atDayStart && travelMinutes !== null;
 
             // Prefer not to straddle the lunch break — but only step over it when the
             // activity genuinely fits in what is left of the day. Pushing unconditionally
@@ -1096,7 +1122,10 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             const startMinutes = cursor === dayStart ? cursor : roundUpToStep(cursor);
             const endMinutes = startMinutes + length;
             cursor = endMinutes;
-            if (here) previousCoords = here;
+            atDayStart = false;
+            // Position unknown: the next leg cannot be measured from a stale point
+            // without inventing a distance, so drop the trail here.
+            previousCoords = here || null;
 
             return {
                 ...act,
@@ -1105,7 +1134,13 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
                 // clamping would hide a genuine overrun behind a plausible-looking time.
                 endTime: minutesToTime(endMinutes),
                 // Exposed so the UI can show "30 min travel" between two stops.
+                // null means the distance could not be measured — one of the two places
+                // has no coordinates on record.
                 travelFromPreviousMinutes: travelMinutes,
+                // True only for the leg out of the hotel, so the UI can label it.
+                ...(isFirstLegFromOrigin ? { travelFromOrigin: true } : {}),
+                // 'self' | 'previous' | 'origin' — which record needs a location.
+                ...(travelUnknownReason ? { travelUnknownReason } : {}),
             };
         });
 
@@ -1282,7 +1317,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     // produced these days.
     itinerary.days = attachOvernightStays(
         normalizeTripDays(
-            hydrateDayActivities(applyDaySchedule(budgetedDays, controlPanel, itinerary.startDate, routeMatrix), catalogue),
+            hydrateDayActivities(applyDaySchedule(budgetedDays, controlPanel, itinerary.startDate, routeMatrix, hotelCoords, Boolean(stayPlan?.some((s) => s?.name))), catalogue),
             itinerary.startDate
         ),
         stayPlan
@@ -1491,8 +1526,16 @@ exports.generateItinerary = async (req, res) => {
             const maxAllowedTotalBudget = useCustomBudget
                 ? customBudget
                 : Math.floor(travelerBudget * (1 + upliftPct));
-            let maxTotalActivitiesCost = maxAllowedTotalBudget - hotelCost - customCostsTotal;
-            maxTotalActivitiesCost = Math.max(0, Math.floor(maxTotalActivitiesCost));
+            // When the fixed costs alone exceed the trip ceiling, flooring the activity
+            // allowance at zero produces a trip of empty days and no explanation — a
+            // 39-day request at $20/person/day food for four people did exactly that.
+            // v148's answer is better: keep a reduced allowance so the traveller still
+            // gets an itinerary, and report the overage instead of hiding it.
+            const fixedCostsTotal = hotelCost + customCostsTotal;
+            const fixedOverBudget = fixedCostsTotal >= maxAllowedTotalBudget;
+            const maxTotalActivitiesCost = fixedOverBudget
+                ? Math.max(0, Math.floor(maxAllowedTotalBudget * FIXED_OVER_BUDGET_ACTIVITY_SHARE))
+                : Math.max(0, Math.floor(maxAllowedTotalBudget - fixedCostsTotal));
             
             // Catalogue prices are per head, so the party ceiling has to be divided by the
             // party size before it can be compared against them. Everything downstream —
@@ -1518,9 +1561,12 @@ exports.generateItinerary = async (req, res) => {
                 // ...and what one traveller's share of that is, which is the figure the
                 // planner and the model are held to.
                 perTravellerActivityCeiling: perPersonCeiling,
-                // A ceiling of zero means accommodation and fixed costs have already
-                // consumed the whole budget. Generation will legitimately return no
-                // activities, so say so rather than handing back a blank plan.
+                fixedCostsTotal,
+                // True when hotel + per-trip costs alone outrun the ceiling. The plan is
+                // still built, to a reduced allowance, and the shortfall is reported.
+                fixedOverBudget,
+                overBudgetBy: fixedOverBudget ? Math.round(fixedCostsTotal - maxAllowedTotalBudget) : 0,
+                // Only a ceiling of literally zero can schedule nothing at all.
                 exhaustedByFixedCosts: maxTotalActivitiesCost === 0,
             };
 

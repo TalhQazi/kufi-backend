@@ -76,6 +76,19 @@ function placeLabel(entry) {
  */
 const TIME_ROUNDING_MINUTES = Number(process.env.ITINERARY_TIME_ROUNDING_MINUTES) || 5;
 
+/**
+ * Floor for the hop between two DISTINCT places.
+ *
+ * Two stops a few hundred metres apart used to cost nothing, so the itinerary showed no
+ * travel at all between them — the traveller appeared to leave one venue and arrive at
+ * the next in the same instant. Even a short walk costs time. v148 uses a 15-minute
+ * floor (`Math.max(.25, km/35)`); this uses one scheduling step, which is enough to
+ * make the leg real and visible without inflating every day by a quarter hour per stop.
+ *
+ * Stops at the SAME coordinates still cost nothing — that is one venue, not two.
+ */
+const MIN_TRANSFER_MINUTES = Number(process.env.ITINERARY_MIN_TRANSFER_MINUTES) || TIME_ROUNDING_MINUTES;
+
 /** Round up to the next scheduling step. Rounding up never under-books travel. */
 function roundUpToStep(minutes, step = TIME_ROUNDING_MINUTES) {
     if (!isFiniteNumber(minutes) || minutes <= 0) return 0;
@@ -103,8 +116,8 @@ function travelMinutesForKm(km) {
         raw = TRANSFER_OVERHEAD_MIN + (km / AVG_TRAVEL_SPEED_KMH) * 60;
     }
 
-    // Adjacent stops (a couple of hundred metres) cost nothing worth scheduling.
-    if (raw < 1) return 0;
+    // Nearby is not the same as co-located: getting there still takes a few minutes.
+    if (raw < MIN_TRANSFER_MINUTES) return MIN_TRANSFER_MINUTES;
     return roundUpToStep(raw);
 }
 
@@ -444,6 +457,7 @@ function validateItineraryGeography(days, { controlPanel = {}, isBreakEntry = ()
 }
 
 module.exports = {
+    MIN_TRANSFER_MINUTES,
     SAME_AREA_RADIUS_KM,
     FLIGHT_THRESHOLD_KM,
     DEFAULT_ACTIVITY_MIN,
