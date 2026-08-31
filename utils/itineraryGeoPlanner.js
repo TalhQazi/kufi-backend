@@ -1086,6 +1086,7 @@ module.exports = {
     trimToBudget,
     spendUpToBudget,
     selectActivitiesForTrip,
+    countActiveDays,
     activityQualityScore,
     isFamousActivity,
     compareActivitiesByQuality,

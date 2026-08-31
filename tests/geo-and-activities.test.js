@@ -652,3 +652,94 @@ test('arrival time shrinks day-1 capacity like v148', () => {
     assert.equal(full, 8 * 60);
     assert.equal(arrival, 4 * 60);
 });
+
+// ── Trip cost model ─────────────────────────────────────────────────────────────
+const {
+    customCostsTotal: tripCustomCostsTotal,
+    customCostLines: tripCustomCostLines,
+    normalizeCostUnit,
+    partyActivityCost,
+    perTravellerCeiling,
+} = require('../utils/tripCosts');
+const { overnightStayPlan } = require('../utils/hotelStays');
+
+test('custom cost units expand correctly', () => {
+    const opts = { tripDays: 7, travellers: 4 };
+    assert.equal(tripCustomCostsTotal([{ amount: 50, unit: 'flat' }], opts), 50);
+    assert.equal(tripCustomCostsTotal([{ amount: 20, unit: 'per_day' }], opts), 140);
+    assert.equal(tripCustomCostsTotal([{ amount: 20, unit: 'per_person' }], opts), 80);
+    assert.equal(tripCustomCostsTotal([{ amount: 20, unit: 'per_person_per_day' }], opts), 560);
+});
+
+test('legacy units are costed exactly as before', () => {
+    // A saved itinerary must not be re-priced by the arrival of per-person units.
+    const opts = { tripDays: 5, travellers: 3 };
+    assert.equal(tripCustomCostsTotal([{ amount: 100, unit: 'flat' }], opts), 100);
+    assert.equal(tripCustomCostsTotal([{ amount: 10, unit: 'per_day' }], opts), 50);
+});
+
+test('unknown and missing units fall back to flat', () => {
+    assert.equal(normalizeCostUnit('per_hour'), 'flat');
+    assert.equal(normalizeCostUnit(undefined), 'flat');
+    assert.equal(tripCustomCostsTotal([{ amount: 30 }], { tripDays: 4, travellers: 2 }), 30);
+});
+
+test('zero-amount rows are dropped from the cost lines', () => {
+    const lines = tripCustomCostLines(
+        [{ label: 'Food', amount: 0, unit: 'per_person_per_day' }, { label: 'Visa', amount: 25, unit: 'per_person' }],
+        { tripDays: 3, travellers: 2 }
+    );
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].total, 50);
+    assert.match(lines[0].label, /\$25\/person × 2/);
+});
+
+test('activity spend scales with party size', () => {
+    assert.equal(partyActivityCost(360, 4), 1440);
+    assert.equal(partyActivityCost(360, 1), 360);
+    assert.equal(partyActivityCost(360, 0), 360); // a party of none is a party of one
+});
+
+test('per-traveller ceiling divides the party ceiling', () => {
+    assert.equal(perTravellerCeiling(2000, 4), 500);
+    assert.equal(perTravellerCeiling(2000, 1), 2000);
+    assert.equal(perTravellerCeiling(999, 4), 249); // never rounds up past the ceiling
+    assert.equal(perTravellerCeiling(0, 4), 0);
+});
+
+test('a party of one is priced identically to the old model', () => {
+    const ceiling = 1500;
+    assert.equal(perTravellerCeiling(ceiling, 1), ceiling);
+    assert.equal(partyActivityCost(1200, 1), 1200);
+});
+
+test('overnight stay plan covers every night but not the departure day', () => {
+    const hotels = { a: { name: 'Nile View', pricePerNight: 100 }, b: { name: 'Aswan Lodge', pricePerNight: 80 } };
+    const stays = [
+        { id: 's1', hotelId: 'a', area: 'Cairo', nights: 3 },
+        { id: 's2', hotelId: 'b', area: 'Aswan', nights: 2 },
+    ];
+    const plan = overnightStayPlan(stays, hotels, 6); // 6 days = 5 nights
+    assert.equal(plan.length, 6);
+    assert.deepEqual(plan.slice(0, 3).map((p) => p.name), ['Nile View', 'Nile View', 'Nile View']);
+    assert.deepEqual(plan.slice(3, 5).map((p) => p.name), ['Aswan Lodge', 'Aswan Lodge']);
+    assert.equal(plan[5], null, 'departure day has no overnight');
+});
+
+test('overnight stay plan splits evenly when no nights are assigned', () => {
+    const hotels = { a: { name: 'Hotel A' }, b: { name: 'Hotel B' } };
+    const stays = [{ id: 's1', hotelId: 'a' }, { id: 's2', hotelId: 'b' }];
+    const plan = overnightStayPlan(stays, hotels, 5); // 4 nights, 2 stays
+    assert.deepEqual(plan.map((p) => p && p.name), ['Hotel A', 'Hotel A', 'Hotel B', 'Hotel B', null]);
+});
+
+test('overnight stay plan carries the last hotel when nights fall short', () => {
+    const hotels = { a: { name: 'Only Hotel' } };
+    const plan = overnightStayPlan([{ id: 's1', hotelId: 'a', nights: 1 }], hotels, 5);
+    assert.deepEqual(plan.map((p) => p && p.name), ['Only Hotel', 'Only Hotel', 'Only Hotel', 'Only Hotel', null]);
+});
+
+test('overnight stay plan is empty when no hotel is configured', () => {
+    assert.deepEqual(overnightStayPlan([], {}, 3), [null, null, null]);
+    assert.deepEqual(overnightStayPlan(null, {}, 0), []);
+});

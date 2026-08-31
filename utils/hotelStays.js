@@ -78,9 +78,54 @@ function hotelsByIdFromDocs(docs) {
     return map;
 }
 
+/**
+ * Which hotel the travellers sleep in after each day.
+ *
+ * Stays are consumed in order, each covering `nightsForStay` consecutive nights, using
+ * the same split as the cost calculation so the displayed hotel and the billed hotel can
+ * never disagree. Night `i` follows day `i`, so a trip of N days has N-1 nights and the
+ * departure day returns `null` — nobody sleeps there.
+ *
+ * Returns one entry per day: `{ hotelId, name, area, pricePerNight }` or `null`.
+ */
+function overnightStayPlan(stays, hotelsById = {}, tripDays = 0) {
+    const days = Math.max(0, Number(tripDays) || 0);
+    const plan = new Array(days).fill(null);
+    const list = Array.isArray(stays) ? stays : [];
+    if (!days || !list.length) return plan;
+
+    const nights = Math.max(0, days - 1);
+    let night = 0;
+
+    for (let i = 0; i < list.length && night < nights; i += 1) {
+        const stay = list[i];
+        const hotel = hotelDocForStay(stay, hotelsById);
+        const entry = {
+            hotelId: hotelIdOf(stay?.hotelId),
+            name: String(hotel?.name || '').trim(),
+            area: String(stay?.area || hotel?.city || '').trim(),
+            pricePerNight: Number(hotel?.pricePerNight) || 0,
+        };
+        const span = nightsForStay(stay, i, list, nights);
+        for (let n = 0; n < span && night < nights; n += 1, night += 1) {
+            plan[night] = entry;
+        }
+    }
+
+    // An explicit night allocation that is short of the trip length leaves a tail of
+    // days with no hotel. Carry the last stay forward rather than showing a blank.
+    const last = plan[night - 1];
+    if (last) {
+        for (let d = night; d < nights; d += 1) plan[d] = last;
+    }
+
+    return plan;
+}
+
 module.exports = {
     hotelIdOf,
     nightsForStay,
+    overnightStayPlan,
     sanitizeHotelStays,
     normalizeHotelStays,
     hotelDocForStay,

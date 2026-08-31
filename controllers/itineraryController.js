@@ -22,7 +22,13 @@ const {
     hotelCostFromStays,
     hotelsByIdFromDocs,
     hotelIdOf,
+    overnightStayPlan,
 } = require('../utils/hotelStays');
+const {
+    customCostsTotal: customCostsTotalFor,
+    partyActivityCost,
+    perTravellerCeiling,
+} = require('../utils/tripCosts');
 const {
     isBreakEntry,
     countActivities,
@@ -54,6 +60,7 @@ const {
     trimToBudget,
     spendUpToBudget,
     selectActivitiesForTrip,
+    countActiveDays,
     clusterName,
 } = require('../utils/itineraryGeoPlanner');
 const { resolveRouteMatrix } = require('../utils/routeMatrix');
@@ -1176,7 +1183,34 @@ function normalizeTripDays(days, tripStartDate = null) {
  * run into an immediate draft and silently move the request between supplier tabs.
  * Pass { persist: true } to opt back into the old write-through behaviour.
  */
-async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null, catalogue = [], routeMatrix = null } = {}) {
+/**
+ * Record which hotel closes each day, so the itinerary reads as a journey rather than a
+ * list of outings. The value is stored on the day (not derived at render time) so the
+ * traveller's copy, the PDF and the supplier's view all show the same hotel even after
+ * the Control Panel moves on.
+ *
+ * The departure day gets `null` — there is no night after it.
+ */
+function attachOvernightStays(days, stayPlan) {
+    const plan = Array.isArray(stayPlan) ? stayPlan : null;
+    return (Array.isArray(days) ? days : []).map((day, index) => {
+        const stay = plan ? plan[index] : null;
+        if (!stay || !stay.name) {
+            const { overnightHotel, ...rest } = day || {};
+            return rest;
+        }
+        return {
+            ...day,
+            overnightHotel: {
+                name: stay.name,
+                area: stay.area || '',
+                ...(stay.hotelId ? { hotelId: stay.hotelId } : {}),
+            },
+        };
+    });
+}
+
+async function saveGeneratedDays(itinerary, days, source, { persist = false, hotelCoords = null, budget = null, catalogue = [], routeMatrix = null, stayPlan = null } = {}) {
     applyBudgetToDocument(itinerary);
 
     // ── Post-generation validation layer ────────────────────────────────────────
@@ -1186,6 +1220,11 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     const controlPanel = itinerary.controlPanel?.toObject
         ? itinerary.controlPanel.toObject()
         : (itinerary.controlPanel || {});
+
+    // The planner compares against per-person catalogue prices, so it is held to one
+    // traveller's share of the party ceiling. Older callers that only pass a party
+    // ceiling still work — with a party of one the two are the same number.
+    const plannerCeiling = budget?.perTravellerActivityCeiling ?? budget?.activityCeiling;
 
     const tripDayCount = (toDateString(itinerary.startDate) && toDateString(itinerary.endDate))
         ? daysBetween(itinerary.startDate, itinerary.endDate)
@@ -1206,7 +1245,7 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     const { days: filledDays, filled: daysBackfilled, toppedUp: daysToppedUp } = fillDaysFromCatalogue(boundedDays, catalogue, {
         controlPanel,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
-        budget: budget?.activityCeiling,
+        budget: plannerCeiling,
         routeMatrix,
     });
 
@@ -1228,22 +1267,25 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
 
     // Spend up toward the traveller's budget, then trim any overshoot.
     const { days: spentDays, added: budgetAdds, swapped: budgetSwaps } = spendUpToBudget(safeDays, catalogue, {
-        budget: budget?.activityCeiling,
+        budget: plannerCeiling,
         controlPanel,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
         routeMatrix,
     });
 
     const { days: budgetedDays, removed: budgetRemovals } = trimToBudget(spentDays, {
-        budget: budget?.activityCeiling,
+        budget: plannerCeiling,
         controlPanel,
     });
 
     // Impose the Control Panel's activity hours and lunch break, whichever generator
     // produced these days.
-    itinerary.days = normalizeTripDays(
-        hydrateDayActivities(applyDaySchedule(budgetedDays, controlPanel, itinerary.startDate, routeMatrix), catalogue),
-        itinerary.startDate
+    itinerary.days = attachOvernightStays(
+        normalizeTripDays(
+            hydrateDayActivities(applyDaySchedule(budgetedDays, controlPanel, itinerary.startDate, routeMatrix), catalogue),
+            itinerary.startDate
+        ),
+        stayPlan
     );
     const activitySpend = sumActivitySpend(itinerary.days);
     const cover = firstActivityImage(itinerary.days?.[0]);
@@ -1266,11 +1308,15 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         routeMatrixSource: routeMatrix?.source || 'none',
     }, budget ? {
         ...budget,
+        // Per person, matching the catalogue...
         activitySpend,
-        activityUtilizationPercent: budget.activityCeiling > 0
-            ? Math.round((activitySpend / budget.activityCeiling) * 100)
+        // ...and what the party actually pays, which is the number that has to fit the
+        // traveller's budget alongside the hotel and the fixed costs.
+        activitySpendTotal: partyActivityCost(activitySpend, budget.travellers),
+        activityUtilizationPercent: plannerCeiling > 0
+            ? Math.round((activitySpend / plannerCeiling) * 100)
             : null,
-        overBudget: activitySpend > budget.activityCeiling,
+        overBudget: plannerCeiling > 0 && activitySpend > plannerCeiling,
         trimmedForBudget: budgetRemovals,
         spentUpAdds: budgetAdds,
         spentUpSwaps: budgetSwaps,
@@ -1390,7 +1436,18 @@ exports.generateItinerary = async (req, res) => {
             ? Number(cp.budgetUplift)
             : 15;
         if (!Number.isFinite(upliftRaw)) upliftRaw = 15;
-        let upliftPct = Math.min(Math.max((upliftRaw > 0 && upliftRaw < 1) ? upliftRaw : (upliftRaw / 100), 0), 1);
+        // A negative tolerance is a deliberate instruction to come in UNDER the
+        // customer's budget, so the clamp runs from -100% to +100%. The legacy
+        // fraction test (0.15 meaning 15%) is applied symmetrically so -0.15 is
+        // read the same way as 0.15.
+        const upliftIsLegacyFraction = Math.abs(upliftRaw) > 0 && Math.abs(upliftRaw) < 1;
+        let upliftPct = Math.min(Math.max(upliftIsLegacyFraction ? upliftRaw : (upliftRaw / 100), -1), 1);
+
+        // The same control can instead carry an absolute trip ceiling, which replaces
+        // the customer's budget rather than adjusting it.
+        const budgetMode = cp.budgetMode === 'amount' ? 'amount' : 'percent';
+        const customBudget = Math.max(0, Math.floor(Number(cp.budgetAmount) || 0));
+        const useCustomBudget = budgetMode === 'amount' && customBudget > 0;
         let hotelCost = 0;
         if (stays.length) {
             const nights = startDate && endDate ? nightsBetween(startDate, endDate) : Math.max(0, tripDays - 1);
@@ -1402,12 +1459,21 @@ exports.generateItinerary = async (req, res) => {
             hotelCost = (hotel.pricePerNight || 0) * nights * rooms;
         }
 
-        const customCostsTotal = (Array.isArray(cp.customCosts) ? cp.customCosts : []).reduce((sum, cost) => {
-            const amount = Number(cost?.amount) || 0;
-            if (!amount) return sum;
-            if (cost?.unit === 'per_day') return sum + (amount * Math.max(1, tripDays || 1));
-            return sum + amount;
-        }, 0);
+        // Which hotel closes each day. Built from the same stay split as the cost above,
+        // and from the legacy single hotel when no stays are configured.
+        const stayPlan = overnightStayPlan(
+            stays.length ? stays : (hotel ? [{ id: 'stay-legacy', hotelId: String(hotel._id), area: cp.hotelBaseArea || '' }] : []),
+            stays.length ? stayHotelMap : (hotel ? { [String(hotel._id)]: hotel } : {}),
+            tripDays
+        );
+
+        // Food and transportation are normally charged per head per day, so party size
+        // belongs in this total. See utils/tripCosts.js for the unit table.
+        const travellers = Math.max(1, Number(itinerary.numberOfTravelers) || 1);
+        const customCostsTotal = customCostsTotalFor(cp.customCosts, {
+            tripDays: Math.max(1, tripDays || 1),
+            travellers,
+        });
 
         let activityBudget = undefined;
         let activityBudgetStr = 'flexible';
@@ -1416,29 +1482,52 @@ exports.generateItinerary = async (req, res) => {
         // translated into a spending ceiling, instead of inferring it from the result.
         let budgetBreakdown = null;
 
-        if (travelerBudget !== undefined) {
-            // 0% tolerance = stay at the customer's budget. N% = spend up to budget × (1 + N/100).
-            const maxAllowedTotalBudget = Math.floor(travelerBudget * (1 + upliftPct));
+        // A custom trip ceiling stands on its own, so it is honoured even when the
+        // customer never stated a budget.
+        if (travelerBudget !== undefined || useCustomBudget) {
+            // Amount mode: the entered figure IS the trip ceiling.
+            // Percent mode: 0% stays at the customer's budget, +N% allows N% more,
+            // -N% requires the trip to come in N% under it.
+            const maxAllowedTotalBudget = useCustomBudget
+                ? customBudget
+                : Math.floor(travelerBudget * (1 + upliftPct));
             let maxTotalActivitiesCost = maxAllowedTotalBudget - hotelCost - customCostsTotal;
             maxTotalActivitiesCost = Math.max(0, Math.floor(maxTotalActivitiesCost));
             
-            activityBudget = maxTotalActivitiesCost;
-            activityBudgetStr = String(maxTotalActivitiesCost);
+            // Catalogue prices are per head, so the party ceiling has to be divided by the
+            // party size before it can be compared against them. Everything downstream —
+            // the planner, the prompt, the swap rules — works in per-person money.
+            const perPersonCeiling = perTravellerCeiling(maxTotalActivitiesCost, travellers);
+
+            activityBudget = perPersonCeiling;
+            activityBudgetStr = String(perPersonCeiling);
 
             budgetBreakdown = {
                 travelerBudget,
-                upliftPercent: Math.round(upliftPct * 100),
+                budgetMode: useCustomBudget ? 'amount' : 'percent',
+                // Null in amount mode: no percentage was applied, and reporting 0 would
+                // read as "no tolerance" rather than "not applicable".
+                upliftPercent: useCustomBudget ? null : Math.round(upliftPct * 100),
+                ...(useCustomBudget ? { customBudget } : {}),
                 maxAllowedTotalBudget,
                 hotelCost,
                 customCostsTotal,
+                travellers,
+                // What the party may spend on activities in total...
                 activityCeiling: maxTotalActivitiesCost,
+                // ...and what one traveller's share of that is, which is the figure the
+                // planner and the model are held to.
+                perTravellerActivityCeiling: perPersonCeiling,
                 // A ceiling of zero means accommodation and fixed costs have already
                 // consumed the whole budget. Generation will legitimately return no
                 // activities, so say so rather than handing back a blank plan.
                 exhaustedByFixedCosts: maxTotalActivitiesCost === 0,
             };
 
-            budgetRulePrompt = `\nCRITICAL BUDGET RULE: Customer budget is $${travelerBudget}. With a ${Math.round(upliftPct * 100)}% tolerance, the maximum trip ceiling is $${maxAllowedTotalBudget}. After hotel ($${hotelCost}) and custom costs ($${customCostsTotal}), the activity spend target is $${maxTotalActivitiesCost}. Build a mix of famous and top-rated activities whose prices SUM as close as possible to that target (aim for at least 95% — use the full tolerance when the catalogue allows). Prefer iconic / ★-rated experiences over cheap filler. Do not exceed the ceiling.`;
+            const ceilingSentence = useCustomBudget
+                ? `The supplier has set a fixed trip budget of $${maxAllowedTotalBudget} for ${travellers} traveller(s).`
+                : `Customer budget is $${travelerBudget} for ${travellers} traveller(s). With a ${Math.round(upliftPct * 100)}% tolerance, the maximum trip ceiling is $${maxAllowedTotalBudget}.`;
+            budgetRulePrompt = `\nCRITICAL BUDGET RULE: ${ceilingSentence} After hotel ($${hotelCost}) and per-trip costs ($${customCostsTotal}), the party may spend $${maxTotalActivitiesCost} on activities. Catalogue prices are PER PERSON, so the per-person target is $${perPersonCeiling}. Build a mix of famous and top-rated activities whose per-person prices SUM as close as possible to $${perPersonCeiling} (aim for at least 95% — use the full tolerance when the catalogue allows). Prefer iconic / ★-rated experiences over cheap filler. Do not exceed $${perPersonCeiling} per person.`;
         }
 
         const mode = req.body.mode || 'ai';
@@ -1475,7 +1564,7 @@ exports.generateItinerary = async (req, res) => {
                 : null;
 
             if (adaptedDays && countActivities(adaptedDays) > 0) {
-                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix }));
+                return res.json(await saveGeneratedDays(itinerary, adaptedDays, 'database', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix, stayPlan }));
             } else {
                 const templateDays = buildDefaultDays(
                     itinerary,
@@ -1484,7 +1573,7 @@ exports.generateItinerary = async (req, res) => {
                     activityBudget,
                     { hotelCoords, required: bookingActivities, routeMatrix }
                 );
-                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix }));
+                return res.json(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix, stayPlan }));
             }
         }
 
@@ -1499,7 +1588,7 @@ exports.generateItinerary = async (req, res) => {
                 { hotelCoords, required: bookingActivities, routeMatrix }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix, stayPlan })),
                 warning: 'OPENAI_API_KEY not configured. Generated a starter template — add OPENAI_API_KEY to enable full AI itineraries.',
             });
         }
@@ -1555,7 +1644,7 @@ Rules:
 - Max ${MAX_ACTIVITIES_PER_DAY} activities per day. Do not repeat an activity.
 - ${activeDayRule}
 - ${lastDayRule}
-- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget}. Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
+- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget} PER PERSON (catalogue prices are per person). Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
 
 Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
 "ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
@@ -1595,7 +1684,7 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
                 { hotelCoords, required: bookingActivities, routeMatrix }
             );
             return res.json({
-                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix })),
+                ...(await saveGeneratedDays(itinerary, templateDays, 'template', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix, stayPlan })),
                 warning: aiErr?.message || 'AI generation failed. A starter template was created instead.',
             });
         }
@@ -1661,7 +1750,7 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
         }));
 
         const finalDays = hydrateDayActivities(enrichedDays, catalogue);
-        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix }));
+        return res.json(await saveGeneratedDays(itinerary, finalDays, 'ai', { persist, hotelCoords, budget: budgetBreakdown, catalogue, routeMatrix, stayPlan }));
     } catch (err) {
         console.error('generateItinerary error:', err?.message, err?.stack);
         res.status(500).json({ msg: 'Server error', error: err?.message });

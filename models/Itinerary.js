@@ -115,12 +115,26 @@ const ItinerarySchema = new mongoose.Schema({
         arrivalTime: { type: String, default: '' },
         departureTime: { type: String, default: '' },
         hotelBaseArea: { type: String, default: '' },
+        // The budget adjustment is one control with two modes. In `percent` mode
+        // `budgetUplift` is a tolerance (negative builds under the customer's budget);
+        // in `amount` mode `budgetAmount` replaces the customer's budget outright.
+        // Both are stored so switching modes never destroys the other value, and a
+        // record with no `budgetMode` behaves exactly as it did before.
         budgetUplift: { type: Number, default: 15 },
+        budgetMode: { type: String, enum: ['percent', 'amount'], default: 'percent' },
+        budgetAmount: { type: Number, default: 0 },
         customCosts: [{
             id: String,
             label: String,
             amount: Number,
-            unit: { type: String, enum: ['flat', 'per_day'], default: 'flat' }
+            // `per_person` / `per_person_per_day` let food and transportation be charged
+            // per head, the way a trip is actually quoted. `flat` and `per_day` keep their
+            // original meaning so saved itineraries are costed unchanged.
+            unit: {
+                type: String,
+                enum: ['flat', 'per_day', 'per_person', 'per_person_per_day'],
+                default: 'flat',
+            }
         }]
     },
     extraFields: [{

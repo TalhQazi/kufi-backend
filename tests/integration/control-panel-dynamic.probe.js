@@ -55,7 +55,11 @@ const BASE_CP = {
     await hotel.save();
 
     // A deliberately tight budget so ceiling-driven settings have a visible effect.
-    const BUDGET = 300;
+    // Big enough that the budget is never the binding constraint. At $300 with two
+    // travellers the per-person ceiling is $150, which caps the plan before the day
+    // window does — and then activityEndTime / endOnDeparture look inert when they
+    // are working fine. This probe is about the time fields, so keep money out of it.
+    const BUDGET = 900;
     const mk = await http.post('/itineraries', {
         userId: String(trav._id), title: 'CP Dynamic Probe', destination: 'Egypt', country: 'Egypt',
         startDate: '2026-09-01', endDate: '2026-09-07', numberOfTravelers: 2, budget: BUDGET,
