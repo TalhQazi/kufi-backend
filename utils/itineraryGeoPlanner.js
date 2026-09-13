@@ -1069,6 +1069,18 @@ function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxP
 
     const repairedValidation = validateItineraryGeography(rebuilt, { controlPanel, isBreakEntry, routeMatrix });
 
+    // Never accept a repair that THREW AWAY activities. planActivitiesAcrossDays gives each
+    // geographic cluster a fixed slice of days and silently drops any stop that does not fit
+    // that slice — on an 11-day multi-city trip a packed 4,3,4,4,4,4,3,4,3,3 collapsed to
+    // 4,4,3,2,4,1,2,3,4,1, losing 11 activities. The fill step already produced coherent,
+    // time-respecting days; a "geography fix" that empties them is worse than the problem.
+    // Overflow is handled losslessly later by spillOverflowToNextDays.
+    const beforeCount = pooled.length;
+    const afterCount = rebuilt.reduce((n, d) => n + countableActivities(d).length, 0);
+    if (afterCount < beforeCount) {
+        return { days: list, validation, repaired: false, repairedValidation };
+    }
+
     // Only accept the repair if it genuinely improved things.
     if (repairedValidation.issues.length >= validation.issues.length) {
         return { days: list, validation, repaired: false, repairedValidation };
@@ -1165,6 +1177,17 @@ function diversifyItineraryAreas(days, catalogue, {
         rebuilt.flatMap((d) => countableActivities(d).filter((a) => getCoordinates(a)))
     );
     if (afterClusters.length <= usedClusters.length) {
+        return { days: list, diversified: false };
+    }
+
+    // ...and only when it does not COST us activities. planActivitiesAcrossDays re-plans the
+    // whole trip to maximise area spread, which on a big multi-area destination (Egypt)
+    // scattered stops one-per-day and silently dropped the ones that no longer "fit" its
+    // area-per-day layout — a densely packed 4,3,3,3,3,3,3,3 collapsed to 4,1,1,1,1,1,3,2.
+    // Diversity must never trade away a fuller plan: reject it if fewer activities land.
+    const beforeCount = scheduled.length;
+    const afterCount = rebuilt.reduce((n, d) => n + countableActivities(d).length, 0);
+    if (afterCount < beforeCount) {
         return { days: list, diversified: false };
     }
 

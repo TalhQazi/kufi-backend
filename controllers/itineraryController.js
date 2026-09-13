@@ -64,6 +64,7 @@ const {
     selectActivitiesForTrip,
     countActiveDays,
     clusterName,
+    allowedDayIndices,
 } = require('../utils/itineraryGeoPlanner');
 const { resolveRouteMatrix } = require('../utils/routeMatrix');
 
@@ -337,7 +338,19 @@ function padDaysToTripLength(days, tripDays) {
 // Mirrors v148's `softActivityCap`.
 const FIXED_OVER_BUDGET_ACTIVITY_SHARE = 0.35;
 
-const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 4;
+// The real limit on a day is TIME, not a head-count. Every place that adds or spills
+// activities already checks the Control Panel's activity start→end window
+// (dayCapacityMinutes), so this is set high enough that the count never binds first: a
+// day holds as many activities as physically fit its hours (durations + travel). If 8
+// short stops fit 09:00–19:00, all 8 are scheduled. Set the env var to cap it again.
+const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 50;
+
+// When true, the traveller's budget is advisory only: days are filled up to their
+// activity start→end window (time capacity) even if the total runs past the ceiling,
+// instead of stopping at ~1 activity/day the moment the budget is spent. A tight budget
+// (e.g. $750pp for a 10-day trip) otherwise leaves most days empty. Flip the env var to
+// 'false' to restore the hard budget cap. See supplier request 2026-09-13.
+const BUDGET_ADVISORY = process.env.ITINERARY_BUDGET_ADVISORY !== 'false';
 
 /**
  * How many catalogue rows are offered to the model.
@@ -908,8 +921,27 @@ exports.getItineraryByBookingId = async (req, res) => {
 async function fetchActivitiesForDestination(country, city) {
     const query = { status: 'approved' };
     const orClause = [];
-    if (country) orClause.push({ country: new RegExp(`^${escapeRegExp(country)}$`, 'i') });
-    if (city) orClause.push({ location: new RegExp(escapeRegExp(city), 'i') });
+
+    // Destinations arrive as free-form strings like "Beirut City, Lebanon". Activities
+    // are stored with a bare country ("Lebanon") and a location ("Beirut"), so an exact
+    // `^Beirut City, Lebanon$` match only ever finds the odd row whose location literally
+    // equals the full string — the AI then plans from a 1-row catalogue and the trip comes
+    // back empty. Tokenise on commas/slashes and match each part against country, city and
+    // location so "Lebanon" (and "Beirut City") both resolve.
+    const tokens = [country, city]
+        .filter(Boolean)
+        .flatMap((s) => String(s).split(/[,/|]+/))
+        .map((s) => s.trim())
+        .filter((s) => s.length >= 2);
+    const seen = new Set();
+    for (const token of tokens) {
+        const key = token.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const rx = new RegExp(escapeRegExp(token), 'i');
+        orClause.push({ country: rx }, { city: rx }, { location: rx });
+    }
+
     if (orClause.length) query.$or = orClause;
     return Activity.find(query)
         // `coordinates` drives geographic grouping. `image`/`images` are deliberately NOT
@@ -1054,11 +1086,30 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
     const cp = controlPanel?.toObject ? controlPanel.toObject() : (controlPanel || {});
     const start = toDateString(tripStartDate);
     const list = Array.isArray(days) ? days : [];
+    // Days that may hold activities — overflow is never parked on a locked arrival/
+    // departure day.
+    const allowedSet = new Set(allowedDayIndices(list.length, cp));
+
+    // Activities that do not fit a day's hours ride along to the next day. This makes the
+    // activity window a HARD limit: nothing is ever scheduled past the day's end time.
+    // Anything still carried after the final day genuinely does not fit the trip and is
+    // dropped rather than shown at an impossible time (e.g. 03:20).
+    let carry = [];
 
     return list.map((day, idx) => {
         const item = day?.toObject ? day.toObject() : day;
         const entries = Array.isArray(item?.activities) ? item.activities : [];
-        const real = entries.filter((a) => !isBreakEntry(a));
+        const ownReal = entries.filter((a) => !isBreakEntry(a));
+
+        // A locked arrival/departure day stays empty; whatever is queued keeps waiting.
+        if (!allowedSet.has(idx)) {
+            carry = [...carry, ...ownReal];
+            return { ...item, activities: [] };
+        }
+
+        // Yesterday's overflow is scheduled first, then this day's own activities.
+        const real = [...carry, ...ownReal];
+        carry = [];
 
         if (real.length === 0) return { ...item, activities: [] };
 
@@ -1103,28 +1154,29 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
         // so an unmeasurable first leg can name the hotel instead of blaming the activity.
         let atDayStart = true;
 
-        const scheduled = real.map((act) => {
+        const scheduled = [];
+        // Once one activity spills, the rest of the day's queue rides with it so route
+        // order is preserved on the following day.
+        let overflowed = false;
+
+        for (const act of real) {
+            if (overflowed) { carry.push(act); continue; }
+
             const length = Math.max(15, parseDurationMinutes(act.durationMinutes ?? act.duration));
             const here = getCoordinates(act);
 
-            // Getting between two places takes time. The capacity planner and the
-            // geographic validator already charged for it, but the clock did not — so a
-            // 20km hop was printed as if the traveller teleported. The gap is now real.
-            // null, not 0, when a position is missing: "we do not know" and "no distance
-            // to cover" are different facts, and printing the second for the first hid
-            // activities that simply have no coordinates on record.
+            // Getting between two places takes time. `tentative` is a trial clock position
+            // so we can test whether the stop fits BEFORE committing the cursor — the old
+            // code advanced the cursor first and printed overruns past the day end.
             let travelMinutes = null;
-            // Which record is missing a position. Reporting this instead of a bare
-            // "unavailable" is the difference between a message the supplier can act on
-            // and one that accuses the wrong row.
             let travelUnknownReason = null;
+            let tentative = cursor;
             if (previousCoords && here) {
                 travelMinutes = travelMinutesBetween(previousCoords, here, routeMatrix);
-                cursor += travelMinutes;
+                tentative += travelMinutes;
             } else if (!here) {
                 travelUnknownReason = 'self';
             } else if (atDayStart) {
-                // The stop is fine; we just do not know where the day started from.
                 travelUnknownReason = originConfigured ? 'origin' : null;
             } else {
                 travelUnknownReason = 'previous';
@@ -1132,45 +1184,41 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             const isFirstLegFromOrigin = atDayStart && travelMinutes !== null;
 
             // Prefer not to straddle the lunch break — but only step over it when the
-            // activity genuinely fits in what is left of the day. Pushing unconditionally
-            // meant a 5-hour tour that could not finish before lunch was moved wholly
-            // after it, wasting the entire morning and ending at 22:07. A long activity
-            // simply spans lunch, which is what happens in reality.
-            if (hasBreak && cursor < breakEnd && cursor + length > breakStart) {
+            // activity genuinely fits in what is left of the day.
+            if (hasBreak && tentative < breakEnd && tentative + length > breakStart) {
                 const fitsAfterBreak = breakEnd + length <= effectiveEnd;
-                if (fitsAfterBreak) cursor = breakEnd;
+                if (fitsAfterBreak) tentative = breakEnd;
             }
 
-            // Snap the start onto the scheduling grid so clock times stay tidy even when
-            // an activity's duration is not a round number. Snapping forward only ever
-            // adds a little slack — it can never create an overlap.
-            const startMinutes = cursor === dayStart ? cursor : roundUpToStep(cursor);
+            const startMinutes = tentative === dayStart ? tentative : roundUpToStep(tentative);
             const endMinutes = startMinutes + length;
+
+            // HARD LIMIT: if this stop would finish after the day's activity window, push it
+            // (and everything queued behind it) to the next day rather than scheduling past
+            // the end time. This is the strict overflow the supplier asked for.
+            if (endMinutes > effectiveEnd) {
+                overflowed = true;
+                carry.push(act);
+                continue;
+            }
+
             cursor = endMinutes;
             atDayStart = false;
-            // Position unknown: the next leg cannot be measured from a stale point
-            // without inventing a distance, so drop the trail here.
             previousCoords = here || null;
 
-            return {
+            scheduled.push({
                 ...act,
                 startTime: minutesToTime(startMinutes),
-                // Not clamped to the day end any more. Now that travel is accounted for,
-                // clamping would hide a genuine overrun behind a plausible-looking time.
                 endTime: minutesToTime(endMinutes),
                 // Exposed so the UI can show "30 min travel" between two stops.
-                // null means the distance could not be measured — one of the two places
-                // has no coordinates on record.
                 travelFromPreviousMinutes: travelMinutes,
-                // True only for the leg out of the hotel, so the UI can label it.
                 ...(isFirstLegFromOrigin ? { travelFromOrigin: true } : {}),
-                // 'self' | 'previous' | 'origin' — which record needs a location.
                 ...(travelUnknownReason ? { travelUnknownReason } : {}),
-            };
-        });
+            });
+        }
 
-        // A single break, on every day that actually has activities.
-        const breaks = durationMinutes > 0
+        // A single lunch break, but only when the day actually holds activities.
+        const breaks = (durationMinutes > 0 && scheduled.length)
             ? [buildBreakEntry({
                 title: 'Lunch Break',
                 description: 'Time set aside for lunch.',
@@ -1179,13 +1227,11 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             })]
             : [];
 
-        const dayEndsAt = scheduled.length ? parseTimeToMinutes(scheduled[scheduled.length - 1].endTime, dayEnd) : dayEnd;
-
         return {
             ...item,
             activities: [...scheduled, ...breaks],
-            // > 0 when travel pushed the day past its configured end time.
-            overrunMinutes: Math.max(0, dayEndsAt - dayEnd),
+            // Strict scheduling never runs past the window, so there is never an overrun.
+            overrunMinutes: 0,
         };
     });
 }
@@ -1302,10 +1348,16 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
 
     // Budget no longer trims the plan, so an empty day means nothing was assigned there.
     // Fill those from the catalogue before validating, so additions are checked too.
+    //
+    // When the budget is advisory we pass no ceiling here: the fill then packs each day up
+    // to its activity start→end window (time + geography are the only limits) instead of
+    // halting at ~1 activity/day once the money runs out. A tight budget used to leave most
+    // days empty; now the day is full and any overshoot is reported, not hidden.
+    const fillBudget = BUDGET_ADVISORY ? undefined : plannerCeiling;
     const { days: filledDays, filled: daysBackfilled, toppedUp: daysToppedUp } = fillDaysFromCatalogue(boundedDays, catalogue, {
         controlPanel,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
-        budget: plannerCeiling,
+        budget: fillBudget,
         routeMatrix,
     });
 
@@ -1335,17 +1387,23 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     const finalValidation = repaired ? repairedValidation : validation;
 
     // Spend up toward the traveller's budget, then trim any overshoot.
+    //
+    // In advisory mode both passes are skipped: spendUpToBudget would only ever add more
+    // spend (harmless) but trimToBudget would strip the very activities the fill just used
+    // to complete each day, dragging the trip back to ~1 activity/day. Keep the full days.
     const { days: spentDays, added: budgetAdds, swapped: budgetSwaps } = spendUpToBudget(safeDays, catalogue, {
-        budget: plannerCeiling,
+        budget: BUDGET_ADVISORY ? undefined : plannerCeiling,
         controlPanel,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
         routeMatrix,
     });
 
-    const { days: budgetedDays, removed: budgetRemovals } = trimToBudget(spentDays, {
-        budget: plannerCeiling,
-        controlPanel,
-    });
+    const { days: budgetedDays, removed: budgetRemovals } = BUDGET_ADVISORY
+        ? { days: spentDays, removed: 0 }
+        : trimToBudget(spentDays, {
+            budget: plannerCeiling,
+            controlPanel,
+        });
 
     // Activities that do not fit activity start→end hours move to the next day.
     const { days: spilledDays, spilled: activitiesSpilled } = spillOverflowToNextDays(budgetedDays, {
@@ -1729,8 +1787,8 @@ Rules:
 - CRITICAL GEOGRAPHY: Each row includes lat,lng (and an area name when known). Same-day activities must fit inside the day's activity hours (${cp.activityStartTime || '09:00'}–${cp.activityEndTime || '19:00'}, lunch reserved). Use coordinates to estimate travel time between stops — do not schedule more activities + travel than those hours allow. Spread the trip across DIFFERENT areas on different days when other areas appear in the list. Keep each area on consecutive days; when moving between areas, put fewer activities on the travel day. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
 - Prioritize a mix of famous landmarks and top-rated (★) experiences. Do NOT fill the trip with cheap filler when iconic options are in the list.
 - Include the destination's iconic landmarks where they appear in the list.
-- Fill days that may hold activities when the remaining spend target allows. Empty days are OK once another activity would exceed the ceiling.
-- Max ${MAX_ACTIVITIES_PER_DAY} activities per day. Do not repeat an activity.
+- Fill EVERY day that may hold activities. Pack each day with AS MANY activities as physically fit inside its activity hours (${cp.activityStartTime || '09:00'}–${cp.activityEndTime || '19:00'}, minus travel between stops and the lunch break) — do not stop at 2 or 3 if more still fit. There is NO fixed per-day limit; the only limit is the day's hours.
+- Do not repeat an activity.
 - ${activeDayRule}
 - ${lastDayRule}
 - Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget} PER PERSON (catalogue prices are per person). Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
