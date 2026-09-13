@@ -1077,6 +1077,182 @@ function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxP
     return { days: rebuilt, validation, repaired: true, repairedValidation };
 }
 
+/**
+ * When the AI (or filler) packed every day from one area, pull unused catalogue clusters
+ * onto empty / under-used days so a Lebanon trip is not Beirut-only for 3 days.
+ *
+ * @returns {{ days: Array, diversified: boolean }}
+ */
+function diversifyItineraryAreas(days, catalogue, {
+    controlPanel = {},
+    origin = null,
+    maxPerDay = 3,
+    routeMatrix = null,
+} = {}) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    if (list.length === 0) return { days: list, diversified: false };
+
+    const allowed = allowedDayIndices(list.length, controlPanel);
+    if (allowed.length < 2) return { days: list, diversified: false };
+
+    const scheduled = [];
+    list.forEach((day) => countableActivities(day).forEach((a) => scheduled.push(a)));
+
+    const usedIds = new Set(scheduled.map((a) => String(a.activityId || a._id || '')).filter(Boolean));
+    const catalogueList = (Array.isArray(catalogue) ? catalogue : []).filter((a) => a?._id);
+    const availableClusters = clusterByGeography(catalogueList).filter((c) => c.centroid);
+    if (availableClusters.length < 2) return { days: list, diversified: false };
+
+    const usedClusters = clusterByGeography(scheduled.filter((a) => getCoordinates(a)));
+    const usedKeys = new Set();
+    usedClusters.forEach((uc) => {
+        availableClusters.forEach((ac) => {
+            if (!ac.centroid || !uc.centroid) return;
+            const d = haversineKm(ac.centroid, uc.centroid);
+            if (d !== null && d <= SAME_AREA_RADIUS_KM) usedKeys.add(ac.key);
+        });
+    });
+
+    const unused = availableClusters.filter((c) => !usedKeys.has(c.key));
+    if (unused.length === 0) return { days: list, diversified: false };
+
+    // Prefer empty allowed days, then days with spare capacity.
+    const targetDays = allowed
+        .map((index) => ({ index, date: list[index]?.date || '', count: countableActivities(list[index]).length }))
+        .sort((a, b) => a.count - b.count);
+
+    const additions = [];
+    unused.forEach((cluster) => {
+        const pick = [...cluster.items]
+            .filter((a) => !usedIds.has(String(a._id)))
+            .sort((a, b) => (Number(b.rating) || 0) - (Number(a.rating) || 0))[0];
+        if (!pick) return;
+        usedIds.add(String(pick._id));
+        additions.push(catalogueEntryFrom(pick));
+    });
+    if (additions.length === 0) return { days: list, diversified: false };
+
+    const pool = [...scheduled, ...additions];
+    const activeDays = allowed.map((index) => ({ index, date: list[index]?.date || '' }));
+    const { assignments, transfers } = planActivitiesAcrossDays(pool, {
+        activeDays,
+        controlPanel,
+        origin,
+        maxPerDay,
+        routeMatrix,
+    });
+
+    const breaksByDay = new Map();
+    list.forEach((day, index) => {
+        const breaks = (day.activities || []).filter(isBreakEntry);
+        if (breaks.length) breaksByDay.set(index, breaks);
+    });
+
+    const rebuilt = list.map((day, index) => {
+        if (!assignments.has(index)) return day;
+        const activities = [...(assignments.get(index) || [])];
+        const breaks = breaksByDay.get(index) || [];
+        const transfer = transfers.get(index);
+        return {
+            ...day,
+            activities: [...activities, ...breaks],
+            ...(transfer ? { transferNote: describeTransfer(transfer), transfer } : {}),
+        };
+    });
+
+    // Keep the diversified plan only when it actually uses more areas.
+    const afterClusters = clusterByGeography(
+        rebuilt.flatMap((d) => countableActivities(d).filter((a) => getCoordinates(a)))
+    );
+    if (afterClusters.length <= usedClusters.length) {
+        return { days: list, diversified: false };
+    }
+
+    return { days: rebuilt, diversified: true };
+}
+
+/**
+ * Move activities that do not fit a day's activity start→end window onto later days.
+ *
+ * Walks days in order. Keeps as many activities as the Control Panel hours allow
+ * (durations + travel). Anything that would overrun is pushed to the next allowed day.
+ * If the last day overflows, remaining activities stay there (nowhere else to go).
+ *
+ * @returns {{ days: Array, spilled: number }}
+ */
+function spillOverflowToNextDays(days, {
+    controlPanel = {},
+    maxPerDay = 4,
+    routeMatrix = null,
+} = {}) {
+    const list = Array.isArray(days) ? days.map((d) => (d?.toObject ? d.toObject() : d)) : [];
+    if (list.length === 0) return { days: list, spilled: 0 };
+
+    const allowed = allowedDayIndices(list.length, controlPanel);
+    const allowedSet = new Set(allowed);
+    const rebuilt = list.map((day) => ({
+        ...day,
+        activities: Array.isArray(day.activities) ? [...day.activities] : [],
+    }));
+
+    let spilled = 0;
+    let carry = [];
+
+    for (let index = 0; index < rebuilt.length; index++) {
+        const day = rebuilt[index];
+        const breaks = (day.activities || []).filter(isBreakEntry);
+        const real = [
+            ...carry,
+            ...(day.activities || []).filter((a) => !isBreakEntry(a)),
+        ];
+        carry = [];
+
+        if (!allowedSet.has(index)) {
+            // Arrival/departure locked empty — push everything forward.
+            if (real.length) {
+                carry = real;
+                spilled += real.length;
+            }
+            rebuilt[index] = { ...day, activities: [...breaks] };
+            continue;
+        }
+
+        const kept = [];
+        const dayFlags = {
+            isArrival: index === 0,
+            isDeparture: index === rebuilt.length - 1,
+        };
+
+        for (const act of real) {
+            const proposed = [...kept, act];
+            const fitsHours = dayWouldFit(day, proposed, controlPanel, routeMatrix, dayFlags);
+            const fitsCount = proposed.length <= maxPerDay;
+            if (fitsHours && fitsCount) {
+                kept.push(act);
+            } else {
+                carry.push(act);
+                spilled += 1;
+            }
+        }
+
+        rebuilt[index] = { ...day, activities: [...kept, ...breaks] };
+    }
+
+    // Nowhere left to spill — put leftovers back on the last allowed day.
+    if (carry.length && allowed.length) {
+        const last = allowed[allowed.length - 1];
+        const day = rebuilt[last];
+        const breaks = (day.activities || []).filter(isBreakEntry);
+        const real = countableActivities(day);
+        rebuilt[last] = {
+            ...day,
+            activities: [...real, ...carry, ...breaks],
+        };
+    }
+
+    return { days: rebuilt, spilled };
+}
+
 module.exports = {
     clusterName,
     describeTransfer,
@@ -1093,4 +1269,6 @@ module.exports = {
     allocateDaysToClusters,
     planActivitiesAcrossDays,
     repairItineraryGeography,
+    diversifyItineraryAreas,
+    spillOverflowToNextDays,
 };

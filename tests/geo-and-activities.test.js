@@ -41,6 +41,7 @@ const {
     trimToBudget,
     spendUpToBudget,
     selectActivitiesForTrip,
+    spillOverflowToNextDays,
 } = require('../utils/itineraryGeoPlanner');
 
 // Real coordinates from the production catalogue.
@@ -635,6 +636,30 @@ test('spendUpToBudget is a no-op when the plan is already near the budget', () =
     });
     assert.equal(added, 0);
     assert.equal(swapped, 0);
+});
+
+test('spillOverflowToNextDays moves activities that do not fit activity hours', () => {
+    const cp = {
+        startOnArrival: true,
+        endOnDeparture: true,
+        activityStartTime: '09:00',
+        activityEndTime: '13:00', // 4 hours, no lunch → 240 min
+        lunchDurationMinutes: 0,
+    };
+    const long = (title) => ({
+        ...act(title, CAIRO, { price: 50 }),
+        activityId: title,
+        duration: '3h',
+    });
+    const days = [
+        { day: 1, activities: [long('A'), long('B'), long('C')] }, // 9h > 4h
+        { day: 2, activities: [] },
+        { day: 3, activities: [] },
+    ];
+    const { days: out, spilled } = spillOverflowToNextDays(days, { controlPanel: cp, maxPerDay: 4 });
+    assert.ok(spilled > 0, 'at least one activity must spill');
+    assert.equal(countableActivities(out[0]).length, 1, 'first day keeps only what fits');
+    assert.ok(countableActivities(out[1]).length >= 1, 'overflow lands on the next day');
 });
 
 test('Google Distance Matrix minutes are used for intercity legs', () => {

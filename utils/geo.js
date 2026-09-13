@@ -15,7 +15,11 @@
 
 const EARTH_RADIUS_KM = 6371;
 
-/** Two places closer than this are treated as the same base — no relocation needed. */
+/**
+ * Two places closer than this are treated as the same base — no relocation needed.
+ * Day capacity still comes from Control Panel activity start/end times; this radius
+ * only groups nearby stops for multi-area routing.
+ */
 const SAME_AREA_RADIUS_KM = Number(process.env.ITINERARY_SAME_AREA_RADIUS_KM) || 60;
 
 /** Average door-to-door ground speed, km/h. Deliberately conservative. */
@@ -196,9 +200,21 @@ function clusterByGeography(activities, { radiusKm = SAME_AREA_RADIUS_KM } = {})
         let target = null;
         let bestDistance = Infinity;
         for (const cluster of clusters) {
-            const d = haversineKm(cluster.centroid, coords);
-            if (d !== null && d <= radiusKm && d < bestDistance) {
-                bestDistance = d;
+            // Complete-link: join only when EVERY existing member is within radius.
+            // Centroid-only matching chained Beirut→Laqlouq→Baalbek into one "area".
+            let farthest = 0;
+            let ok = true;
+            for (const member of cluster.items) {
+                const mc = getCoordinates(member);
+                const d = mc ? haversineKm(mc, coords) : null;
+                if (d === null || d > radiusKm) {
+                    ok = false;
+                    break;
+                }
+                farthest = Math.max(farthest, d);
+            }
+            if (ok && farthest < bestDistance) {
+                bestDistance = farthest;
                 target = cluster;
             }
         }

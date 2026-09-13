@@ -54,6 +54,8 @@ const {
 const {
     planActivitiesAcrossDays,
     repairItineraryGeography,
+    diversifyItineraryAreas,
+    spillOverflowToNextDays,
     describeTransfer,
     enforceDayBoundaries,
     fillDaysFromCatalogue,
@@ -398,6 +400,25 @@ function selectCatalogueForPrompt(activities, { limit = AI_CATALOGUE_LIMIT, acti
 }
 
 /**
+ * Place label for the AI catalogue row.
+ * Prefer city; never send the bare country when that is all we have — instead infer a
+ * known area name from the title so Lebanon activities are not all labelled "Lebanon".
+ */
+function areaLabelForPrompt(act, destination = '') {
+    const city = String(act?.city || '').trim();
+    if (city) return city;
+    const loc = String(act?.location || act?.area || '').trim();
+    const dest = String(destination || '').trim().toLowerCase();
+    const country = String(act?.country || '').trim().toLowerCase();
+    if (loc && loc.toLowerCase() !== dest && loc.toLowerCase() !== country) return loc;
+    const title = String(act?.title || '');
+    const match = title.match(
+        /\b(Beirut|Byblos|Baalbek|Tyre|Sidon|Laqlouq|Jeita|Harissa|Chouf|Beiteddine|Anjar|Baatara|Raouche|Cairo|Giza|Luxor|Aswan|Alexandria|Hurghada|Abu Simbel|Edfu|Kom Ombo|Saqqara|Memphis)\b/i
+    );
+    return match ? match[1] : '';
+}
+
+/**
  * Render the shortlist for the prompt.
  *
  * Deliberately terse. Each row used to carry a 24-character hex ObjectId (~12 tokens on
@@ -413,11 +434,10 @@ function buildCataloguePrompt(shortlist, { destination = '' } = {}) {
         indexToActivity.set(handle, a);
 
         const c = getCoordinates(a);
-        const place = String(a.city || a.location || '').trim();
+        const place = areaLabelForPrompt(a, destination);
         const parts = [`#${handle} ${a.title}`];
         if (c) parts.push(`${c.lat.toFixed(2)},${c.lng.toFixed(2)}`);
-        // Only worth sending when it distinguishes this row from the destination itself.
-        if (place && place.toLowerCase() !== String(destination).toLowerCase()) parts.push(place);
+        if (place) parts.push(place);
         parts.push(String(a.duration || '2h').replace(/\s*hours?/i, 'h').replace(/\s*mins?/i, 'm'));
         parts.push(`$${Number(a.price) || 0}`);
         if (Number(a.rating) > 0) parts.push(`★${Number(a.rating).toFixed(1)}`);
@@ -604,6 +624,11 @@ function hydrateDayActivities(days, catalogue) {
                 }
 
                 const coords = getCoordinates(act) || getCoordinates(match);
+                const place = areaLabelForPrompt(match, match.country || match.location)
+                    || act.location
+                    || match.city
+                    || match.location
+                    || '';
                 return {
                     ...act,
                     activityId: linkedId || String(match._id),
@@ -617,7 +642,7 @@ function hydrateDayActivities(days, catalogue) {
                     image: activityImageUrl(linkedId || match._id),
                     coordinates: coords || act.coordinates,
                     duration: act.duration || match.duration,
-                    location: act.location || match.location || match.city,
+                    location: place,
                 };
             }),
         };
@@ -1291,7 +1316,16 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     // Geography must be fixed before the budget pass. spendUpToBudget was running first,
     // then repairItineraryGeography redistributed the plan and dropped the expensive
     // upgrades — a $2,000 Egypt request routinely came back at ~$112 activity spend.
-    const { days: safeDays, validation, repaired, repairedValidation } = repairItineraryGeography(hydratedDays, {
+    const { days: repairedDays, validation, repaired, repairedValidation } = repairItineraryGeography(hydratedDays, {
+        controlPanel,
+        origin: hotelCoords,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
+    });
+
+    // Even a geographically-valid plan can still be one-area-only. Pull unused catalogue
+    // clusters onto other days so Beirut-only Lebanon trips become multi-area.
+    const { days: safeDays, diversified: areasDiversified } = diversifyItineraryAreas(repairedDays, catalogue, {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -1313,11 +1347,18 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         controlPanel,
     });
 
+    // Activities that do not fit activity start→end hours move to the next day.
+    const { days: spilledDays, spilled: activitiesSpilled } = spillOverflowToNextDays(budgetedDays, {
+        controlPanel,
+        maxPerDay: MAX_ACTIVITIES_PER_DAY,
+        routeMatrix,
+    });
+
     // Impose the Control Panel's activity hours and lunch break, whichever generator
     // produced these days.
     itinerary.days = attachOvernightStays(
         normalizeTripDays(
-            hydrateDayActivities(applyDaySchedule(budgetedDays, controlPanel, itinerary.startDate, routeMatrix, hotelCoords, Boolean(stayPlan?.some((s) => s?.name))), catalogue),
+            hydrateDayActivities(applyDaySchedule(spilledDays, controlPanel, itinerary.startDate, routeMatrix, hotelCoords, Boolean(stayPlan?.some((s) => s?.name))), catalogue),
             itinerary.startDate
         ),
         stayPlan
@@ -1335,6 +1376,8 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
     await itinerary.populate(HOTEL_POPULATE);
     return resPayload(itinerary, source, persist, {
         geographyRepaired: repaired,
+        areasDiversified: Boolean(areasDiversified),
+        activitiesSpilledToNextDay: activitiesSpilled || 0,
         dayBoundariesEnforced: boundariesChanged,
         daysBackfilled,
         daysToppedUp,
@@ -1683,7 +1726,7 @@ Activities available (use the #number to reference one):
 ${catalogueText}
 
 Rules:
-- Same-day activities must be within ~${Math.round(SAME_AREA_RADIUS_KM)}km of each other (use the coordinates). Keep each area on consecutive days; when moving between areas, use one travel day with fewer activities. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
+- CRITICAL GEOGRAPHY: Each row includes lat,lng (and an area name when known). Same-day activities must fit inside the day's activity hours (${cp.activityStartTime || '09:00'}–${cp.activityEndTime || '19:00'}, lunch reserved). Use coordinates to estimate travel time between stops — do not schedule more activities + travel than those hours allow. Spread the trip across DIFFERENT areas on different days when other areas appear in the list. Keep each area on consecutive days; when moving between areas, put fewer activities on the travel day. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
 - Prioritize a mix of famous landmarks and top-rated (★) experiences. Do NOT fill the trip with cheap filler when iconic options are in the list.
 - Include the destination's iconic landmarks where they appear in the list.
 - Fill days that may hold activities when the remaining spend target allows. Empty days are OK once another activity would exceed the ceiling.

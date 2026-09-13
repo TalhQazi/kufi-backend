@@ -49,8 +49,8 @@ const sanitizeActivityPayload = (body) => {
  * biggest cost in this endpoint. Callers that only render a handful of cards should ask
  * for a `limit`; callers that do not need pictures at all can pass `fields=summary`.
  */
-const LIST_EXCLUDED_FIELDS = '-image -images -description -addOns -coordinates';
-const SUMMARY_FIELDS = '_id title location country price duration category rating reviews status order createdAt imageUrl';
+const LIST_EXCLUDED_FIELDS = '-image -images -description -addOns';
+const SUMMARY_FIELDS = '_id title location country price duration category rating reviews status order createdAt imageUrl coordinates';
 
 // Get all activities
 exports.getActivities = async (req, res) => {
@@ -127,7 +127,7 @@ exports.getActivities = async (req, res) => {
         // named in the exclusion form — the inclusion form drops it by omission.
         const projection = wantsSummary
             ? SUMMARY_FIELDS.split(' ').reduce((acc, f) => ({ ...acc, [f]: 1 }), {})
-            : { image: 0, images: 0, description: 0, addOns: 0, coordinates: 0, _rank: 0 };
+            : { image: 0, images: 0, description: 0, addOns: 0, _rank: 0 };
         pipeline.push({ $project: projection });
 
         const activities = await Activity.aggregate(pipeline).option({ maxTimeMS: 10000 });
