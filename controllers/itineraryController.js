@@ -6,6 +6,7 @@ const Activity = require('../models/Activity');
 const Hotel = require('../models/Hotel');
 const Booking = require('../models/Booking');
 const User = require('../models/User');
+const GlobalSettings = require('../models/GlobalSettings');
 const { parseBudget, applyBudgetToDocument } = require('../utils/parseBudget');
 const { sendEmail } = require('../utils/emailService');
 const { notifyPreset } = require('../utils/createNotification');
@@ -2003,6 +2004,78 @@ function buildBuilderStateUpdate(body, existingControlPanel) {
     return update;
 }
 
+/**
+ * Calculates the exact quoted grand total for an itinerary:
+ *   grandTotal = activitiesTotal (party-aware) + hotelCost + customCostsTotal
+ * This guarantees the backend quote, the database fields (price / totalCost / totalAmount)
+ * and the supplier builder match identically.
+ */
+async function calculateItineraryGrandTotal(itinerary) {
+    if (!itinerary) return 0;
+    const travellers = Math.max(1, Number(itinerary.numberOfTravelers) || 1);
+    const days = Array.isArray(itinerary.days) ? itinerary.days : [];
+
+    const activitiesPerPerson = days.reduce((sum, day) => {
+        const acts = Array.isArray(day?.activities) ? day.activities : [];
+        return sum + acts.reduce((s, a) => {
+            if (!a || a.isBreak || isBreakEntry(a)) return s;
+            return s + (Number(a.price || a.cost) || 0);
+        }, 0);
+    }, 0);
+    const activitiesTotal = partyActivityCost(activitiesPerPerson, travellers);
+
+    const cp = itinerary.controlPanel || {};
+    const startDate = itinerary.startDate;
+    const endDate = itinerary.endDate;
+    const tripDays = (startDate && endDate) ? daysBetween(startDate, endDate) : (days.length || 1);
+    const nights = (startDate && endDate) ? nightsBetween(startDate, endDate) : Math.max(0, tripDays - 1);
+
+    let hotelCost = 0;
+    const stays = normalizeHotelStays(cp);
+    if (stays.length) {
+        const rooms = cp.numberOfRooms || 1;
+        const hotelIds = stays.map((s) => s.hotelId).filter(Boolean);
+        const hotels = await Hotel.find({ _id: { $in: hotelIds } }).lean();
+        const stayHotelMap = hotelsByIdFromDocs(hotels);
+        hotelCost = hotelCostFromStays(stays, stayHotelMap, rooms, nights);
+    } else if (cp.hotelId) {
+        const hotel = await Hotel.findById(cp.hotelId).lean();
+        if (hotel) {
+            const rooms = cp.numberOfRooms || 1;
+            hotelCost = (hotel.pricePerNight || 0) * nights * rooms;
+        }
+    }
+
+    const customCostsTotal = customCostsTotalFor(cp.customCosts, {
+        tripDays: Math.max(1, tripDays || 1),
+        travellers,
+    });
+
+    return activitiesTotal + hotelCost + customCostsTotal;
+}
+
+/**
+ * Synchronizes the booking document with the quoted itinerary price and platform fees.
+ */
+async function syncBookingTotalWithItinerary(itinerary, grandTotal) {
+    if (!itinerary || !itinerary.bookingId || grandTotal <= 0) return;
+    try {
+        let settings = await GlobalSettings.findOne().lean();
+        const commissionPct = Number(settings?.commissionPercentage) || 10;
+        const commissionAmount = (grandTotal * commissionPct) / 100;
+        const netAmount = grandTotal - commissionAmount;
+
+        await Booking.findByIdAndUpdate(itinerary.bookingId, {
+            totalAmount: grandTotal,
+            commissionAmount,
+            netAmount,
+            itineraryId: itinerary._id,
+        });
+    } catch (err) {
+        console.error('syncBookingTotalWithItinerary error:', err?.message);
+    }
+}
+
 // ─── SAVE days (manual edits after AI generation) ────────────────────────────
 
 exports.saveDays = async (req, res) => {
@@ -2030,6 +2103,14 @@ exports.saveDays = async (req, res) => {
         ).populate(HOTEL_POPULATE);
 
         if (!itinerary) return res.status(404).json({ msg: 'Itinerary not found' });
+
+        const grandTotal = await calculateItineraryGrandTotal(itinerary);
+        if (grandTotal > 0) {
+            itinerary.price = grandTotal;
+            itinerary.totalCost = grandTotal;
+            await itinerary.save();
+            await syncBookingTotalWithItinerary(itinerary, grandTotal);
+        }
 
         res.json(itinerary);
     } catch (err) {
@@ -2109,8 +2190,19 @@ exports.submitItinerary = async (req, res) => {
         const wasDraft = ['Pending', 'Pending Review'].includes(itinerary.status);
         itinerary.status = 'Supplier Replied Back';
         itinerary.updatedAt = new Date();
+
+        const grandTotal = await calculateItineraryGrandTotal(itinerary);
+        if (grandTotal > 0) {
+            itinerary.price = grandTotal;
+            itinerary.totalCost = grandTotal;
+        }
+
         await itinerary.save();
         await itinerary.populate(HOTEL_POPULATE);
+
+        if (grandTotal > 0 && itinerary.bookingId) {
+            await syncBookingTotalWithItinerary(itinerary, grandTotal);
+        }
 
         if (wasDraft || req.body.forceNotify) {
             await sendItineraryReadyEmail(itinerary);

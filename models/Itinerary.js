@@ -51,6 +51,12 @@ const ItinerarySchema = new mongoose.Schema({
     budget: {
         type: Number
     },
+    price: {
+        type: Number
+    },
+    totalCost: {
+        type: Number
+    },
     activities: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Activity'
