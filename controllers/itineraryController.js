@@ -36,6 +36,7 @@ const {
     markBreakEntries,
     buildBreakEntry,
     resolveActivityId,
+    mergeActivitiesWithBreaks,
 } = require('../utils/activityClassification');
 const {
     getCoordinates,
@@ -1122,7 +1123,6 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
         const override = (cp.perDayOverrides || []).find((o) => o.date === date) || {};
         const activityStartTime = override.startTime || cp.activityStartTime || '09:00';
         const activityEndTime = override.endTime || cp.activityEndTime || '19:00';
-        const { lunchStart, lunchEnd, durationMinutes } = resolveLunchWindow(cp, override);
 
         // Pack the day sequentially from its start time, stepping over the lunch window
         // and using each activity's real duration.
@@ -1142,6 +1142,14 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             const departure = parseTimeToMinutes(cp.departureTime, null);
             if (departure != null) effectiveEnd = Math.min(dayEnd, departure);
         }
+
+        // Lunch is derived from the *effective* day window (after arrival/departure), so a
+        // 16:00 arrival day does not get a 13:00 lunch break.
+        const { lunchStart, lunchEnd, durationMinutes } = resolveLunchWindow(cp, {
+            ...override,
+            startTime: minutesToTime(dayStart),
+            endTime: minutesToTime(effectiveEnd),
+        });
         const breakStart = parseTimeToMinutes(lunchStart, null);
         const breakEnd = parseTimeToMinutes(lunchEnd, null);
         const hasBreak = durationMinutes > 0 && breakStart !== null && breakEnd !== null;
@@ -1218,8 +1226,8 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             });
         }
 
-        // A single lunch break, but only when the day actually holds activities.
-        const breaks = (durationMinutes > 0 && scheduled.length)
+        // One lunch break when the day has activities and overlaps 13:00–15:00.
+        const breaks = (hasBreak && scheduled.length)
             ? [buildBreakEntry({
                 title: 'Lunch Break',
                 description: 'Time set aside for lunch.',
@@ -1230,7 +1238,9 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
 
         return {
             ...item,
-            activities: [...scheduled, ...breaks],
+            // Chronological order so lunch (13:30–14:30) sits between morning and afternoon
+            // activities, not at the bottom of the day.
+            activities: mergeActivitiesWithBreaks(scheduled, breaks),
             // Strict scheduling never runs past the window, so there is never an overrun.
             overrunMinutes: 0,
         };
@@ -1792,7 +1802,7 @@ Rules:
 - Do not repeat an activity.
 - ${activeDayRule}
 - ${lastDayRule}
-- Keep ${lunch.lunchStart}-${lunch.lunchEnd} free for lunch (do NOT output a lunch entry — it is added automatically).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget} PER PERSON (catalogue prices are per person). Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
+- When the day overlaps 13:00–15:00, keep ${lunch.durationMinutes > 0 ? `${lunch.lunchStart}-${lunch.lunchEnd}` : '13:00–15:00'} free for lunch (do NOT output a lunch entry — it is added automatically only on days that overlap that window).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget} PER PERSON (catalogue prices are per person). Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
 
 Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
 "ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
@@ -1909,9 +1919,9 @@ Return a JSON object with a "days" array holding exactly ${tripDays} entries, in
 /**
  * Normalize a control panel before it is stored.
  *
- * Lunch is configured as a duration; the concrete window is derived by centring it in the
- * day's activity hours. Persisting the derived start/end keeps every existing reader
- * (traveller itinerary view, payment totals, older records) working unchanged.
+ * Lunch is configured as a duration; the concrete window is derived inside 13:00–15:00
+ * where it overlaps the day's activity hours. Persisting the derived start/end keeps
+ * every existing reader (traveller itinerary view, payment totals, older records) working.
  */
 function normalizeControlPanel(cp = {}) {
     const next = { ...cp };

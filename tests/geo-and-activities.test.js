@@ -28,6 +28,7 @@ const {
     travelMinutesBetween,
     transportModeForKm,
     dayCapacityMinutes,
+    resolveLunchWindow,
     validateItineraryGeography,
     roundUpToStep,
     SAME_AREA_RADIUS_KM,
@@ -147,6 +148,32 @@ test('day capacity subtracts the lunch window', () => {
     assert.equal(
         dayCapacityMinutes({ activityStartTime: '09:00', activityEndTime: '19:00', lunchStart: '13:00', lunchEnd: '14:00' }),
         540
+    );
+});
+
+test('lunch is placed inside 13:00–15:00', () => {
+    const a = resolveLunchWindow({ activityStartTime: '09:00', activityEndTime: '19:00', lunchDurationMinutes: 60 });
+    assert.equal(a.lunchStart, '13:30');
+    assert.equal(a.lunchEnd, '14:30');
+    assert.equal(a.durationMinutes, 60);
+
+    const b = resolveLunchWindow({ activityStartTime: '08:00', activityEndTime: '18:00', lunchDurationMinutes: 60 });
+    assert.equal(b.lunchStart, '13:30');
+    assert.equal(b.lunchEnd, '14:30');
+});
+
+test('late day start skips lunch entirely', () => {
+    const late = resolveLunchWindow({ activityStartTime: '16:00', activityEndTime: '19:00', lunchDurationMinutes: 60 });
+    assert.equal(late.durationMinutes, 0);
+
+    // Arrival at 16:00 on a normal 09–19 window also drops lunch from capacity.
+    assert.equal(
+        dayCapacityMinutes(
+            { activityStartTime: '09:00', activityEndTime: '19:00', lunchDurationMinutes: 60, arrivalTime: '16:00' },
+            {},
+            { isArrival: true }
+        ),
+        180 // 16:00–19:00 with no lunch
     );
 });
 

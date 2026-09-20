@@ -30,7 +30,7 @@ const {
     dayCapacityMinutes,
     validateItineraryGeography,
 } = require('./geo');
-const { isBreakEntry, countableActivities } = require('./activityClassification');
+const { isBreakEntry, countableActivities, mergeActivitiesWithBreaks } = require('./activityClassification');
 
 /**
  * Human-readable name for a cluster, for transfer notes.
@@ -329,7 +329,7 @@ function enforceDayBoundaries(days, { controlPanel = {}, origin = null, maxPerDa
         const transfer = transfers.get(index);
         return {
             ...day,
-            activities: [...(assignments.get(index) || []), ...(breaksByDay.get(index) || [])],
+            activities: mergeActivitiesWithBreaks(assignments.get(index) || [], breaksByDay.get(index) || []),
             ...(transfer ? { transferNote: describeTransfer(transfer), transfer } : {}),
         };
     });
@@ -1062,7 +1062,7 @@ function repairItineraryGeography(days, { controlPanel = {}, origin = null, maxP
         const transfer = transfers.get(index);
         return {
             ...day,
-            activities: [...activities, ...breaks],
+            activities: mergeActivitiesWithBreaks(activities, breaks),
             ...(transfer ? { transferNote: describeTransfer(transfer), transfer } : {}),
         };
     });
@@ -1167,7 +1167,7 @@ function diversifyItineraryAreas(days, catalogue, {
         const transfer = transfers.get(index);
         return {
             ...day,
-            activities: [...activities, ...breaks],
+            activities: mergeActivitiesWithBreaks(activities, breaks),
             ...(transfer ? { transferNote: describeTransfer(transfer), transfer } : {}),
         };
     });
@@ -1258,7 +1258,7 @@ function spillOverflowToNextDays(days, {
             }
         }
 
-        rebuilt[index] = { ...day, activities: [...kept, ...breaks] };
+        rebuilt[index] = { ...day, activities: mergeActivitiesWithBreaks(kept, breaks) };
     }
 
     // Nowhere left to spill — put leftovers back on the last allowed day.
@@ -1269,7 +1269,7 @@ function spillOverflowToNextDays(days, {
         const real = countableActivities(day);
         rebuilt[last] = {
             ...day,
-            activities: [...real, ...carry, ...breaks],
+            activities: mergeActivitiesWithBreaks([...real, ...carry], breaks),
         };
     }
 

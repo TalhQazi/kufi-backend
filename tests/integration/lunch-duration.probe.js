@@ -1,6 +1,6 @@
 /**
- * The lunch break is configured as a duration only and must apply to EVERY day,
- * centred in the activity window and moving with the start/end times.
+ * The lunch break is configured as a duration only and must fall inside 13:00–15:00
+ * whenever the day overlaps that band. Days that start after 15:00 get no lunch.
  */
 require('dotenv').config({ path: __dirname + '/../../.env' });
 const mongoose = require('mongoose');
@@ -57,11 +57,14 @@ const hdr = (t) => ({ headers: { Authorization: `Bearer ${t}` } });
 
     console.log('\nchecks:');
     console.log(`  duration stored and window derived  : ${a.stored.lunchDurationMinutes === 60 && a.stored.lunchStart === '13:30' ? 'PASS' : 'FAIL (' + a.stored.lunchStart + '-' + a.stored.lunchEnd + ')'}`);
-    console.log(`  window moves with activity hours    : ${b.stored.lunchStart === '12:30' ? 'PASS' : 'FAIL (' + b.stored.lunchStart + ')'}`);
+    console.log(`  window stays inside 13:00–15:00     : ${b.stored.lunchStart === '13:30' ? 'PASS' : 'FAIL (' + b.stored.lunchStart + ')'}`);
     console.log(`  longer duration widens the window   : ${c.stored.lunchStart === '13:15' && c.stored.lunchEnd === '14:45' ? 'PASS' : 'FAIL (' + c.stored.lunchStart + '-' + c.stored.lunchEnd + ')'}`);
     console.log(`  applies to EVERY day with activities: ${a.daysWithBreak === a.daysWithActivities ? 'PASS' : 'FAIL (' + a.daysWithBreak + '/' + a.daysWithActivities + ')'}`);
     console.log(`  one identical window across days    : ${a.times.length === 1 ? 'PASS (' + a.times[0] + ')' : 'FAIL (' + a.times.join(', ') + ')'}`);
     console.log(`  duration 0 -> no break scheduled    : ${d.stored.lunchDurationMinutes === 0 ? 'PASS' : 'FAIL (' + d.stored.lunchDurationMinutes + ')'}`);
+
+    const e = await run('16:00', '19:00', 60);
+    console.log(`  late start 16:00 -> no lunch break  : ${e.stored.lunchDurationMinutes === 0 && e.daysWithBreak === 0 ? 'PASS' : 'FAIL (dur=' + e.stored.lunchDurationMinutes + ', breaks=' + e.daysWithBreak + ')'}`);
 
     await Itinerary.deleteMany({ _id: id });
     await require('../../models/Notification').deleteMany({ userId: { $in: [sup._id, trav._id] } });

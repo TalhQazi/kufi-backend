@@ -143,6 +143,29 @@ function buildBreakEntry({ title = 'Lunch Break', description = '', startTime = 
     };
 }
 
+/**
+ * Order a day's entries by clock time so lunch sits between activities, not at the end.
+ * Entries without a parseable startTime sink to the bottom.
+ */
+function sortDayActivitiesByTime(entries = []) {
+    const toMinutes = (value) => {
+        const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+        if (!m) return Number.MAX_SAFE_INTEGER;
+        return Number(m[1]) * 60 + Number(m[2]);
+    };
+    return [...entries].sort((a, b) => {
+        const diff = toMinutes(a?.startTime) - toMinutes(b?.startTime);
+        if (diff !== 0) return diff;
+        // Same start: show the break first so lunch precedes an activity that starts after it.
+        return (isBreakEntry(a) ? 0 : 1) - (isBreakEntry(b) ? 0 : 1);
+    });
+}
+
+/** Merge real activities with break placeholders in chronological order. */
+function mergeActivitiesWithBreaks(activities = [], breaks = []) {
+    return sortDayActivitiesByTime([...(activities || []), ...(breaks || [])]);
+}
+
 module.exports = {
     BREAK_CATEGORY,
     BREAK_CATEGORIES,
@@ -153,4 +176,6 @@ module.exports = {
     countActivities,
     markBreakEntries,
     buildBreakEntry,
+    sortDayActivitiesByTime,
+    mergeActivitiesWithBreaks,
 };

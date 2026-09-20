@@ -53,7 +53,7 @@ node tests/integration/activities-sort-parity.probe.js   # read-only
 | `ai-token-usage` | Breaks the prompt down section by section so prompt growth is visible; `--live` reports exact usage and cost from the API |
 | `overview-controlpanel` | Settings made on the "Proceed to create itinerary" screen drive generation even when the request already has an itinerary record, and generation stays a preview (the stored copy is not overwritten) |
 | `day-boundaries` | `startOnArrival` / `endOnDeparture` actually change the plan on every generation path, and Save-as-Draft persists and lands the request in the Drafts tab |
-| `lunch-duration` | The lunch break is duration-driven, centred in the activity window, identical on every day, and absent when the duration is 0 |
+| `lunch-duration` | The lunch break is duration-driven, placed inside 13:00–15:00, identical on overlapping days, and absent when the day starts after 15:00 or duration is 0 |
 | `activity-reorder` | The admin up/down arrows: admin-only, input validation, `/reorder` is not shadowed by `/:id`, rows swap, orders come out sequential, the public listing reflects the change. Snapshots and restores the real ordering |
 | `uplift-effect` | Changing the budget uplift actually changes the generated plan, on both the template and AI paths. Use `PROBE_BUDGET=100` for a budget tight enough that the ceiling binds |
 | `uplift-zero-budget` | What `uplift = 0` does to the activity ceiling, including the case where hotel and custom costs consume the whole budget and the ceiling collapses to $0 |

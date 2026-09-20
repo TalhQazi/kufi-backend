@@ -307,6 +307,9 @@ function orderClustersByRoute(clusters, origin = null) {
 }
 
 const DEFAULT_LUNCH_MINUTES = Number(process.env.ITINERARY_LUNCH_MINUTES) || 60;
+/** Lunch may only fall inside this band (1:00 PM – 3:00 PM). */
+const LUNCH_BAND_START = 13 * 60;
+const LUNCH_BAND_END = 15 * 60;
 
 const parseTimeToMinutes = (value, fallback = null) => {
     const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
@@ -322,14 +325,15 @@ const minutesToTime = (mins) => {
 /**
  * Where lunch falls on a given day.
  *
- * The supplier now configures a *duration* only — a start time was one more thing to keep
- * consistent with the activity window, and getting it wrong silently produced days where
- * lunch sat outside working hours. The break is instead centred in the day's activity
- * window and applies to every day, so it always lands somewhere sensible:
+ * The supplier configures a *duration* only. The break is placed inside the fixed
+ * 13:00–15:00 lunch band, centred in the overlap between that band and the day's
+ * activity hours. If the day does not overlap 13:00–15:00 (e.g. activities start at
+ * 16:00), no lunch break is scheduled.
  *
  *   09:00–19:00, 60 min  ->  13:30–14:30
- *   08:00–18:00, 60 min  ->  12:30–13:30
+ *   08:00–18:00, 60 min  ->  13:30–14:30
  *   09:00–19:00, 90 min  ->  13:15–14:45
+ *   16:00–19:00, 60 min  ->  none (duration 0)
  *
  * Legacy records that still carry explicit lunchStart/lunchEnd keep working: their stored
  * span is used as the duration when no explicit duration is set.
@@ -352,14 +356,28 @@ function resolveLunchWindow(controlPanel = {}, override = {}) {
             : DEFAULT_LUNCH_MINUTES;
     }
 
-    const window = Math.max(0, dayEnd - dayStart);
-    // A break can never be longer than the working day.
-    duration = Math.max(0, Math.min(duration, window));
+    // Lunch only when the working day overlaps 13:00–15:00.
+    const bandStart = Math.max(dayStart, LUNCH_BAND_START);
+    const bandEnd = Math.min(dayEnd, LUNCH_BAND_END);
+    const available = Math.max(0, bandEnd - bandStart);
 
-    // Centre it, rounded down to a quarter hour so the times read cleanly.
-    const midpoint = dayStart + Math.floor(window / 2);
+    if (duration <= 0 || available <= 0) {
+        return {
+            startMinutes: LUNCH_BAND_START,
+            endMinutes: LUNCH_BAND_START,
+            durationMinutes: 0,
+            lunchStart: minutesToTime(LUNCH_BAND_START),
+            lunchEnd: minutesToTime(LUNCH_BAND_START),
+        };
+    }
+
+    // Fit inside the overlap; never longer than what the day can hold in the band.
+    duration = Math.min(duration, available);
+
+    // Centre in the overlap, rounded down to a quarter hour.
+    const midpoint = bandStart + Math.floor(available / 2);
     let startMinutes = Math.floor((midpoint - Math.floor(duration / 2)) / 15) * 15;
-    startMinutes = Math.max(dayStart, Math.min(startMinutes, dayEnd - duration));
+    startMinutes = Math.max(bandStart, Math.min(startMinutes, bandEnd - duration));
 
     return {
         startMinutes,
@@ -385,7 +403,12 @@ function dayCapacityMinutes(controlPanel = {}, override = {}, dayFlags = {}) {
         if (departure != null) end = Math.min(end, departure);
     }
 
-    const { durationMinutes } = resolveLunchWindow(controlPanel, override);
+    // Use the effective day window so late arrivals (e.g. 16:00) correctly drop lunch.
+    const { durationMinutes } = resolveLunchWindow(controlPanel, {
+        ...override,
+        startTime: minutesToTime(start),
+        endTime: minutesToTime(end),
+    });
 
     const window = Math.max(0, end - start);
     return Math.max(0, window - durationMinutes);

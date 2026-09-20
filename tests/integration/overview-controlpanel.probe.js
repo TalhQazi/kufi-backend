@@ -67,7 +67,7 @@ const line = (n, v, extra = '') => console.log(`  ${String(v).padStart(8)}  ${n}
 
     console.log('');
     line('lunch duration applied', cp.lunchDurationMinutes === 120 ? 'PASS' : 'FAIL', `got ${cp.lunchDurationMinutes}m`);
-    line('lunch window recentred', breakWindows.length === 1 && breakWindows[0] === '11:00-13:00' ? 'PASS' : 'FAIL', breakWindows.join(', ') || '(no breaks)');
+    line('lunch window recentred', breakWindows.length === 1 && breakWindows[0] === '13:00-15:00' ? 'PASS' : 'FAIL', breakWindows.join(', ') || '(no breaks)');
     // The day must START at the configured hour. It may finish past the configured end —
     // the budget is advisory and every day is filled, so an activity that does not fit the
     // window is scheduled and the day reports `overrunMinutes` rather than being dropped.
