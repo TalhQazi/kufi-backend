@@ -22,8 +22,21 @@ const EARTH_RADIUS_KM = 6371;
  */
 const SAME_AREA_RADIUS_KM = Number(process.env.ITINERARY_SAME_AREA_RADIUS_KM) || 60;
 
-/** Average door-to-door ground speed, km/h. Deliberately conservative. */
+/** Average door-to-door ground speed for intercity road legs, km/h. */
 const AVG_TRAVEL_SPEED_KMH = Number(process.env.ITINERARY_TRAVEL_SPEED_KMH) || 70;
+
+/**
+ * Urban / same-area average speed. Cairo-style traffic is far slower than highway
+ * cruising; 25 km/h plus a fixed overhead matches real door-to-door times better than
+ * a bare 40 km/h haversine.
+ */
+const LOCAL_TRAVEL_SPEED_KMH = Number(process.env.ITINERARY_LOCAL_TRAVEL_SPEED_KMH) || 25;
+
+/** Fixed minutes added to every local hop (parking, security, short walks). */
+const LOCAL_TRAVEL_OVERHEAD_MIN = Number(process.env.ITINERARY_LOCAL_TRAVEL_OVERHEAD_MIN) || 20;
+
+/** Minimum minutes between two distinct nearby places (not co-located). */
+const LOCAL_MIN_TRANSFER_MINUTES = Number(process.env.ITINERARY_LOCAL_MIN_TRANSFER_MINUTES) || 25;
 
 /** Fixed overhead per intercity transfer (check-out, terminals, transfers), minutes. */
 const TRANSFER_OVERHEAD_MIN = Number(process.env.ITINERARY_TRANSFER_OVERHEAD_MIN) || 60;
@@ -36,6 +49,13 @@ const FLIGHT_OVERHEAD_MIN = Number(process.env.ITINERARY_FLIGHT_OVERHEAD_MIN) ||
 
 /** Default activity length when the catalogue has no parsable duration, minutes. */
 const DEFAULT_ACTIVITY_MIN = Number(process.env.ITINERARY_DEFAULT_ACTIVITY_MIN) || 120;
+
+/**
+ * Minutes to leave after the flight/transfer lands before the first activity on an
+ * arrival day (check-in, freshen up, transfer to hotel). Midpoint of the 1–2 hour
+ * window the supplier asked for.
+ */
+const ARRIVAL_SETTLE_BUFFER_MINUTES = Number(process.env.ITINERARY_ARRIVAL_SETTLE_BUFFER_MINUTES) || 90;
 
 const toRad = (deg) => (Number(deg) * Math.PI) / 180;
 
@@ -103,33 +123,32 @@ function roundUpToStep(minutes, step = TIME_ROUNDING_MINUTES) {
 /**
  * Realistic door-to-door travel time in minutes for a given distance.
  *
- * Rounded up to the scheduling step so the resulting clock times are tidy: a 37-minute
- * leg is booked as 40. Legs under a minute stay at 0 — neighbouring sites should not
- * acquire a phantom five-minute transfer.
+ * Local hops use a slow urban speed + overhead so Museum→Saqqara style legs book
+ * ~45–60 minutes instead of an optimistic 15–25. Intercity legs keep the highway
+ * model with transfer overhead. Rounded up to the scheduling step.
  */
 function travelMinutesForKm(km) {
     if (!isFiniteNumber(km) || km <= 0) return 0;
 
     let raw;
     if (km <= SAME_AREA_RADIUS_KM) {
-        // Local hops: slower average speed, no fixed overhead.
-        raw = (km / 40) * 60;
+        raw = LOCAL_TRAVEL_OVERHEAD_MIN + (km / LOCAL_TRAVEL_SPEED_KMH) * 60;
+        if (raw < LOCAL_MIN_TRANSFER_MINUTES) raw = LOCAL_MIN_TRANSFER_MINUTES;
     } else if (km >= FLIGHT_THRESHOLD_KM) {
         raw = FLIGHT_OVERHEAD_MIN;
     } else {
         raw = TRANSFER_OVERHEAD_MIN + (km / AVG_TRAVEL_SPEED_KMH) * 60;
+        if (raw < MIN_TRANSFER_MINUTES) raw = MIN_TRANSFER_MINUTES;
     }
 
-    // Nearby is not the same as co-located: getting there still takes a few minutes.
-    if (raw < MIN_TRANSFER_MINUTES) return MIN_TRANSFER_MINUTES;
     return roundUpToStep(raw);
 }
 
 /**
  * Door-to-door minutes between two coordinates or activity-like objects.
  *
- * Intercity legs use the Google Distance Matrix when one was primed for this run
- * (same as Kufi v148). Local hops and missing cells fall back to haversine.
+ * Prefers a live Google Distance Matrix cell when one was primed for this run
+ * (including same-area hops). Falls back to the haversine model otherwise.
  */
 function travelMinutesBetween(from, to, routeMatrix) {
     const a = getCoordinates(from);
@@ -145,6 +164,79 @@ function travelMinutesBetween(from, to, routeMatrix) {
         }
     }
     return travelMinutesForKm(haversineKm(a, b));
+}
+
+/**
+ * Clock time (minutes) when an activity may start after the lunch break.
+ * Lunch ends first; then travel to the next place. Never start at lunch-end
+ * while still showing a travel leg — e.g. lunch 14:30 + 55 min → 15:25.
+ */
+function startMinutesAfterLunch(lunchEndMinutes, travelMinutes = 0) {
+    const lunchEnd = Number(lunchEndMinutes);
+    const travel = Math.max(0, Number(travelMinutes) || 0);
+    if (!Number.isFinite(lunchEnd)) return travel;
+    return lunchEnd + travel;
+}
+
+/**
+ * Push a stop past lunch when it would collide with the break, or when it would
+ * start at lunch-end while a travel leg is still outstanding (the classic
+ * "Lunch 14:30 → activity 14:30 · 30 min travel" bug).
+ *
+ * When the post-lunch slot (lunch end + travel + duration) does not fit before
+ * dayEndMinutes, still return that earliest clock — callers must overflow the
+ * stop rather than leave it overlapping lunch (e.g. departure at 14:30 with
+ * lunch until 14:15 must not keep a 12:20–14:20 activity).
+ *
+ * `dayEndMinutes` is accepted for call-site compatibility; overflow is enforced
+ * by applyDaySchedule when end > effectiveEnd.
+ *
+ * @returns {number} corrected tentative start (minutes from midnight)
+ */
+function adjustStartForLunchWindow({
+    tentative,
+    length,
+    breakStart,
+    breakEnd,
+    travelMinutes = 0,
+    dayEndMinutes: _dayEndMinutes = null,
+} = {}) {
+    const start = Number(tentative);
+    const dur = Math.max(0, Number(length) || 0);
+    const lunchStart = Number(breakStart);
+    const lunchEnd = Number(breakEnd);
+    const travel = Math.max(0, Number(travelMinutes) || 0);
+    if (!Number.isFinite(start) || !Number.isFinite(lunchStart) || !Number.isFinite(lunchEnd)) {
+        return start;
+    }
+
+    const earliest = startMinutesAfterLunch(lunchEnd, travel);
+    const overlapsLunch = start < lunchEnd && (start + dur) > lunchStart;
+    // Catch start === lunchEnd (or anywhere in the post-lunch travel window).
+    const squeezedAtLunchEnd = travel > 0 && start >= lunchEnd && start < earliest;
+
+    if (!overlapsLunch && !squeezedAtLunchEnd) return start;
+    return earliest;
+}
+
+/**
+ * Extra rest / walking buffer after a physically demanding attraction so the day
+ * does not pack museum → necropolis → pyramids with no recovery time.
+ */
+function effortBufferMinutes(activity) {
+    const title = String(activity?.title || '').toLowerCase();
+    const category = String(activity?.category || '').toLowerCase();
+    const duration = parseDurationMinutes(activity?.durationMinutes ?? activity?.duration);
+    const heavyTitle =
+        /pyramid|saqqara|necropolis|museum|giza|karnak|valley of the kings|abu simbel|temple|citadel|sphinx|walking.?tour|old.?cairo|khan|bazaar/i.test(title);
+    const heavyCategory = /landmark|heritage|historic|museum|temple|outdoor|adventure/i.test(category);
+    if (heavyTitle || heavyCategory || duration >= 180) {
+        return Number(process.env.ITINERARY_EFFORT_BUFFER_MINUTES) || 45;
+    }
+    if (duration >= 120) {
+        return Number(process.env.ITINERARY_LIGHT_EFFORT_BUFFER_MINUTES) || 20;
+    }
+    return 0;
 }
 
 /** The transport a leg of this length realistically requires. */
@@ -356,12 +448,14 @@ function resolveLunchWindow(controlPanel = {}, override = {}) {
             : DEFAULT_LUNCH_MINUTES;
     }
 
-    // Lunch only when the working day overlaps 13:00–15:00.
+    // Lunch only when the working day can hold the FULL configured duration inside
+    // 13:00–15:00. A partial leftover (e.g. 10 minutes on a late arrival day) is skipped
+    // rather than shown as a tiny "lunch break".
     const bandStart = Math.max(dayStart, LUNCH_BAND_START);
     const bandEnd = Math.min(dayEnd, LUNCH_BAND_END);
     const available = Math.max(0, bandEnd - bandStart);
 
-    if (duration <= 0 || available <= 0) {
+    if (duration <= 0 || available < duration) {
         return {
             startMinutes: LUNCH_BAND_START,
             endMinutes: LUNCH_BAND_START,
@@ -370,9 +464,6 @@ function resolveLunchWindow(controlPanel = {}, override = {}) {
             lunchEnd: minutesToTime(LUNCH_BAND_START),
         };
     }
-
-    // Fit inside the overlap; never longer than what the day can hold in the band.
-    duration = Math.min(duration, available);
 
     // Centre in the overlap, rounded down to a quarter hour.
     const midpoint = bandStart + Math.floor(available / 2);
@@ -393,10 +484,13 @@ function dayCapacityMinutes(controlPanel = {}, override = {}, dayFlags = {}) {
     let start = parseTimeToMinutes(override.startTime || controlPanel.activityStartTime, 9 * 60);
     let end = parseTimeToMinutes(override.endTime || controlPanel.activityEndTime, 19 * 60);
 
-    // Optional clock times from the v148-style control panel shrink the first/last day.
+    // Arrival day: first activity starts AFTER a settle buffer past arrival time
+    // (check-in / transfer), not at the moment the flight lands.
     if (dayFlags.isArrival && controlPanel.arrivalTime) {
         const arrival = parseTimeToMinutes(controlPanel.arrivalTime, null);
-        if (arrival != null) start = Math.max(start, arrival);
+        if (arrival != null) {
+            start = Math.max(start, arrival + ARRIVAL_SETTLE_BUFFER_MINUTES);
+        }
     }
     if (dayFlags.isDeparture && controlPanel.departureTime) {
         const departure = parseTimeToMinutes(controlPanel.departureTime, null);
@@ -412,6 +506,18 @@ function dayCapacityMinutes(controlPanel = {}, override = {}, dayFlags = {}) {
 
     const window = Math.max(0, end - start);
     return Math.max(0, window - durationMinutes);
+}
+
+/**
+ * Effective clock start for an arrival day when activities are allowed.
+ * Returns minutes-from-midnight: max(activityStart, arrival + settle buffer).
+ * Null when there is no arrival time to honour.
+ */
+function arrivalDayActivityStartMinutes(controlPanel = {}, activityStartFallback = 9 * 60) {
+    const dayStart = parseTimeToMinutes(controlPanel.activityStartTime, activityStartFallback);
+    const arrival = parseTimeToMinutes(controlPanel.arrivalTime, null);
+    if (arrival == null) return dayStart;
+    return Math.max(dayStart, arrival + ARRIVAL_SETTLE_BUFFER_MINUTES);
 }
 
 /**
@@ -497,6 +603,7 @@ function validateItineraryGeography(days, { controlPanel = {}, isBreakEntry = ()
 
 module.exports = {
     MIN_TRANSFER_MINUTES,
+    LOCAL_MIN_TRANSFER_MINUTES,
     SAME_AREA_RADIUS_KM,
     FLIGHT_THRESHOLD_KM,
     DEFAULT_ACTIVITY_MIN,
@@ -505,12 +612,17 @@ module.exports = {
     placeLabel,
     travelMinutesForKm,
     travelMinutesBetween,
+    effortBufferMinutes,
     transportModeForKm,
     parseDurationMinutes,
     clusterByGeography,
     orderClustersByRoute,
     dayCapacityMinutes,
     resolveLunchWindow,
+    arrivalDayActivityStartMinutes,
+    ARRIVAL_SETTLE_BUFFER_MINUTES,
+    startMinutesAfterLunch,
+    adjustStartForLunchWindow,
     roundUpToStep,
     TIME_ROUNDING_MINUTES,
     parseTimeToMinutes,

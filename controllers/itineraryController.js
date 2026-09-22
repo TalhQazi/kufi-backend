@@ -37,6 +37,7 @@ const {
     buildBreakEntry,
     resolveActivityId,
     mergeActivitiesWithBreaks,
+    dedupeItineraryActivities,
 } = require('../utils/activityClassification');
 const {
     getCoordinates,
@@ -49,6 +50,12 @@ const {
     SAME_AREA_RADIUS_KM,
     FLIGHT_THRESHOLD_KM,
     resolveLunchWindow,
+    LOCAL_MIN_TRANSFER_MINUTES,
+    effortBufferMinutes,
+    arrivalDayActivityStartMinutes,
+    ARRIVAL_SETTLE_BUFFER_MINUTES,
+    startMinutesAfterLunch,
+    adjustStartForLunchWindow,
     parseTimeToMinutes,
     minutesToTime,
     roundUpToStep,
@@ -77,19 +84,31 @@ function escapeRegExp(value) {
 }
 
 async function primeRouteMatrix(catalogue, hotelCoords) {
-    const clusters = clusterByGeography(catalogue);
     const points = [];
     if (hotelCoords?.lat != null && hotelCoords?.lng != null) {
         points.push({ name: 'Hotel', lat: hotelCoords.lat, lng: hotelCoords.lng });
     }
-    clusters.forEach((cluster, i) => {
-        if (!cluster?.centroid) return;
-        points.push({
-            name: clusterName(cluster, i),
-            lat: cluster.centroid.lat,
-            lng: cluster.centroid.lng,
+    // Prefer individual activity coordinates so same-city hops get real road times.
+    const list = Array.isArray(catalogue) ? catalogue : [];
+    for (const act of list) {
+        const c = getCoordinates(act);
+        if (!c) continue;
+        const name = String(act._id || act.title || '').trim();
+        if (!name) continue;
+        points.push({ name, lat: c.lat, lng: c.lng });
+    }
+    // Top up with geographic cluster centroids for intercity coverage when sparse.
+    if (points.length < 4) {
+        const clusters = clusterByGeography(list);
+        clusters.forEach((cluster, i) => {
+            if (!cluster?.centroid) return;
+            points.push({
+                name: clusterName(cluster, i),
+                lat: cluster.centroid.lat,
+                lng: cluster.centroid.lng,
+            });
         });
-    });
+    }
     return resolveRouteMatrix(points);
 }
 
@@ -223,7 +242,9 @@ function getActivityTimeSlot(index, startStr, endStr, lunchStartStr, lunchEndStr
         const overlapsLunch = (current < lunchEnd && slotEnd > lunchStart);
 
         if (overlapsLunch) {
-            current = lunchEnd;
+            // Leave room after lunch for a typical local transfer so slot[1] is not
+            // stamped at lunch-end (applyDaySchedule still recomputes with real travel).
+            current = lunchEnd + LOCAL_MIN_TRANSFER_MINUTES;
             continue;
         }
 
@@ -340,12 +361,9 @@ function padDaysToTripLength(days, tripDays) {
 // Mirrors v148's `softActivityCap`.
 const FIXED_OVER_BUDGET_ACTIVITY_SHARE = 0.35;
 
-// The real limit on a day is TIME, not a head-count. Every place that adds or spills
-// activities already checks the Control Panel's activity start→end window
-// (dayCapacityMinutes), so this is set high enough that the count never binds first: a
-// day holds as many activities as physically fit its hours (durations + travel). If 8
-// short stops fit 09:00–19:00, all 8 are scheduled. Set the env var to cap it again.
-const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 50;
+// Hard cap on bookable attractions per day. Client requirement: max 2 major sites
+// so travellers are not exhausted. Override with ITINERARY_MAX_ACTIVITIES_PER_DAY.
+const MAX_ACTIVITIES_PER_DAY = Number(process.env.ITINERARY_MAX_ACTIVITIES_PER_DAY) || 2;
 
 // When true, the traveller's budget is advisory only: days are filled up to their
 // activity start→end window (time capacity) even if the total runs past the ceiling,
@@ -1005,18 +1023,37 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
         list.push({ day: list.length + 1, ids: [], activities: [] });
     }
 
-    // The prompt forbids repeats, but the model does not always comply — and asking it to
-    // fill every day makes repetition more tempting. Deduplicate here so the same
-    // activity can never appear on two days of one itinerary.
+    // The prompt forbids repeats, but the model does not always comply. Deduplicate
+    // here and enforce max attractions per day so the rest of the pipeline starts clean.
     const seenIds = new Set();
     const seenTitles = new Set();
 
-    return list.map((entry, idx) => {
+    const mapped = list.map((entry, idx) => {
         const day = entry || {};
 
-        // Verbose shape: activities already spelled out.
+        // Verbose shape: activities already spelled out — still dedupe + cap.
         if (Array.isArray(day.activities)) {
-            return { ...day, day: idx + 1 };
+            const kept = [];
+            for (const raw of day.activities) {
+                const act = raw || {};
+                if (isBreakEntry(act)) {
+                    kept.push(act);
+                    continue;
+                }
+                const id = resolveActivityId(act.activityId) || resolveActivityId(act._id);
+                const titleKey = String(act.title || '').trim().toLowerCase();
+                if (id) {
+                    if (seenIds.has(id)) continue;
+                    seenIds.add(id);
+                } else if (titleKey) {
+                    if (seenTitles.has(titleKey)) continue;
+                    seenTitles.add(titleKey);
+                }
+                if (titleKey) seenTitles.add(titleKey);
+                kept.push(act);
+                if (kept.filter((a) => !isBreakEntry(a)).length >= MAX_ACTIVITIES_PER_DAY) break;
+            }
+            return { ...day, day: idx + 1, activities: kept };
         }
 
         // Compact shape: resolve #numbers back to catalogue activities.
@@ -1030,6 +1067,7 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
                 seenIds.add(key);
                 return true;
             })
+            .slice(0, MAX_ACTIVITIES_PER_DAY)
             .map((act) => ({
                 activityId: String(act._id),
                 title: act.title,
@@ -1047,7 +1085,6 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
         const custom = (Array.isArray(day.custom) ? day.custom : [])
             .filter((c) => String(c?.title || '').trim())
             .filter((c) => {
-                // Custom entries have no id, so they are deduplicated on title.
                 const key = String(c.title).trim().toLowerCase();
                 if (seenTitles.has(key)) return false;
                 seenTitles.add(key);
@@ -1066,8 +1103,11 @@ function parseAiItineraryReply(rawContent, { indexToActivity, tripDays }) {
                 isSupplierOnly: true,
             }));
 
-        return { day: idx + 1, activities: [...fromCatalogue, ...custom] };
+        const room = Math.max(0, MAX_ACTIVITIES_PER_DAY - fromCatalogue.length);
+        return { day: idx + 1, activities: [...fromCatalogue, ...custom.slice(0, room)] };
     });
+
+    return dedupeItineraryActivities(mapped);
 }
 
 /**
@@ -1133,9 +1173,10 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
         // never collide.
         let dayStart = parseTimeToMinutes(activityStartTime, 9 * 60);
         const dayEnd = parseTimeToMinutes(activityEndTime, 19 * 60);
-        if (idx === 0 && cp.arrivalTime) {
-            const arrival = parseTimeToMinutes(cp.arrivalTime, null);
-            if (arrival != null) dayStart = Math.max(dayStart, arrival);
+        // Arrival day with activities: leave ~1.5h after landing for transfer/check-in
+        // before the first attraction (not at the arrival clock time itself).
+        if (idx === 0 && cp.startOnArrival && cp.arrivalTime) {
+            dayStart = arrivalDayActivityStartMinutes(cp, dayStart);
         }
         let effectiveEnd = dayEnd;
         if (idx === list.length - 1 && cp.departureTime) {
@@ -1192,26 +1233,54 @@ function applyDaySchedule(days, controlPanel = {}, tripStartDate = null, routeMa
             }
             const isFirstLegFromOrigin = atDayStart && travelMinutes !== null;
 
-            // Prefer not to straddle the lunch break — but only step over it when the
-            // activity genuinely fits in what is left of the day.
-            if (hasBreak && tentative < breakEnd && tentative + length > breakStart) {
-                const fitsAfterBreak = breakEnd + length <= effectiveEnd;
-                if (fitsAfterBreak) tentative = breakEnd;
+            // Lunch first, then travel, then the attraction. Also catches the case where
+            // the clock lands exactly on lunch-end (overlap check is false there) while a
+            // travel leg is still shown — e.g. Lunch 14:30 + 30 min → must start 15:00.
+            if (hasBreak) {
+                let leg = Math.max(0, Number(travelMinutes) || 0);
+                if (leg <= 0 && previousCoords && here) {
+                    leg = travelMinutesBetween(previousCoords, here, routeMatrix);
+                } else if (leg <= 0 && (here || previousCoords) && !atDayStart) {
+                    leg = LOCAL_MIN_TRANSFER_MINUTES;
+                }
+                const adjusted = adjustStartForLunchWindow({
+                    tentative,
+                    length,
+                    breakStart,
+                    breakEnd,
+                    travelMinutes: leg,
+                    dayEndMinutes: effectiveEnd,
+                });
+                if (adjusted !== tentative) {
+                    tentative = adjusted;
+                    if (leg > 0) {
+                        travelMinutes = leg;
+                        travelUnknownReason = null;
+                    }
+                }
             }
 
             const startMinutes = tentative === dayStart ? tentative : roundUpToStep(tentative);
             const endMinutes = startMinutes + length;
 
+            // Never keep a stop that still collides with lunch (e.g. early departure
+            // left no room after lunch + travel — overflow instead of overlapping).
+            const collidesWithLunch = hasBreak
+                && startMinutes < breakEnd
+                && endMinutes > breakStart;
+
             // HARD LIMIT: if this stop would finish after the day's activity window, push it
             // (and everything queued behind it) to the next day rather than scheduling past
             // the end time. This is the strict overflow the supplier asked for.
-            if (endMinutes > effectiveEnd) {
+            if (endMinutes > effectiveEnd || collidesWithLunch) {
                 overflowed = true;
                 carry.push(act);
                 continue;
             }
 
-            cursor = endMinutes;
+            // Leave recovery time after heavy sites (museum, pyramids, long walks) so the
+            // next stop is not jammed against this one.
+            cursor = endMinutes + effortBufferMinutes(act);
             atDayStart = false;
             previousCoords = here || null;
 
@@ -1347,10 +1416,13 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         ? daysBetween(itinerary.startDate, itinerary.endDate)
         : (Array.isArray(days) ? days.length : 1);
 
+    // Hard rule: one attraction once per trip, before fill/repair can reintroduce it.
+    const uniqueDays = dedupeItineraryActivities(days);
+
     // The arrival/departure toggles are enforced here rather than inside one generator.
     // The template-clone path copies days from an older itinerary and never consulted
     // them, so flipping "Start activities on arrival day" used to change nothing.
-    const { days: boundedDays, changed: boundariesChanged } = enforceDayBoundaries(padDaysToTripLength(days, tripDayCount), {
+    const { days: boundedDays, changed: boundariesChanged } = enforceDayBoundaries(padDaysToTripLength(uniqueDays, tripDayCount), {
         controlPanel,
         origin: hotelCoords,
         maxPerDay: MAX_ACTIVITIES_PER_DAY,
@@ -1372,9 +1444,12 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         routeMatrix,
     });
 
+    // Fill/top-up must not reintroduce an attraction already used earlier in the trip.
+    const dedupedFilledDays = dedupeItineraryActivities(filledDays);
+
     // Backfilled rows are built from a lean catalogue (no image blob). Re-hydrate so
     // every day entry carries `/api/activities/:id/image` before we persist.
-    const hydratedDays = hydrateDayActivities(filledDays, catalogue);
+    const hydratedDays = hydrateDayActivities(dedupedFilledDays, catalogue);
 
     // Geography must be fixed before the budget pass. spendUpToBudget was running first,
     // then repairItineraryGeography redistributed the plan and dropped the expensive
@@ -1423,11 +1498,14 @@ async function saveGeneratedDays(itinerary, days, source, { persist = false, hot
         routeMatrix,
     });
 
+    // Final hard dedupe after fill/repair/spend/spill — same attraction never appears twice.
+    const uniqueSpilledDays = dedupeItineraryActivities(spilledDays);
+
     // Impose the Control Panel's activity hours and lunch break, whichever generator
     // produced these days.
     itinerary.days = attachOvernightStays(
         normalizeTripDays(
-            hydrateDayActivities(applyDaySchedule(spilledDays, controlPanel, itinerary.startDate, routeMatrix, hotelCoords, Boolean(stayPlan?.some((s) => s?.name))), catalogue),
+            hydrateDayActivities(applyDaySchedule(uniqueSpilledDays, controlPanel, itinerary.startDate, routeMatrix, hotelCoords, Boolean(stayPlan?.some((s) => s?.name))), catalogue),
             itinerary.startDate
         ),
         stayPlan
@@ -1783,7 +1861,9 @@ exports.generateItinerary = async (req, res) => {
                 .join('; ')
             : '';
         const activeDayRule = cp.startOnArrival
-            ? 'Day 1 is the arrival day and MAY hold activities.'
+            ? (cp.arrivalTime
+                ? `Day 1 is the arrival day and MAY hold activities, but the first activity must start at least ~${ARRIVAL_SETTLE_BUFFER_MINUTES} minutes after arrival time ${cp.arrivalTime} (transfer + check-in).`
+                : 'Day 1 is the arrival day and MAY hold activities.')
             : 'Day 1 is the arrival day and MUST be empty (transfer only).';
         const lastDayRule = cp.endOnDeparture !== false
             ? `Day ${tripDays} is the departure day and MAY hold activities.`
@@ -1798,11 +1878,11 @@ Rules:
 - CRITICAL GEOGRAPHY: Each row includes lat,lng (and an area name when known). Same-day activities must fit inside the day's activity hours (${cp.activityStartTime || '09:00'}–${cp.activityEndTime || '19:00'}, lunch reserved). Use coordinates to estimate travel time between stops — do not schedule more activities + travel than those hours allow. Spread the trip across DIFFERENT areas on different days when other areas appear in the list. Keep each area on consecutive days; when moving between areas, put fewer activities on the travel day. Legs over ${Math.round(FLIGHT_THRESHOLD_KM)}km imply a flight.
 - Prioritize a mix of famous landmarks and top-rated (★) experiences. Do NOT fill the trip with cheap filler when iconic options are in the list.
 - Include the destination's iconic landmarks where they appear in the list.
-- Fill EVERY day that may hold activities. Pack each day with AS MANY activities as physically fit inside its activity hours (${cp.activityStartTime || '09:00'}–${cp.activityEndTime || '19:00'}, minus travel between stops and the lunch break) — do not stop at 2 or 3 if more still fit. There is NO fixed per-day limit; the only limit is the day's hours.
-- Do not repeat an activity.
+- Fill EVERY day that may hold activities with at most ${MAX_ACTIVITIES_PER_DAY} major attractions per day. Leave recovery time between heavy sites (museums, pyramids, long walking tours).
+- NEVER repeat the same activity (same #id or same title) anywhere in the trip.
 - ${activeDayRule}
 - ${lastDayRule}
-- When the day overlaps 13:00–15:00, keep ${lunch.durationMinutes > 0 ? `${lunch.lunchStart}-${lunch.lunchEnd}` : '13:00–15:00'} free for lunch (do NOT output a lunch entry — it is added automatically only on days that overlap that window).${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget} PER PERSON (catalogue prices are per person). Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
+- When the day overlaps 13:00–15:00, keep ${lunch.durationMinutes > 0 ? `${lunch.lunchStart}-${lunch.lunchEnd}` : '13:00–15:00'} free for lunch (do NOT output a lunch entry — it is added automatically only on days that overlap that window). After lunch, the next activity must start only once travel time after lunch ends has elapsed.${activityBudget !== undefined ? `\n- Activity spend target: about $${activityBudget} PER PERSON (catalogue prices are per person). Build a mix of famous and top-rated experiences whose prices SUM as close as possible to that figure (aim for at least 95% of it when the list allows — use the full tolerance budget). Prefer iconic / ★-rated options over cheap filler. Do not exceed $${activityBudget}.` : ''}${requiredHandles.length ? `\n- You MUST include these: ${requiredHandles.map((h) => `#${h}`).join(', ')}.` : ''}${overridesPrompt}${budgetRulePrompt}
 
 Return a JSON object with a "days" array holding exactly ${tripDays} entries, in order.
 "ids" are #numbers from the list above. Add "custom" only for something genuinely missing from it.
@@ -2258,6 +2338,9 @@ exports.submitItinerary = async (req, res) => {
 };
 
 // ─── CLEAR all activities from itinerary days (admin) ────────────────────────
+
+// Exposed for unit tests — production callers use generateItinerary → saveGeneratedDays.
+exports.applyDaySchedule = applyDaySchedule;
 
 exports.clearActivities = async (req, res) => {
     try {

@@ -166,6 +166,41 @@ function mergeActivitiesWithBreaks(activities = [], breaks = []) {
     return sortDayActivitiesByTime([...(activities || []), ...(breaks || [])]);
 }
 
+/**
+ * Keep the first occurrence of each activity across the whole trip.
+ * Drops later repeats by activityId, then by normalized title
+ * (case/spacing insensitive) so "Giza Pyramids" and "giza  pyramids" collide.
+ */
+function dedupeItineraryActivities(days = []) {
+    const seenIds = new Set();
+    const seenTitles = new Set();
+    const normalizeTitle = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    return (Array.isArray(days) ? days : []).map((day) => {
+        const item = day?.toObject ? day.toObject() : day;
+        const list = Array.isArray(item?.activities) ? item.activities : [];
+        const kept = [];
+        for (const entry of list) {
+            const act = entry?.toObject ? entry.toObject() : entry;
+            if (isBreakEntry(act)) {
+                kept.push(act);
+                continue;
+            }
+            const id = resolveActivityId(act?.activityId) || resolveActivityId(act?._id);
+            const titleKey = normalizeTitle(act?.title);
+            if (id) {
+                if (seenIds.has(id)) continue;
+                seenIds.add(id);
+            }
+            if (titleKey) {
+                if (seenTitles.has(titleKey)) continue;
+                seenTitles.add(titleKey);
+            }
+            kept.push(act);
+        }
+        return { ...item, activities: kept };
+    });
+}
+
 module.exports = {
     BREAK_CATEGORY,
     BREAK_CATEGORIES,
@@ -178,4 +213,5 @@ module.exports = {
     buildBreakEntry,
     sortDayActivitiesByTime,
     mergeActivitiesWithBreaks,
+    dedupeItineraryActivities,
 };
