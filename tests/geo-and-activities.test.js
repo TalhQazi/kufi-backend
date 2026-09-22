@@ -29,6 +29,10 @@ const {
     transportModeForKm,
     dayCapacityMinutes,
     resolveLunchWindow,
+    effortBufferMinutes,
+    arrivalDayActivityStartMinutes,
+    startMinutesAfterLunch,
+    adjustStartForLunchWindow,
     validateItineraryGeography,
     roundUpToStep,
     SAME_AREA_RADIUS_KM,
@@ -166,15 +170,25 @@ test('late day start skips lunch entirely', () => {
     const late = resolveLunchWindow({ activityStartTime: '16:00', activityEndTime: '19:00', lunchDurationMinutes: 60 });
     assert.equal(late.durationMinutes, 0);
 
-    // Arrival at 16:00 on a normal 09–19 window also drops lunch from capacity.
+    // Only 10 minutes of the lunch band left — skip rather than show a tiny break.
+    const partial = resolveLunchWindow({ activityStartTime: '14:50', activityEndTime: '19:00', lunchDurationMinutes: 60 });
+    assert.equal(partial.durationMinutes, 0);
+
+    // Arrival at 16:00 + 90 min settle → first activity from 17:30; lunch band missed.
     assert.equal(
         dayCapacityMinutes(
             { activityStartTime: '09:00', activityEndTime: '19:00', lunchDurationMinutes: 60, arrivalTime: '16:00' },
             {},
             { isArrival: true }
         ),
-        180 // 16:00–19:00 with no lunch
+        90 // 17:30–19:00 with no lunch
     );
+});
+
+test('effort buffer is reserved after heavy attractions', () => {
+    assert.equal(effortBufferMinutes({ title: 'Giza Pyramids', duration: '3 hours' }), 45);
+    assert.equal(effortBufferMinutes({ title: 'Grand Egyptian Museum', duration: '2 hours' }), 45);
+    assert.ok(effortBufferMinutes({ title: 'Coffee tasting', duration: '30 mins' }) < 45);
 });
 
 // ─── Issue 6: geographic clustering ──────────────────────────────────────────
@@ -391,12 +405,12 @@ test('a "Leisure" category alone does not make something a break', () => {
 // ─── Travel time is reserved between consecutive activities ──────────────────
 
 test('travel time between two stops is charged to the day', () => {
-    // 19.7km at the local 40km/h rate is ~30 minutes.
+    // ~13km Cairo hop — urban model must book ~45–60 minutes, not an optimistic 15–25.
     const km = haversineKm({ lat: 29.979, lng: 31.134 }, { lat: 29.871, lng: 31.216 });
     assert.ok(km > 12 && km < 16, `expected ~13km, got ${Math.round(km)}`);
-    assert.ok(travelMinutesForKm(km) >= 15, 'a 13km hop must reserve real time');
-    // Neighbouring-but-distinct sites still cost the minimum hop.
-    assert.equal(travelMinutesForKm(0.2), MIN_TRANSFER_MINUTES);
+    assert.ok(travelMinutesForKm(km) >= 45, `a 13km hop must reserve real time, got ${travelMinutesForKm(km)}`);
+    // Neighbouring-but-distinct sites still cost the local minimum hop.
+    assert.equal(travelMinutesForKm(0.2), 25);
 });
 
 // ─── Budget is advisory: every day gets filled ───────────────────────────────
@@ -489,32 +503,29 @@ test('fillDaysFromCatalogue does not dump the catalogue past the budget', () => 
 // ─── Travel time rounds to tidy clock values ─────────────────────────────────
 
 test('travel time is rounded UP to a clean 5-minute step', () => {
-    // The reported case: an exact 37-minute leg must be booked as 40.
-    const km37 = 24.6;                       // ~37 minutes at the local 40km/h rate
-    assert.equal(travelMinutesForKm(km37), 40);
-
-    assert.equal(travelMinutesForKm(13.1), 20);
-    assert.equal(travelMinutesForKm(19.7), 30);
-    // Every result lands on the grid.
+    // Local model: overhead 20 + km/25*60, then round up to 5.
+    // 24.6km → 20 + 59.04 = 79.04 → 80
+    assert.equal(travelMinutesForKm(24.6), 80);
+    // 13.1km → 20 + 31.44 = 51.44 → 55
+    assert.equal(travelMinutesForKm(13.1), 55);
+    // 19.7km → 20 + 47.28 = 67.28 → 70
+    assert.equal(travelMinutesForKm(19.7), 70);
     [0.5, 1.3, 5, 8, 13.1, 19.7, 24.6, 40, 100, 500].forEach((km) => {
         assert.equal(travelMinutesForKm(km) % 5, 0, `${km}km produced an off-grid value`);
     });
 });
 
 test('only the same place costs no travel at all', () => {
-    // Two DISTINCT sites always cost something, however close. They used to cost zero,
-    // which printed an itinerary where the traveller left one venue and arrived at the
-    // next in the same instant — and the UI, which hides a zero leg, showed no travel
-    // time at all for those stops.
-    assert.equal(travelMinutesForKm(0.2), MIN_TRANSFER_MINUTES);
-    assert.equal(travelMinutesForKm(0.05), MIN_TRANSFER_MINUTES);
-    // Identical coordinates are one venue, not two: still free.
+    assert.equal(travelMinutesForKm(0.2), 25);
+    assert.equal(travelMinutesForKm(0.05), 25);
     assert.equal(travelMinutesForKm(0), 0);
 });
 
 test('rounding up never under-books the journey', () => {
     [1.3, 5, 8, 13.1, 19.7, 24.6, 40, 120].forEach((km) => {
-        const raw = km <= SAME_AREA_RADIUS_KM ? (km / 40) * 60 : 60 + (km / 70) * 60;
+        const raw = km <= SAME_AREA_RADIUS_KM
+            ? 20 + (km / 25) * 60
+            : 60 + (km / 70) * 60;
         assert.ok(
             travelMinutesForKm(km) >= raw,
             `${km}km booked ${travelMinutesForKm(km)}min but needs ${raw.toFixed(1)}min`
@@ -708,7 +719,191 @@ test('arrival time shrinks day-1 capacity like v148', () => {
     const full = dayCapacityMinutes(cp, {});
     const arrival = dayCapacityMinutes(cp, {}, { isArrival: true });
     assert.equal(full, 8 * 60);
-    assert.equal(arrival, 4 * 60);
+    // 13:00 arrival + 90 min settle → first activity from 14:30 → 14:30–17:00 = 150 min
+    assert.equal(arrival, 150);
+});
+
+test('arrival-day activities start after the settle buffer', () => {
+    assert.equal(
+        arrivalDayActivityStartMinutes({ activityStartTime: '09:00', arrivalTime: '10:00' }),
+        10 * 60 + 90 // 11:30
+    );
+    assert.equal(
+        arrivalDayActivityStartMinutes({ activityStartTime: '09:00', arrivalTime: '08:00' }),
+        9 * 60 + 30 // 08:00 + 90 = 09:30, still after activity start
+    );
+});
+
+test('post-lunch activity starts after lunch end plus travel', () => {
+    // Lunch ends 14:30, 55 min travel → 15:25 — never 14:30.
+    assert.equal(startMinutesAfterLunch(14 * 60 + 30, 55), 15 * 60 + 25);
+    assert.equal(startMinutesAfterLunch(14 * 60 + 30, 0), 14 * 60 + 30);
+});
+
+test('adjustStartForLunchWindow bumps start at exact lunch-end when travel remains', () => {
+    const lunchStart = 13 * 60 + 30;
+    const lunchEnd = 14 * 60 + 30;
+    // Classic bug: tentative already at 14:30 with 30 min travel still due.
+    assert.equal(
+        adjustStartForLunchWindow({
+            tentative: lunchEnd,
+            length: 120,
+            breakStart: lunchStart,
+            breakEnd: lunchEnd,
+            travelMinutes: 30,
+            dayEndMinutes: 19 * 60,
+        }),
+        15 * 60
+    );
+    // Pre-lunch collision still pushes to lunch end + travel.
+    assert.equal(
+        adjustStartForLunchWindow({
+            tentative: 12 * 60,
+            length: 120,
+            breakStart: lunchStart,
+            breakEnd: lunchEnd,
+            travelMinutes: 30,
+            dayEndMinutes: 19 * 60,
+        }),
+        15 * 60
+    );
+    // Morning slot that finishes before lunch is untouched.
+    assert.equal(
+        adjustStartForLunchWindow({
+            tentative: 9 * 60,
+            length: 120,
+            breakStart: lunchStart,
+            breakEnd: lunchEnd,
+            travelMinutes: 30,
+            dayEndMinutes: 19 * 60,
+        }),
+        9 * 60
+    );
+    // Does not fit after lunch before day end → still return post-lunch earliest
+    // (caller overflows) instead of leaving the lunch-overlapping start.
+    assert.equal(
+        adjustStartForLunchWindow({
+            tentative: 12 * 60 + 20,
+            length: 120,
+            breakStart: 13 * 60 + 15,
+            breakEnd: 14 * 60 + 15,
+            travelMinutes: 30,
+            dayEndMinutes: 14 * 60 + 30,
+        }),
+        14 * 60 + 45
+    );
+});
+
+test('applyDaySchedule never starts post-lunch stop at lunch-end with travel', () => {
+    const { applyDaySchedule } = require('../controllers/itineraryController');
+    const MUSEUM = { lat: 30.0085, lng: 31.2295 };
+    const MOSQUE = { lat: 30.0322, lng: 31.2561 };
+    const days = applyDaySchedule(
+        [{
+            day: 1,
+            date: '2026-09-24',
+            activities: [
+                {
+                    title: 'Visit the National Museum of Egyptian Civilization',
+                    durationMinutes: 120,
+                    coordinates: MUSEUM,
+                    category: 'museum',
+                    price: 10,
+                },
+                {
+                    title: 'Visit Sultan Hassan Mosque',
+                    durationMinutes: 120,
+                    coordinates: MOSQUE,
+                    category: 'landmark',
+                    price: 5,
+                },
+            ],
+        }],
+        { activityStartTime: '09:00', activityEndTime: '19:00', lunchDurationMinutes: 60 },
+        '2026-09-23'
+    );
+    const acts = days[0].activities.filter((a) => !a.isBreak && a.category !== 'break');
+    const mosque = acts.find((a) => /Sultan Hassan/i.test(a.title));
+    const lunch = days[0].activities.find((a) => a.isBreak || /lunch/i.test(a.title || ''));
+    assert.ok(mosque, 'mosque scheduled');
+    assert.ok(lunch, 'lunch scheduled');
+    const lunchEnd = lunch.endTime;
+    const travel = Number(mosque.travelFromPreviousMinutes) || 0;
+    assert.ok(travel > 0, `expected travel leg, got ${travel}`);
+    assert.notEqual(
+        mosque.startTime,
+        lunchEnd,
+        `mosque must not start at lunch end (${lunchEnd}) while travel is ${travel} min`
+    );
+    const toMin = (t) => {
+        const [h, m] = String(t).split(':').map(Number);
+        return h * 60 + (m || 0);
+    };
+    assert.ok(
+        toMin(mosque.startTime) >= toMin(lunchEnd) + travel,
+        `expected start >= ${lunchEnd} + ${travel}m, got ${mosque.startTime}`
+    );
+});
+
+test('early departure day: no activity overlapping lunch — only lunch then leave', () => {
+    const { applyDaySchedule } = require('../controllers/itineraryController');
+    const MUSEUM = { lat: 30.0478, lng: 31.2336 };
+    const NMEC = { lat: 30.0085, lng: 31.2295 };
+    const days = applyDaySchedule(
+        [{
+            day: 1,
+            date: '2026-09-29',
+            activities: [
+                {
+                    title: 'Explore the Egyptian Museum in Tahrir',
+                    durationMinutes: 120,
+                    coordinates: MUSEUM,
+                    category: 'museum',
+                    price: 18,
+                },
+                {
+                    title: 'Visit the National Museum of Egyptian Civilization',
+                    durationMinutes: 120,
+                    coordinates: NMEC,
+                    category: 'museum',
+                    price: 18,
+                },
+            ],
+        }],
+        {
+            activityStartTime: '09:00',
+            activityEndTime: '19:00',
+            lunchDurationMinutes: 60,
+            departureTime: '14:30',
+            endOnDeparture: true,
+        },
+        '2026-09-29'
+    );
+    const toMin = (t) => {
+        const [h, m] = String(t).split(':').map(Number);
+        return h * 60 + (m || 0);
+    };
+    const acts = days[0].activities.filter((a) => !a.isBreak);
+    const lunch = days[0].activities.find((a) => a.isBreak || /lunch/i.test(a.title || ''));
+    assert.ok(lunch, 'lunch should still appear on departure day');
+    const lunchStart = toMin(lunch.startTime);
+    const lunchEnd = toMin(lunch.endTime);
+    assert.ok(lunchEnd <= 14 * 60 + 30, 'lunch must finish by departure');
+    // Second museum cannot fit after lunch before 14:30 — must not appear overlapping lunch.
+    assert.equal(
+        acts.filter((a) => /National Museum of Egyptian Civilization/i.test(a.title)).length,
+        0,
+        'afternoon activity must overflow, not overlap lunch'
+    );
+    for (const a of acts) {
+        const start = toMin(a.startTime);
+        const end = toMin(a.endTime);
+        assert.ok(
+            end <= lunchStart || start >= lunchEnd,
+            `"${a.title}" (${a.startTime}–${a.endTime}) must not overlap lunch ${lunch.startTime}–${lunch.endTime}`
+        );
+        assert.ok(end <= 14 * 60 + 30, `"${a.title}" must end by departure`);
+    }
 });
 
 // ── Trip cost model ─────────────────────────────────────────────────────────────

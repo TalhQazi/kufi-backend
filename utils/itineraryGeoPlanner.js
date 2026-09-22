@@ -25,12 +25,13 @@ const {
     travelMinutesBetween,
     transportModeForKm,
     parseDurationMinutes,
+    effortBufferMinutes,
     clusterByGeography,
     orderClustersByRoute,
     dayCapacityMinutes,
     validateItineraryGeography,
 } = require('./geo');
-const { isBreakEntry, countableActivities, mergeActivitiesWithBreaks } = require('./activityClassification');
+const { isBreakEntry, countableActivities, mergeActivitiesWithBreaks, dedupeItineraryActivities } = require('./activityClassification');
 
 /**
  * Human-readable name for a cluster, for transfer notes.
@@ -421,6 +422,7 @@ function dayWouldFit(day, activities, controlPanel = {}, routeMatrix = null, day
     let prev = null;
     for (const act of real) {
         used += parseDurationMinutes(act.durationMinutes ?? act.duration);
+        used += effortBufferMinutes(act);
         const coords = getCoordinates(act);
         if (prev && coords) {
             const km = haversineKm(prev, coords);

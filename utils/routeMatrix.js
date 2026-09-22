@@ -1,13 +1,18 @@
 /**
- * Live intercity route matrix, matching Kufi v148.
+ * Live route matrix for itinerary planning.
  *
- * Google Distance Matrix supplies driving distance/duration for the planning run.
- * Those Google values are not stored. If the key is missing or a cell fails, the
- * existing haversine travel model is used instead.
+ * Google Distance Matrix supplies driving distance/duration for the planning run
+ * (local and intercity). Those Google values are not stored. If the key is missing
+ * or a cell fails, the haversine travel model is used instead.
+ *
+ * Points are preferably individual activity coordinates so same-city hops
+ * (Museum → Saqqara) get real road times, not only cluster-centroid estimates.
  */
-const { getCoordinates, haversineKm, SAME_AREA_RADIUS_KM, travelMinutesForKm, roundUpToStep } = require('./geo');
+const { getCoordinates, haversineKm, travelMinutesForKm, roundUpToStep } = require('./geo');
 
-const MAX_POINTS = 10;
+const MAX_POINTS = Number(process.env.ITINERARY_MATRIX_MAX_POINTS) || 12;
+/** Snap an activity to a matrix point only when it is this close (km). */
+const MATRIX_SNAP_KM = Number(process.env.ITINERARY_MATRIX_SNAP_KM) || 8;
 
 function pointKey(name) {
     return String(name || '').trim().replace(/\s+/g, ' ');
@@ -128,13 +133,13 @@ function nearestNamedPoint(matrix, coords) {
             best = p;
         }
     });
-    if (!best || bestKm > SAME_AREA_RADIUS_KM) return null;
+    if (!best || bestKm > MATRIX_SNAP_KM) return null;
     return best;
 }
 
 /**
- * Driving minutes from the live matrix when the two places sit in different
- * named bases. Same-base hops return null so the local haversine model still applies.
+ * Driving minutes from the live matrix when both ends snap to named points.
+ * Same-area hops are included so local Cairo legs get real road times.
  */
 function matrixTravelMinutes(from, to, routeMatrix) {
     const a = getCoordinates(from);
@@ -142,11 +147,18 @@ function matrixTravelMinutes(from, to, routeMatrix) {
     if (!a || !b || !routeMatrix?.byPair) return null;
     const pa = nearestNamedPoint(routeMatrix, a);
     const pb = nearestNamedPoint(routeMatrix, b);
-    if (!pa || !pb || pa.name === pb.name) return null;
+    if (!pa || !pb) return null;
+    if (pa.name === pb.name) {
+        // Same snapped point — treat as co-located unless the raw hop is meaningful.
+        const km = haversineKm(a, b);
+        if (km == null || km < 0.4) return 0;
+        return null;
+    }
     const route = routeMatrix.byPair.get(pairKey(pa.name, pb.name));
     const sec = Number(route?.durationSeconds);
     if (!Number.isFinite(sec) || sec < 0) return null;
-    return roundUpToStep(sec / 60);
+    // Never under-book vs the local fallback floor.
+    return Math.max(roundUpToStep(sec / 60), travelMinutesForKm(haversineKm(a, b) || 0));
 }
 
 module.exports = {

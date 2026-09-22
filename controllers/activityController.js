@@ -112,13 +112,30 @@ exports.getActivities = async (req, res) => {
         if (page > 1) pipeline.push({ $skip: (page - 1) * limit });
         pipeline.push({ $limit: limit });
 
-        // Point every row at the binary image route so list UIs can show the stored
-        // photo without shipping the base64 field. The route itself falls back from
-        // `image` to `images[0]`.
+        // Only advertise an image URL when the document actually has photo bytes.
+        // Otherwise list UIs request /image, get 404, and leave blank tiles.
         pipeline.push({
             $addFields: {
                 imageUrl: {
-                    $concat: ['/api/activities/', { $toString: '$_id' }, '/image'],
+                    $cond: [
+                        {
+                            $or: [
+                                { $gt: [{ $strLenCP: { $ifNull: ['$image', ''] } }, 0] },
+                                {
+                                    $gt: [
+                                        {
+                                            $strLenCP: {
+                                                $ifNull: [{ $arrayElemAt: ['$images', 0] }, ''],
+                                            },
+                                        },
+                                        0,
+                                    ],
+                                },
+                            ],
+                        },
+                        { $concat: ['/api/activities/', { $toString: '$_id' }, '/image'] },
+                        '',
+                    ],
                 },
             },
         });
